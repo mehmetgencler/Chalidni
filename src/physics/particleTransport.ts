@@ -12,10 +12,16 @@
  * c(x, y) proportional to 1 / D_g(x, y)
  * (Without gradient-of-diffusivity drift)
  * 
- * PRIORITY 4: Dimensionally calibrated grain diffusivity:
- * Gamma = a_rms / g
+ * Dimensionally consistent grain diffusivity:
+ * Gamma = a_rms / g  (g = 9.80665 m/s^2)
  * D_g = D_ref * max(Gamma - Gamma_c, 0)^p
- * With strict zero transport during silence (Gamma < 1e-6).
+ * With strict zero transport during silence (Gamma < 1e-6 or a_rms <= 1e-6).
+ * 
+ * Note on physical interpretation:
+ * Gamma_c is an empirical activity threshold rather than an exact instantaneous contact-loss criterion.
+ * Instantaneous contact loss depends on peak acceleration reaching g, whereas Gamma uses time-window RMS.
+ * The stochastic particle velocities vx = dx/dt, vy = dy/dt represent the statistical Brownian velocity scale
+ * (Delta X / Delta t ~ sqrt(2*D_g/Delta t) * N(0, 1)), not ballistic Newtonian inertia.
  */
 
 import { DimensionalTransportConfig, Particle } from './types.ts';
@@ -23,11 +29,12 @@ import { DimensionalTransportConfig, Particle } from './types.ts';
 export const DEFAULT_DIMENSIONAL_CONFIG: DimensionalTransportConfig = {
   particleCount: 1000,
   dRef: 1.0e-4,       // m^2/s (reference diffusivity scale)
-  gammaC: 1.0,        // dimensionless critical acceleration threshold for liftoff
+  gammaC: 1.0,        // dimensionless empirical activity threshold
   power: 2.0,         // dimensionless scaling exponent (quadratic kinetic scaling)
   g: 9.80665,         // m/s^2 (standard gravity)
   dt: 0.016,          // s
   seed: 42,
+  subThresholdCreepFloor: 0.0, // strictly 0.0: matches displayed equation identically
 };
 
 /**
@@ -60,20 +67,22 @@ export class Mulberry32PRNG {
 }
 
 /**
- * Reflects coordinate into [0, L]
+ * Mathematically robust periodic-reflection mapping for domain [0, L].
+ * Correctly handles positive overshoot, negative overshoot, multiple plate widths of overshoot,
+ * and finite input validation with zero iteration loops and zero clamping artifacts.
  */
 export function reflectCoordinate(val: number, L: number): number {
-  let v = val;
-  let iters = 0;
-  while ((v < 0 || v > L) && iters < 10) {
-    if (v < 0) {
-      v = -v;
-    } else if (v > L) {
-      v = 2 * L - v;
-    }
-    iters++;
+  if (!Number.isFinite(val) || L <= 0) {
+    return L > 0 ? L * 0.5 : 0;
   }
-  return Math.min(Math.max(v, 0), L);
+
+  const period = 2.0 * L;
+  let rem = val % period;
+  if (rem < 0) {
+    rem += period;
+  }
+
+  return rem > L ? period - rem : rem;
 }
 
 export class ParticleTransportSystem {
@@ -115,11 +124,12 @@ export class ParticleTransportSystem {
   }
 
   /**
-   * PRIORITY 4: Evaluates dimensionally consistent grain diffusivity D_g [m^2/s]
+   * Evaluates dimensionally consistent grain diffusivity D_g [m^2/s]:
    * Gamma = a_rms / g
    * D_g = D_ref * max(Gamma - Gamma_c, 0)^p
    * 
-   * In true silence (isSilent or Gamma < 1e-6), D_g is strictly 0.0.
+   * Strictly matches displayed scientific equation with zero undocumented creep floor.
+   * In true silence (isSilent or a_rms <= 1e-6), D_g is strictly 0.0.
    */
   evaluateDimensionalDiffusivity(
     aRms: number,
@@ -129,30 +139,32 @@ export class ParticleTransportSystem {
       return 0.0; // Strictly zero transport during silence
     }
 
-    const { dRef, gammaC, power, g } = this.config;
+    const { dRef, gammaC, power, g, subThresholdCreepFloor = 0.0 } = this.config;
     const gamma = aRms / g;
     const excessGamma = Math.max(0, gamma - gammaC);
 
     if (excessGamma <= 0) {
-      // Sub-threshold microscopic creep floor when plate is active but sub-liftoff:
-      // Scaled by 0.001 * dRef to avoid hard discontinuity, but only when plate is active.
-      return 1e-3 * dRef * (gamma / Math.max(0.1, gammaC));
+      return subThresholdCreepFloor; // strictly 0.0 by default
     }
 
     return dRef * Math.pow(excessGamma, power);
   }
 
   /**
-   * Euler-Maruyama step for Itô SDE:
+   * Euler-Maruyama step for driftless Itô SDE:
    * dX = sqrt(2 * D_g) * dW_x
    * dY = sqrt(2 * D_g) * dW_y
    * 
-   * Strictly zero drift term (no grad D_g drift) and reflecting boundaries.
+   * Note on pseudo-velocities vx, vy:
+   * These fields record the instantaneous Brownian displacement rate dx/dt for statistical visualization,
+   * reflecting the stochastic thermal/kinetic scale rather than ballistic momentum.
    */
   step(
     dt: number = this.config.dt,
     diffusivityEvaluator?: (x: number, y: number) => number
   ): void {
+    if (dt <= 0) return;
+
     const L = this.sideLength;
     const sqrtDt = Math.sqrt(dt);
 
@@ -169,7 +181,7 @@ export class ParticleTransportSystem {
         continue;
       }
 
-      const sigma = Math.sqrt(2 * D_g);
+      const sigma = Math.sqrt(2.0 * D_g);
       const dWx = sqrtDt * this.prng.nextGaussian();
       const dWy = sqrtDt * this.prng.nextGaussian();
 
@@ -239,7 +251,7 @@ export class ParticleTransportSystem {
   }
 
   /**
-   * PRIORITY 6: Genuine spatial uniformity statistic using Variance-to-Mean Ratio (VMR)
+   * Genuine spatial uniformity statistic using Variance-to-Mean Ratio (VMR)
    * and Pearson Chi-Square Goodness-of-Fit over K spatial bins:
    * chi^2 = sum_k (Observed_k - Expected)^2 / Expected
    * For uniform Poisson spatial distribution, VMR = Var(N) / Mean(N) approx 1.0.
@@ -275,7 +287,7 @@ export class ParticleTransportSystem {
     const variance = sumSqDiff / numBins;
     const vmr = expectedPerBin > 0 ? variance / expectedPerBin : 1.0;
 
-    // A Poisson random scatter has VMR around 1.0 (typically 0.7 to 1.5)
+    // A Poisson random scatter has VMR around 1.0 (typically 0.5 to 1.8)
     const isUniform = vmr >= 0.5 && vmr <= 1.8;
 
     return { vmr, chiSquare, isUniform };

@@ -8,7 +8,10 @@
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test": "tsx --test src/physics/physics.test.ts",
+    "audit": "tsx src/physics/independentAudit.ts",
+    "ci": "npm run lint && npm run test && npm run audit && npm run build"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

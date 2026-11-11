@@ -32,6 +32,8 @@ export const AudioExciter: React.FC<AudioExciterProps> = ({
   const [isFileLoaded, setIsFileLoaded] = useState<boolean>(false);
   const [fileName, setFileName] = useState<string>('');
   const [isPlayingFile, setIsPlayingFile] = useState<boolean>(false);
+  const [isFileLooping, setIsFileLooping] = useState<boolean>(false);
+  const [isMicMonitoring, setIsMicMonitoring] = useState<boolean>(false);
   const [isMuted, setIsMuted] = useState<boolean>(false);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -338,24 +340,67 @@ export const AudioExciter: React.FC<AudioExciterProps> = ({
         </div>
       </div>
 
+      {/* Mic Monitor Opt-In Warning (Feedback Prevention) */}
+      {isMicActive && (
+        <div className="bg-amber-950/30 p-2 rounded border border-amber-800/60 flex items-center justify-between text-xs">
+          <span className="text-amber-300 text-[11px]">
+            Mic Speaker Monitor: {isMicMonitoring ? 'AUDIBLE (Caution: Feedback)' : 'MUTED (Feedback Isolated)'}
+          </span>
+          <button
+            onClick={() => {
+              const next = !isMicMonitoring;
+              setIsMicMonitoring(next);
+              audioEngine.setMicMonitoring(next);
+            }}
+            className={`px-2 py-0.5 rounded text-[10px] font-bold border transition ${
+              isMicMonitoring
+                ? 'bg-rose-900 border-rose-600 text-rose-200'
+                : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'
+            }`}
+          >
+            {isMicMonitoring ? 'Mute Monitor' : 'Enable Monitor'}
+          </button>
+        </div>
+      )}
+
       {/* File playback controls if loaded */}
       {isFileLoaded && sourceType === 'file' && (
-        <div className="bg-slate-950/70 p-2 rounded border border-slate-700 flex items-center justify-between text-xs">
-          <span className="truncate max-w-[150px] font-mono text-slate-300">{fileName}</span>
-          <button
-            onClick={handleToggleFilePlay}
-            className="flex items-center gap-1 px-2 py-1 bg-sky-600 hover:bg-sky-500 rounded text-white"
-          >
-            {isPlayingFile ? <Pause className="w-3 h-3" /> : <Play className="w-3 h-3" />}
-            <span>{isPlayingFile ? 'Pause' : 'Play'}</span>
-          </button>
+        <div className="bg-slate-950/70 p-2 rounded border border-slate-700 flex flex-col gap-1.5 text-xs">
+          <div className="flex items-center justify-between">
+            <span className="truncate max-w-[150px] font-mono text-slate-300">{fileName}</span>
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={() => {
+                  const next = !isFileLooping;
+                  setIsFileLooping(next);
+                  audioEngine.setFileLooping(next);
+                }}
+                className={`px-2 py-0.5 rounded text-[10px] font-medium border transition ${
+                  isFileLooping
+                    ? 'bg-indigo-900 border-indigo-600 text-indigo-200'
+                    : 'bg-slate-800 border-slate-700 text-slate-400'
+                }`}
+              >
+                {isFileLooping ? 'Loop: ON' : 'Loop: OFF'}
+              </button>
+              <button
+                onClick={handleToggleFilePlay}
+                className="flex items-center gap-1 px-2.5 py-1 bg-sky-600 hover:bg-sky-500 rounded text-white"
+              >
+                {isPlayingFile ? <Pause className="w-3 h-3" /> : <Play className="w-3 h-3" />}
+                <span>{isPlayingFile ? 'Pause' : 'Play'}</span>
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
       {/* Excitation Amplitude / Gain Slider */}
       <div className="flex flex-col gap-1.5 pt-1">
         <div className="flex justify-between text-xs">
-          <span className="text-slate-400">Excitation Magnitude ({isPointForce ? 'Force N' : 'Pressure Pa'}):</span>
+          <span className="text-slate-400">
+            Excitation Digital Gain <span className="text-[10px] text-slate-500">(Uncalibrated Demo Setting)</span>:
+          </span>
           <span className="font-mono text-slate-200 font-semibold">{gain.toFixed(2)}x</span>
         </div>
         <input
@@ -367,6 +412,11 @@ export const AudioExciter: React.FC<AudioExciterProps> = ({
           onChange={handleGainSlider}
           className="w-full accent-sky-500 cursor-pointer"
         />
+        <div className="flex justify-between text-[10px] text-slate-500 font-mono">
+          <span>0.1x (Fine grain)</span>
+          <span>Mode: {isPointForce ? 'Effective Shaker Force' : 'Acoustic Field'}</span>
+          <span>5.0x (High energy)</span>
+        </div>
       </div>
 
       {/* Live Oscilloscope */}

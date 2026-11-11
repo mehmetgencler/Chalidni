@@ -4,7 +4,7 @@
  * sample-rate audio stream stepping, and true time-window modal covariance RMS acceleration.
  */
 
-import { ModeState, PlateGeometry, PlateMaterial } from './types.ts';
+import { ModalSnapshot, ModeState, PlateGeometry, PlateMaterial } from './types.ts';
 import {
   calculateAnalyticalFrequency,
   calculateAnalyticalOmega,
@@ -59,6 +59,9 @@ export class ModalBank {
   covarianceMatrix: Float64Array;
   rmsWindowTimeConstant: number = 0.08; // 80 ms moving time-window
 
+  // Cached typed array to eliminate allocation churn in evaluateRmsAcceleration()
+  private phisCache: Float64Array;
+
   constructor(
     material: PlateMaterial = DEFAULT_ALUMINUM,
     geometry: PlateGeometry = DEFAULT_GEOMETRY,
@@ -78,6 +81,7 @@ export class ModalBank {
     this.geometry = geometry;
     this.dampingRatio = dampingRatio;
     this.covarianceMatrix = new Float64Array(activeIndices.length * activeIndices.length);
+    this.phisCache = new Float64Array(activeIndices.length);
     this.initModes(activeIndices);
   }
 
@@ -85,6 +89,7 @@ export class ModalBank {
     const M = calculateModalMass(this.material, this.geometry);
     const nModes = indices.length;
     this.covarianceMatrix = new Float64Array(nModes * nModes);
+    this.phisCache = new Float64Array(nModes);
 
     this.modes = indices.map(({ m, n }) => {
       const f = calculateAnalyticalFrequency(m, n, this.material, this.geometry);
@@ -382,27 +387,55 @@ export class ModalBank {
    * For degenerate/coherent modes: correctly retains non-zero cross terms.
    * Does NOT depend on Canvas frame rate.
    */
+  /**
+   * Applies an authoritative ModalSnapshot emitted by the AudioWorklet thread.
+   * Keeps main-thread visualizer and particle transport 100% synchronized with
+   * the true audio sample-clock state without secondary re-integration.
+   */
+  applySnapshot(snapshot: ModalSnapshot): void {
+    const n = Math.min(this.modes.length, snapshot.displacements.length);
+    for (let i = 0; i < n; i++) {
+      this.modes[i].displacement = snapshot.displacements[i];
+      this.modes[i].velocity = snapshot.velocities[i];
+      this.modes[i].acceleration = snapshot.accelerations[i];
+    }
+    const covLen = Math.min(this.covarianceMatrix.length, snapshot.covarianceMatrix.length);
+    for (let i = 0; i < covLen; i++) {
+      this.covarianceMatrix[i] = snapshot.covarianceMatrix[i];
+    }
+  }
+
+  /**
+   * PRIORITY 3: Calculates true time-window RMS acceleration field:
+   * a_rms(x, y) = sqrt[ (1/T) ∫ a_z(x, y, t)^2 dt ]
+   *             = sqrt[ sum_i sum_j R_ij * phi_i(x, y) * phi_j(x, y) ]
+   * 
+   * Strictly preserves phase relationships and cross-terms between modes.
+   * For single sinusoid of peak acceleration A: returns A / sqrt(2).
+   * For degenerate/coherent modes: correctly retains non-zero cross terms.
+   * Reuses phisCache to eliminate GC allocation churn.
+   * Does NOT depend on Canvas frame rate.
+   */
   evaluateRmsAcceleration(x: number, y: number): number {
     const L = this.geometry.sideLength;
     const n = this.modes.length;
     let sumRmsSq = 0;
 
-    // Cache mode shapes at (x, y)
-    const phis = new Float64Array(n);
+    // Cache mode shapes at (x, y) in pre-allocated array (zero allocations)
+    const phis = this.phisCache;
     for (let i = 0; i < n; i++) {
-      if (this.modes[i].active) {
-        phis[i] = modeShape(this.modes[i].m, this.modes[i].n, x, y, L);
-      }
+      phis[i] = this.modes[i].active ? modeShape(this.modes[i].m, this.modes[i].n, x, y, L) : 0.0;
     }
 
     // sum_i sum_j R_ij * phi_i * phi_j
     for (let i = 0; i < n; i++) {
-      if (!this.modes[i].active || phis[i] === 0) continue;
+      if (!this.modes[i].active || phis[i] === 0.0) continue;
       const phi_i = phis[i];
+      const rowOffset = i * n;
 
       for (let j = 0; j < n; j++) {
-        if (!this.modes[j].active || phis[j] === 0) continue;
-        const R_ij = this.covarianceMatrix[i * n + j];
+        if (!this.modes[j].active || phis[j] === 0.0) continue;
+        const R_ij = this.covarianceMatrix[rowOffset + j];
         sumRmsSq += R_ij * phi_i * phis[j];
       }
     }

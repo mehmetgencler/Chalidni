@@ -68,8 +68,8 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = (props) => {
         heatmapType,
       } = currentProps;
 
-      // Handle high DPI
-      const dpr = window.devicePixelRatio || 1;
+      // Handle high DPI (capped at 2 for performance)
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
       const width = canvas.clientWidth;
       const height = canvas.clientHeight;
       const size = Math.min(width, height);
@@ -162,17 +162,16 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = (props) => {
         }
       }
 
-      // 3. PRIORITY 5: Nodal Overlay — Single Mode lines OR actual combined zero contour
+      // 3. Nodal Overlay — Explicit Distinction: Single-Mode Lines, Low-RMS Mask, and Total Zero Contours
       if (showNodalLines) {
-        ctx.strokeStyle = 'rgba(234, 179, 8, 0.55)'; // amber-500 line
-        ctx.lineWidth = 1.5;
-
         const activeModes = modalBank.modes.filter((m) => m.active);
 
         if (activeModes.length === 1) {
           // Exact analytical straight lines for pure single mode (m, n)
           const m = activeModes[0].m;
           const n = activeModes[0].n;
+          ctx.strokeStyle = 'rgba(234, 179, 8, 0.75)'; // amber-500 line
+          ctx.lineWidth = 1.5;
           ctx.setLineDash([4, 4]);
 
           for (let k = 1; k < m; k++) {
@@ -191,13 +190,11 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = (props) => {
           }
           ctx.setLineDash([]);
         } else if (activeModes.length > 1) {
-          // PRIORITY 5: Real combined total-field zero-crossing contour
-          // Contour where a_rms(x, y) < 0.15 * maxA or where displacement crosses zero
+          // A. Low-Vibration Zone Mask (a_rms <= 0.12 * max_a_rms)
           const sampleN = 50;
           const step = size / sampleN;
           let maxRms = 0;
 
-          // Estimate max RMS across grid
           for (let j = 0; j <= sampleN; j += 5) {
             const y = (j / sampleN) * sideLength;
             for (let i = 0; i <= sampleN; i += 5) {
@@ -208,8 +205,8 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = (props) => {
           }
 
           if (maxRms > 1e-4) {
-            const threshold = maxRms * 0.12; // nodal valley threshold
-            ctx.fillStyle = 'rgba(234, 179, 8, 0.25)';
+            const threshold = maxRms * 0.12;
+            ctx.fillStyle = 'rgba(234, 179, 8, 0.18)'; // Low-vibration zone tint
 
             for (let j = 0; j < sampleN; j++) {
               const y = ((j + 0.5) / sampleN) * sideLength;
@@ -222,6 +219,46 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = (props) => {
               }
             }
           }
+
+          // B. Instantaneous Total Displacement Zero Contours: w(x, y, t) = 0
+          ctx.strokeStyle = 'rgba(56, 189, 248, 0.85)'; // sky-400 zero-contour segments
+          ctx.lineWidth = 1.0;
+          const cN = 36;
+          const cStep = size / cN;
+          const dispGrid = new Float64Array((cN + 1) * (cN + 1));
+
+          for (let j = 0; j <= cN; j++) {
+            const y = (j / cN) * sideLength;
+            for (let i = 0; i <= cN; i++) {
+              const x = (i / cN) * sideLength;
+              dispGrid[j * (cN + 1) + i] = modalBank.evaluateDisplacement(x, y);
+            }
+          }
+
+          ctx.beginPath();
+          for (let j = 0; j < cN; j++) {
+            for (let i = 0; i < cN; i++) {
+              const v00 = dispGrid[j * (cN + 1) + i];
+              const v10 = dispGrid[j * (cN + 1) + (i + 1)];
+              const v01 = dispGrid[(j + 1) * (cN + 1) + i];
+
+              if (v00 * v10 < 0) {
+                const frac = Math.abs(v00) / (Math.abs(v00) + Math.abs(v10));
+                const zx = (i + frac) * cStep;
+                const zy = j * cStep;
+                ctx.moveTo(zx - 1, zy);
+                ctx.lineTo(zx + 1, zy);
+              }
+              if (v00 * v01 < 0) {
+                const frac = Math.abs(v00) / (Math.abs(v00) + Math.abs(v01));
+                const zx = i * cStep;
+                const zy = (j + frac) * cStep;
+                ctx.moveTo(zx, zy - 1);
+                ctx.lineTo(zx, zy + 1);
+              }
+            }
+          }
+          ctx.stroke();
         }
       }
 

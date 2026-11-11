@@ -60,6 +60,23 @@ export interface DimensionalTransportConfig {
   g: number;          // m/s^2 (gravitational acceleration, 9.80665)
   dt: number;         // s
   seed: number;
+  subThresholdCreepFloor?: number; // m^2/s, explicit optional floor (default 0.0)
+}
+
+/**
+ * Snapshot emitted by the AudioWorklet thread at controlled ~60 Hz intervals
+ */
+export interface ModalSnapshot {
+  sampleFramesProcessed: number;
+  sampleRate: number;
+  elapsedSimTime: number;
+  displacements: number[];
+  velocities: number[];
+  accelerations: number[];
+  covarianceMatrix: number[];
+  isPlaying: boolean;
+  isSilent: boolean;
+  quantumCount: number;
 }
 
 export type TestLayer =
@@ -85,7 +102,22 @@ export interface VerificationResult {
 
 export interface ConvergenceData {
   timestepSteps: { dt: number; rmsAmplitude: number; maxRelativeError: number }[];
-  gridSteps: { resolution: number; correlationWithAnalytical: number; l2Error: number; meanDiffusivity: number }[];
+  gridSteps: {
+    resolution: number;
+    correlationWithAnalytical: number;
+    l2Error: number;
+    normalizedL2Error: number;
+    meanDiffusivity: number;
+  }[];
+}
+
+export interface DetailedFramePerformance {
+  medianFrameTimeMs: number;
+  p95FrameTimeMs: number;
+  worstFrameTimeMs: number;
+  particleUpdateTimeMs: number;
+  canvasRenderTimeMs: number;
+  measuredFps: number;
 }
 
 export interface BenchmarkResult {
@@ -94,11 +126,13 @@ export interface BenchmarkResult {
   minFps: number;
   physicsUpdateTimeMs: number;
   audioTimeMs: number;
+  detailedPerformance?: DetailedFramePerformance;
   memoryBreakdown: {
     particleStateKb: number;
     densityGridsKb: number;
     audioBuffersKb: number;
     canvasBackingStoreMb: number;
-    jsRuntimeHeapMbEstimate: number;
+    jsRuntimeHeapStatus: 'MEASURED' | 'NOT_MEASURED';
+    jsRuntimeHeapMb?: number;
   };
 }

@@ -1,7 +1,7 @@
 /**
  * Main Application: Chladni Plate Physics Workbench
- * Real-time AudioWorklet/buffer streaming pipeline, exact discrete state-transition modal ODE,
- * true time-window modal covariance RMS acceleration, dimensional Itô SDE, and decoupled continuous canvas.
+ * Real-time AudioWorklet authoritative simulation clock, exact ZOH modal ODE,
+ * modal covariance RMS acceleration, dimensional Itô SDE, and decoupled continuous canvas.
  */
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
@@ -34,14 +34,14 @@ export default function App() {
   const [shakerPos, setShakerPos] = useState<{ x: number; y: number }>({ x: 0.5, y: 0.5 });
   const [gain, setGain] = useState<number>(1.0);
 
-  // PRIORITY 4: Configurable Dimensional Transport Parameters
+  // Configurable Dimensional Transport Parameters
   const [particleCount, setParticleCount] = useState<number>(1000);
   const [dRef, setDRef] = useState<number>(DEFAULT_DIMENSIONAL_CONFIG.dRef);
   const [gammaC, setGammaC] = useState<number>(DEFAULT_DIMENSIONAL_CONFIG.gammaC);
   const [power, setPower] = useState<number>(DEFAULT_DIMENSIONAL_CONFIG.power);
   const [seed] = useState<number>(42);
 
-  // PRIORITY 5: Visual display overlays and physical heatmap types
+  // Visual display overlays and physical heatmap types
   const [showNodalLines, setShowNodalLines] = useState<boolean>(true);
   const [heatmapType, setHeatmapType] = useState<HeatmapType>('rmsAcceleration');
 
@@ -56,7 +56,7 @@ export default function App() {
   }
   const audioEngine = audioEngineRef.current;
 
-  // ModalBank instance
+  // ModalBank instance (synchronized directly with AudioWorklet snapshots)
   const modalBank = useMemo(() => {
     return new ModalBank(material, geometry, dampingRatio);
   }, [material, geometry, dampingRatio]);
@@ -80,7 +80,9 @@ export default function App() {
   // Handle mode activation toggle
   const handleToggleMode = (idx: number) => {
     if (modalBank.modes[idx]) {
-      modalBank.modes[idx].active = !modalBank.modes[idx].active;
+      const nextActive = !modalBank.modes[idx].active;
+      modalBank.modes[idx].active = nextActive;
+      audioEngine.toggleMode(idx, nextActive);
     }
   };
 
@@ -96,56 +98,81 @@ export default function App() {
     }
   };
 
-  // PRIORITY 1 & 2: High-rate sample streaming and exact ZOH physics integration
+  // Monotonically increasing worklet sample-frame counter and time accumulator
+  const lastSampleFramesRef = useRef<number>(0);
+  const timeAccumulatorRef = useRef<number>(0);
+  const DT_PARTICLE = 0.016; // 16 ms fixed step for particle transport
+
+  // Update AudioWorklet excitation parameters whenever user adjustments occur
   useEffect(() => {
-    let animId: number;
-    let lastTime = performance.now();
+    const x0 = shakerPos.x * geometry.sideLength;
+    const y0 = shakerPos.y * geometry.sideLength;
+    audioEngine.setExcitationConfig(
+      isPointForce,
+      { x: x0, y: y0 },
+      gain * (isPointForce ? 2.5 : 10.0)
+    );
+  }, [audioEngine, isPointForce, shakerPos, gain, geometry.sideLength]);
 
-    const loop = (currentTime: number) => {
-      const deltaMs = Math.min(currentTime - lastTime, 50);
-      lastTime = currentTime;
-      const dt = deltaMs / 1000;
+  // Update AudioWorklet plate geometry/material configuration
+  useEffect(() => {
+    audioEngine.postMessageToWorklet({
+      type: 'CONFIGURE_MODES',
+      sideLength: geometry.sideLength,
+      modes: modalBank.modes.map((m) => ({
+        m: m.m,
+        n: m.n,
+        active: m.active,
+        frequency: m.frequency,
+        omega: m.omega,
+        zeta: m.dampingRatio,
+        M: m.modalMass,
+      })),
+    });
+  }, [audioEngine, geometry, material, dampingRatio, modalBank]);
 
-      const x0 = shakerPos.x * geometry.sideLength;
-      const y0 = shakerPos.y * geometry.sideLength;
+  // STAGE 6 PRIORITY 1 & 2: Authoritative AudioWorklet Simulation Clock & Snapshot Synchronization
+  // The AudioWorklet sample-frame clock drives modal ODE integration and fixed-step particle transport.
+  // There is NO frame-based fallback advancing the modal solver: t = sampleFramesProcessed / sampleRate.
+  useEffect(() => {
+    const unsubscribe = audioEngine.onSnapshot((snapshot) => {
+      // 1. Update main-thread modal coordinates and covariance matrix directly from worklet snapshot
+      modalBank.applySnapshot(snapshot);
 
-      // 1. Pull sequential audio stream produced at AudioContext.sampleRate
-      const samples = audioEngine.pullSampleStream();
-
-      if (samples.length > 0) {
-        // PRIORITY 2: Advance modal solver through sequential audio samples at true sample rate
-        // Gain is applied strictly once inside stepSampleBuffer.
-        modalBank.stepSampleBuffer(
-          samples,
-          audioEngine.sampleRate,
-          isPointForce,
-          x0,
-          y0,
-          gain * (isPointForce ? 2.5 : 10.0)
-        );
-      } else {
-        // Fallback when no audio samples are queued: advance with exact discrete state transition
-        modalBank.computeGeneralizedForces(isPointForce, 0, x0, y0);
-        modalBank.stepExactZOH(dt);
+      // 2. Derive elapsed physical simulation time from the monotonic sample-frame counter
+      if (lastSampleFramesRef.current === 0) {
+        lastSampleFramesRef.current = snapshot.sampleFramesProcessed;
+        return;
       }
 
-      // 2. Check vibration activity for silence gating (PRIORITY 4)
-      const hasModalMotion = modalBank.modes.some((m) => m.active && Math.abs(m.displacement) > 1e-8);
+      const deltaSamples = snapshot.sampleFramesProcessed - lastSampleFramesRef.current;
+      lastSampleFramesRef.current = snapshot.sampleFramesProcessed;
 
-      // 3. Step Itô particle transport driven by physical dimensional diffusivity D_g(x,y)
-      // dX = sqrt(2*D_g) dW_x, dY = sqrt(2*D_g) dW_y
-      particleSystem.step(dt, (px, py) => {
-        if (!hasModalMotion) return 0.0; // Strictly zero transport during silence
-        const aRms = modalBank.evaluateRmsAcceleration(px, py);
-        return particleSystem.evaluateDimensionalDiffusivity(aRms, !hasModalMotion);
-      });
+      if (deltaSamples > 0 && snapshot.sampleRate > 0) {
+        const dtSim = deltaSamples / snapshot.sampleRate;
+        timeAccumulatorRef.current += dtSim;
 
-      animId = requestAnimationFrame(loop);
-    };
+        // Prevent accumulator explosion if browser tab was backgrounded
+        if (timeAccumulatorRef.current > 0.2) {
+          timeAccumulatorRef.current = 0.2;
+        }
 
-    animId = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(animId);
-  }, [audioEngine, modalBank, particleSystem, isPointForce, shakerPos, gain, geometry.sideLength]);
+        const hasModalMotion = modalBank.modes.some((m) => m.active && Math.abs(m.displacement) > 1e-8);
+
+        // Fixed-step particle transport driven strictly by elapsed AudioWorklet time
+        while (timeAccumulatorRef.current >= DT_PARTICLE) {
+          particleSystem.step(DT_PARTICLE, (px, py) => {
+            if (!hasModalMotion || snapshot.isSilent) return 0.0; // Silence standstill
+            const aRms = modalBank.evaluateRmsAcceleration(px, py);
+            return particleSystem.evaluateDimensionalDiffusivity(aRms, snapshot.isSilent);
+          });
+          timeAccumulatorRef.current -= DT_PARTICLE;
+        }
+      }
+    });
+
+    return unsubscribe;
+  }, [audioEngine, modalBank, particleSystem]);
 
   // Clean up audio on unmount
   useEffect(() => {
@@ -166,12 +193,12 @@ export default function App() {
             <div>
               <h1 className="text-base font-bold tracking-tight text-white flex items-center gap-2">
                 Chladni Plate Physics Workbench
-                <span className="text-[10px] font-mono uppercase bg-indigo-900/70 text-indigo-300 px-2 py-0.5 rounded border border-indigo-700/60">
-                  Sample-Accurate Audio &bull; Exact ZOH
+                <span className="text-[10px] font-mono uppercase bg-emerald-950 text-emerald-300 px-2 py-0.5 rounded border border-emerald-800">
+                  AudioWorklet &bull; Synchronized Clock
                 </span>
               </h1>
               <p className="text-xs text-slate-400">
-                Kirchhoff Plate Theory &bull; Exact Discrete SDOF State Transition &bull; Dimensional Itô SDE
+                Kirchhoff Plate Theory &bull; Real AudioWorklet SDOF Thread &bull; Dimensional Itô SDE
               </p>
             </div>
           </div>
@@ -290,7 +317,7 @@ export default function App() {
 
       {/* Footer */}
       <footer className="border-t border-slate-800 py-3 px-4 text-center text-xs text-slate-500 font-mono">
-        Chladni Plate Acoustical Verification Environment &bull; Sample-Rate Discrete Transition &bull; Uncalibrated Demonstration SDE
+        Chladni Plate Acoustical Verification Environment &bull; AudioWorklet Authoritative Clock &bull; Uncalibrated Demonstration SDE
       </footer>
 
       {/* Limitations Modal */}

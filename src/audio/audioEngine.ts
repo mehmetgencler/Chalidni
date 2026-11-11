@@ -1,69 +1,70 @@
 /**
- * Web Audio Engine for Chladni Plate Simulation
- * PRIORITY 2: Continuous audio sample streaming pipeline.
- * Collects sequential samples at AudioContext.sampleRate into a ring buffer.
- * Streams long audio files via HTMLMediaElement (zero decodeAudioData memory overhead).
- * Strictly guarantees microphone is disconnected from audible output.
- * Preserves AnalyserNode strictly for diagnostic visual monitoring.
+ * AudioEngine: Real Web Audio AudioWorklet Architecture for Chladni Plate Simulation
+ * 
+ * Conforms to STAGE 6 Requirements:
+ * - ScriptProcessorNode and FIFO ring buffers are completely removed.
+ * - Real AudioWorkletProcessor module ('/audio/modal-worklet-processor.js') loaded via audioWorklet.addModule().
+ * - All audio sources (Oscillators, Microphone, HTML5 Audio File) route through the same AudioWorkletNode.
+ * - Processes continuous audio samples at native AudioContext.sampleRate without requestAnimationFrame coupling.
+ * - Modal integration executes inside AudioWorklet thread; compact snapshots are received at ~60 Hz.
+ * - Authoritative simulation clock: t = sampleFramesProcessed / sampleRate.
+ * - Feedback prevention: microphone monitoring is muted by default (explicit opt-in only).
+ * - File playback does NOT loop by default; user-controlled loop option provided.
+ * - AnalyserNode is preserved strictly for visual diagnostics, never for modal excitation.
  */
+
+import { ModalSnapshot } from '../physics/types.ts';
 
 export type AudioSourceType = 'generator' | 'microphone' | 'file';
 export type GeneratorWaveform = 'sine' | 'dual' | 'sweep' | 'silence';
 
 export class AudioEngine {
   private ctx: AudioContext | null = null;
+  private workletNode: AudioWorkletNode | null = null;
+  private isWorkletReady = false;
+  private workletInitPromise: Promise<boolean> | null = null;
+
   private sourceType: AudioSourceType = 'generator';
   private generatorType: GeneratorWaveform = 'sine';
 
   // Oscillator nodes for generator
   private osc1: OscillatorNode | null = null;
   private osc2: OscillatorNode | null = null;
+  private generatorGain: GainNode | null = null;
   private sweepInterval: number | null = null;
 
   // Mic stream
   private micStream: MediaStream | null = null;
   private micSource: MediaStreamAudioSourceNode | null = null;
+  private micGain: GainNode | null = null;
+  private micMonitorGain: GainNode | null = null;
+  private isMicMonitoring = false;
 
   // Streaming HTML5 Audio element for uploaded files (zero decodeAudioData memory pressure)
   private audioElement: HTMLAudioElement | null = null;
   private mediaElementSource: MediaElementAudioSourceNode | null = null;
+  private fileGain: GainNode | null = null;
   private audioFileUrl: string | null = null;
   private isFilePlaying = false;
+  private isFileLooping = false;
 
-  // Nodes
-  private streamTapNode: ScriptProcessorNode | null = null;
+  // Diagnostic Analyser & Monitor Gain Nodes
   private analyser: AnalyserNode | null = null;
-  private monitorGain: GainNode | null = null;
+  private masterMonitorGain: GainNode | null = null;
+  private timeDomainBuffer = new Float32Array(512);
 
   // Configuration
-  frequency1 = 53.9;  // Hz
-  frequency2 = 215.8; // Hz
+  frequency1 = 53.96; // Hz
+  frequency2 = 215.85; // Hz
   gain = 1.0;
   isMuted = false;
 
-  // Sample ring buffer for continuous sample-rate delivery
-  private ringBufferSize = 32768;
-  private ringBuffer = new Float32Array(32768);
-  private writeIndex = 0;
-  private readIndex = 0;
-
-  // Diagnostics visual buffer
-  private timeDomainBuffer = new Float32Array(512);
+  // Latest snapshot received from AudioWorklet
+  latestSnapshot: ModalSnapshot | null = null;
+  private snapshotListeners: Set<(snapshot: ModalSnapshot) => void> = new Set();
 
   constructor() {
     // Lazily initialized on user interaction
-  }
-
-  private initContext(): AudioContext {
-    if (!this.ctx) {
-      const AudioContextClass = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      this.ctx = new AudioContextClass();
-    }
-    if (this.ctx.state === 'suspended') {
-      this.ctx.resume();
-    }
-    this.ensureTapNode();
-    return this.ctx;
   }
 
   get sampleRate(): number {
@@ -74,80 +75,179 @@ export class AudioEngine {
     return this.ctx ? this.ctx.state : 'suspended';
   }
 
+  isReady(): boolean {
+    return this.isWorkletReady && this.workletNode !== null;
+  }
+
+  /**
+   * Initializes the AudioContext and registers the AudioWorkletProcessor module
+   */
+  async initContext(): Promise<AudioContext> {
+    if (!this.ctx) {
+      const AudioContextClass =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      this.ctx = new AudioContextClass();
+    }
+
+    if (this.ctx.state === 'suspended') {
+      await this.ctx.resume();
+    }
+
+    await this.ensureWorklet();
+    return this.ctx;
+  }
+
+  /**
+   * Ensures the real AudioWorkletProcessor is registered and connected
+   */
+  private async ensureWorklet(): Promise<boolean> {
+    if (this.isWorkletReady && this.workletNode) return true;
+    if (this.workletInitPromise) return this.workletInitPromise;
+
+    this.workletInitPromise = (async () => {
+      try {
+        if (!this.ctx) return false;
+
+        // Register AudioWorkletProcessor from public folder
+        const workletUrl = '/audio/modal-worklet-processor.js';
+        await this.ctx.audioWorklet.addModule(workletUrl);
+
+        // Instantiate AudioWorkletNode
+        this.workletNode = new AudioWorkletNode(this.ctx, 'modal-worklet-processor', {
+          numberOfInputs: 1,
+          numberOfOutputs: 1,
+          outputChannelCount: [1],
+        });
+
+        // Set up snapshot reception from worklet thread
+        this.workletNode.port.onmessage = (event) => {
+          const data = event.data;
+          if (data && data.type === 'MODAL_SNAPSHOT') {
+            this.latestSnapshot = data as ModalSnapshot;
+            for (const listener of this.snapshotListeners) {
+              listener(this.latestSnapshot);
+            }
+          }
+        };
+
+        // Create diagnostic AnalyserNode
+        this.analyser = this.ctx.createAnalyser();
+        this.analyser.fftSize = 1024;
+
+        // Create Master Monitor Gain Node (for audible playback of generator and file)
+        this.masterMonitorGain = this.ctx.createGain();
+        this.masterMonitorGain.gain.setValueAtTime(this.isMuted ? 0 : 0.15, this.ctx.currentTime);
+
+        // Route: workletNode -> analyser
+        this.workletNode.connect(this.analyser);
+
+        // Sub-bus for generator gain
+        this.generatorGain = this.ctx.createGain();
+        this.generatorGain.gain.setValueAtTime(1.0, this.ctx.currentTime);
+        this.generatorGain.connect(this.workletNode);
+        this.generatorGain.connect(this.masterMonitorGain);
+
+        // Sub-bus for file gain
+        this.fileGain = this.ctx.createGain();
+        this.fileGain.gain.setValueAtTime(1.0, this.ctx.currentTime);
+        this.fileGain.connect(this.workletNode);
+        this.fileGain.connect(this.masterMonitorGain);
+
+        // Sub-bus for mic gain:
+        // Strictly routes to workletNode, NOT to masterMonitorGain (prevents acoustic feedback)
+        this.micGain = this.ctx.createGain();
+        this.micGain.gain.setValueAtTime(1.0, this.ctx.currentTime);
+        this.micGain.connect(this.workletNode);
+
+        // Optional mic monitoring gain (strictly 0.0 by default)
+        this.micMonitorGain = this.ctx.createGain();
+        this.micMonitorGain.gain.setValueAtTime(0.0, this.ctx.currentTime);
+        this.micGain.connect(this.micMonitorGain);
+        this.micMonitorGain.connect(this.ctx.destination);
+
+        // Master monitor output to destination
+        this.masterMonitorGain.connect(this.ctx.destination);
+
+        this.isWorkletReady = true;
+        return true;
+      } catch (err) {
+        console.error('AudioWorklet initialization failed:', err);
+        this.isWorkletReady = false;
+        return false;
+      }
+    })();
+
+    return this.workletInitPromise;
+  }
+
+  /**
+   * Subscribes to periodic modal snapshots emitted by the AudioWorklet
+   */
+  onSnapshot(callback: (snapshot: ModalSnapshot) => void): () => void {
+    this.snapshotListeners.add(callback);
+    return () => {
+      this.snapshotListeners.delete(callback);
+    };
+  }
+
   async resumeContext(): Promise<void> {
-    const ctx = this.initContext();
+    const ctx = await this.initContext();
     if (ctx.state === 'suspended') {
       await ctx.resume();
     }
   }
 
-  /**
-   * Sets up the continuous audio stream tap node (ScriptProcessor / Worklet buffer).
-   * Sequential audio blocks are pushed into the FIFO ring buffer.
-   */
-  private ensureTapNode(): void {
-    if (!this.ctx || this.streamTapNode) return;
-
-    // Buffer size 1024 provides low latency capture (~23ms at 44.1kHz)
-    this.streamTapNode = this.ctx.createScriptProcessor(1024, 1, 1);
-    this.streamTapNode.onaudioprocess = (e) => {
-      const input = e.inputBuffer.getChannelData(0);
-      const len = input.length;
-      for (let i = 0; i < len; i++) {
-        this.ringBuffer[this.writeIndex] = input[i];
-        this.writeIndex = (this.writeIndex + 1) % this.ringBufferSize;
-      }
-    };
-
-    this.analyser = this.ctx.createAnalyser();
-    this.analyser.fftSize = 1024;
-
-    this.monitorGain = this.ctx.createGain();
-    this.monitorGain.gain.setValueAtTime(this.isMuted ? 0 : 0.15, this.ctx.currentTime);
-
-    // Audio graph: Source -> tapNode -> analyser -> (monitorGain -> destination)
-    this.streamTapNode.connect(this.analyser);
-    this.analyser.connect(this.monitorGain);
-    this.monitorGain.connect(this.ctx.destination);
+  async suspendContext(): Promise<void> {
+    if (this.ctx && this.ctx.state === 'running') {
+      await this.ctx.suspend();
+    }
   }
 
   /**
-   * Drains and returns all sequential samples received since the last call.
-   * Guarantees continuous sample-rate feeding to the modal solver.
+   * Post control message to AudioWorklet
    */
-  pullSampleStream(): Float32Array {
-    if (!this.ctx) {
-      return new Float32Array(0);
+  postMessageToWorklet(message: unknown): void {
+    if (this.workletNode) {
+      this.workletNode.port.postMessage(message);
     }
+  }
 
-    if (this.sourceType === 'generator' && this.generatorType === 'silence') {
-      this.readIndex = this.writeIndex;
-      return new Float32Array(0);
-    }
+  setExcitationConfig(isPointForce: boolean, shakerPos: { x: number; y: number }, gain: number): void {
+    this.gain = gain;
+    this.postMessageToWorklet({
+      type: 'SET_EXCITATION',
+      isPointForce,
+      shakerPos,
+      gain,
+    });
+  }
 
-    let count = this.writeIndex - this.readIndex;
-    if (count < 0) {
-      count += this.ringBufferSize;
-    }
+  toggleMode(index: number, active: boolean): void {
+    this.postMessageToWorklet({
+      type: 'TOGGLE_MODE',
+      index,
+      active,
+    });
+  }
 
-    if (count === 0) {
-      return new Float32Array(0);
-    }
-
-    const output = new Float32Array(count);
-    for (let i = 0; i < count; i++) {
-      output[i] = this.ringBuffer[this.readIndex];
-      this.readIndex = (this.readIndex + 1) % this.ringBufferSize;
-    }
-
-    return output;
+  resetModes(): void {
+    this.postMessageToWorklet({
+      type: 'RESET_MODES',
+    });
   }
 
   /**
-   * Starts Internal Signal Generator
+   * Starts Internal Signal Generator (sine, dual tone, or sweep)
    */
-  startGenerator(type: GeneratorWaveform = 'sine', freq1: number = 53.9, freq2: number = 215.8): void {
-    const ctx = this.initContext();
+  async startGenerator(
+    type: GeneratorWaveform = 'sine',
+    freq1: number = 53.96,
+    freq2: number = 215.85
+  ): Promise<void> {
+    await this.initContext();
+    if (!this.ctx || !this.generatorGain) return;
+
     this.stopAllSources();
     this.sourceType = 'generator';
     this.generatorType = type;
@@ -155,32 +255,34 @@ export class AudioEngine {
     this.frequency2 = freq2;
 
     if (type === 'silence') {
+      // In silence, generators are inactive, but AudioWorklet continues processing zero input
+      // allowing free modal decay in true physical lockstep.
       return;
     }
 
-    this.osc1 = ctx.createOscillator();
+    this.osc1 = this.ctx.createOscillator();
     this.osc1.type = 'sine';
-    this.osc1.frequency.setValueAtTime(freq1, ctx.currentTime);
+    this.osc1.frequency.setValueAtTime(freq1, this.ctx.currentTime);
 
     if (type === 'sine') {
-      if (this.streamTapNode) this.osc1.connect(this.streamTapNode);
+      this.osc1.connect(this.generatorGain);
     } else if (type === 'dual') {
-      this.osc2 = ctx.createOscillator();
+      this.osc2 = this.ctx.createOscillator();
       this.osc2.type = 'sine';
-      this.osc2.frequency.setValueAtTime(freq2, ctx.currentTime);
+      this.osc2.frequency.setValueAtTime(freq2, this.ctx.currentTime);
 
-      const merger = ctx.createGain();
-      merger.gain.setValueAtTime(0.5, ctx.currentTime); // 50% mix each
+      const mixer = this.ctx.createGain();
+      mixer.gain.setValueAtTime(0.5, this.ctx.currentTime); // 50% each to prevent clipping
 
-      this.osc1.connect(merger);
-      this.osc2.connect(merger);
-      if (this.streamTapNode) merger.connect(this.streamTapNode);
+      this.osc1.connect(mixer);
+      this.osc2.connect(mixer);
+      mixer.connect(this.generatorGain);
       this.osc2.start();
     } else if (type === 'sweep') {
-      if (this.streamTapNode) this.osc1.connect(this.streamTapNode);
+      this.osc1.connect(this.generatorGain);
 
       const sweepDuration = 6.0;
-      const startTime = ctx.currentTime;
+      const startTime = this.ctx.currentTime;
       this.osc1.frequency.setValueAtTime(40, startTime);
       this.osc1.frequency.exponentialRampToValueAtTime(300, startTime + sweepDuration);
 
@@ -214,11 +316,13 @@ export class AudioEngine {
 
   /**
    * Microphone Input
-   * Strictly disconnected from speaker monitor to avoid acoustic feedback.
+   * Strictly routed to AudioWorklet; monitoring to speakers is MUTED by default to prevent feedback.
    */
   async startMicrophone(): Promise<boolean> {
     try {
-      const ctx = this.initContext();
+      await this.initContext();
+      if (!this.ctx || !this.micGain) return false;
+
       this.stopAllSources();
       this.sourceType = 'microphone';
 
@@ -231,22 +335,25 @@ export class AudioEngine {
       });
 
       this.micStream = stream;
-      this.micSource = ctx.createMediaStreamSource(stream);
+      this.micSource = this.ctx.createMediaStreamSource(stream);
+      this.micSource.connect(this.micGain);
 
-      // Connect mic to tap node for continuous stream capture:
-      // Note: tapNode connects to analyser -> monitorGain.
-      // For microphone, we MUST mute monitorGain to eliminate speaker feedback!
-      if (this.monitorGain) {
-        this.monitorGain.gain.setValueAtTime(0, ctx.currentTime);
-      }
-      if (this.streamTapNode) {
-        this.micSource.connect(this.streamTapNode);
+      // Verify mic monitoring is disabled by default
+      if (this.micMonitorGain) {
+        this.micMonitorGain.gain.setValueAtTime(this.isMicMonitoring ? 0.15 : 0.0, this.ctx.currentTime);
       }
 
       return true;
     } catch (err) {
       console.error('Failed to open microphone:', err);
       return false;
+    }
+  }
+
+  setMicMonitoring(enabled: boolean): void {
+    this.isMicMonitoring = enabled;
+    if (this.micMonitorGain && this.ctx) {
+      this.micMonitorGain.gain.setValueAtTime(enabled ? 0.15 : 0.0, this.ctx.currentTime);
     }
   }
 
@@ -259,18 +366,21 @@ export class AudioEngine {
       this.micSource.disconnect();
       this.micSource = null;
     }
-    if (this.monitorGain && this.ctx) {
-      this.monitorGain.gain.setValueAtTime(this.isMuted ? 0 : 0.15, this.ctx.currentTime);
+    if (this.micMonitorGain && this.ctx) {
+      this.micMonitorGain.gain.setValueAtTime(0.0, this.ctx.currentTime);
     }
   }
 
   /**
-   * Streaming Audio File Player (PRIORITY 2: uses HTMLMediaElement streaming)
-   * Avoids decoding entire file into memory; scales effortlessly to files of any duration.
+   * Streaming Audio File Player (uses HTMLMediaElement streaming)
+   * Avoids decoding entire file into memory; scales to arbitrarily long recordings.
+   * Does NOT loop by default; user-controlled loop option provided.
    */
   async loadAudioFile(file: File): Promise<boolean> {
     try {
-      const ctx = this.initContext();
+      await this.initContext();
+      if (!this.ctx || !this.fileGain) return false;
+
       this.stopAllSources();
       this.sourceType = 'file';
 
@@ -281,11 +391,11 @@ export class AudioEngine {
 
       if (!this.audioElement) {
         this.audioElement = new Audio();
-        this.audioElement.loop = true;
-        this.mediaElementSource = ctx.createMediaElementSource(this.audioElement);
-        if (this.streamTapNode) {
-          this.mediaElementSource.connect(this.streamTapNode);
-        }
+        this.audioElement.loop = this.isFileLooping; // false by default
+        this.mediaElementSource = this.ctx.createMediaElementSource(this.audioElement);
+        this.mediaElementSource.connect(this.fileGain);
+      } else {
+        this.audioElement.loop = this.isFileLooping;
       }
 
       this.audioElement.src = this.audioFileUrl;
@@ -295,6 +405,13 @@ export class AudioEngine {
     } catch (err) {
       console.error('Failed to stream audio file:', err);
       return false;
+    }
+  }
+
+  setFileLooping(loop: boolean): void {
+    this.isFileLooping = loop;
+    if (this.audioElement) {
+      this.audioElement.loop = loop;
     }
   }
 
@@ -328,13 +445,13 @@ export class AudioEngine {
 
   setMuted(muted: boolean): void {
     this.isMuted = muted;
-    if (this.monitorGain && this.ctx && this.sourceType !== 'microphone') {
-      this.monitorGain.gain.setValueAtTime(muted ? 0 : 0.15, this.ctx.currentTime);
+    if (this.masterMonitorGain && this.ctx) {
+      this.masterMonitorGain.gain.setValueAtTime(muted ? 0 : 0.15, this.ctx.currentTime);
     }
   }
 
   /**
-   * Diagnostic oscilloscope buffer (preserved strictly for visual HUD)
+   * Diagnostic oscilloscope buffer (strictly for visual HUD)
    */
   getDiagnosticWaveform(): Float32Array {
     if (this.analyser) {
@@ -373,13 +490,15 @@ export class AudioEngine {
       URL.revokeObjectURL(this.audioFileUrl);
       this.audioFileUrl = null;
     }
-    if (this.streamTapNode) {
-      this.streamTapNode.disconnect();
-      this.streamTapNode = null;
+    if (this.workletNode) {
+      this.workletNode.disconnect();
+      this.workletNode = null;
     }
     if (this.ctx) {
       this.ctx.close();
       this.ctx = null;
     }
+    this.isWorkletReady = false;
+    this.snapshotListeners.clear();
   }
 }

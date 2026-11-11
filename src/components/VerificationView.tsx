@@ -331,7 +331,7 @@ export const VerificationView: React.FC = () => {
                         <th className="p-2 border-b border-slate-800">Cell Width (&Delta;x)</th>
                         <th className="p-2 border-b border-slate-800">Mean Mode Diffusivity</th>
                         <th className="p-2 border-b border-slate-800">Pearson r with Analytical</th>
-                        <th className="p-2 border-b border-slate-800">L2 Discretization Residual</th>
+                        <th className="p-2 border-b border-slate-800">Normalized L2 Error</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-800">
@@ -343,7 +343,9 @@ export const VerificationView: React.FC = () => {
                           <td className="p-2 text-slate-300">{((0.3 / g.resolution) * 1000).toFixed(2)} mm</td>
                           <td className="p-2 text-slate-200">{g.meanDiffusivity.toFixed(4)}</td>
                           <td className="p-2 text-sky-400 font-bold">{g.correlationWithAnalytical.toFixed(6)}</td>
-                          <td className="p-2 text-emerald-400 font-mono">{g.l2Error.toExponential(3)}</td>
+                          <td className="p-2 text-emerald-400 font-mono">
+                            {(g.normalizedL2Error * 100).toFixed(3)}% ({g.normalizedL2Error.toExponential(3)})
+                          </td>
                         </tr>
                       ))}
                     </tbody>
@@ -372,7 +374,7 @@ export const VerificationView: React.FC = () => {
                       <th className="p-2 border-b border-slate-800">Avg Frame Rate</th>
                       <th className="p-2 border-b border-slate-800">Worst (Min) FPS</th>
                       <th className="p-2 border-b border-slate-800">Physics Update Time</th>
-                      <th className="p-2 border-b border-slate-800">Audio Stream Overhead</th>
+                      <th className="p-2 border-b border-slate-800">Median / p95 Frame</th>
                       <th className="p-2 border-b border-slate-800">Mobile Suitability</th>
                     </tr>
                   </thead>
@@ -383,7 +385,11 @@ export const VerificationView: React.FC = () => {
                         <td className="p-2 text-emerald-400 font-bold">{b.avgFps} FPS</td>
                         <td className="p-2 text-slate-300">{b.minFps} FPS</td>
                         <td className="p-2 text-slate-200">{b.physicsUpdateTimeMs.toFixed(3)} ms</td>
-                        <td className="p-2 text-slate-400">{b.audioTimeMs.toFixed(3)} ms</td>
+                        <td className="p-2 text-slate-400">
+                          {b.detailedPerformance
+                            ? `${b.detailedPerformance.medianFrameTimeMs.toFixed(2)} ms / ${b.detailedPerformance.p95FrameTimeMs.toFixed(2)} ms`
+                            : '-'}
+                        </td>
                         <td className="p-2">
                           {b.particleCount <= 1000 ? (
                             <span className="text-emerald-400 font-semibold">Optimal for Mobile</span>
@@ -433,8 +439,12 @@ export const VerificationView: React.FC = () => {
                         <span className="text-violet-300">{b.memoryBreakdown.canvasBackingStoreMb.toFixed(2)} MB</span>
                       </div>
                       <div className="flex justify-between text-slate-500 pt-1 border-t border-slate-800/60">
-                        <span>V8 Baseline Heap:</span>
-                        <span>~{b.memoryBreakdown.jsRuntimeHeapMbEstimate.toFixed(0)} MB</span>
+                        <span>Runtime Heap:</span>
+                        <span>
+                          {b.memoryBreakdown.jsRuntimeHeapStatus === 'MEASURED' && b.memoryBreakdown.jsRuntimeHeapMb !== undefined
+                            ? `${b.memoryBreakdown.jsRuntimeHeapMb} MB (Measured)`
+                            : 'NOT_MEASURED'}
+                        </span>
                       </div>
                     </div>
                   ))}

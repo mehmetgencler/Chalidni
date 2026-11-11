@@ -1,13 +1,15 @@
 /**
  * Independent Scientific Audit Script
- * Executes reproducible benchmarks and measurements for Stage 5 Scientific Verification.
- * Strictly adheres to Priorities 1-7:
- * - Validates exact ZOH discrete state transition.
- * - Confirms continuous modal acceleration covariance matrix R_ij (RMS = A / sqrt(2)).
- * - Tests dimensional diffusivity D_g and silence standstill.
- * - Multi-seed uncertainty evaluation (N=5 seeds) for stationary density c ~ 1/D_g.
- * - Honest segregated memory audit.
- * - Reports Layer A, B, C, D breakdown.
+ * Executes reproducible benchmarks and measurements for Stage 6 Scientific Verification.
+ * Strictly adheres to STAGE 6 Priorities:
+ * - AudioWorklet authoritative simulation clock synchronization.
+ * - Exact discrete ZOH state transition & high-frequency stability.
+ * - Modal acceleration covariance matrix R_ij & degenerate cross-term retention.
+ * - Robust periodic boundary reflections.
+ * - Dimensional diffusivity with zero undocumented creep floor.
+ * - Genuine bilinear spatial grid convergence.
+ * - Segregated memory & true performance benchmarking.
+ * - Explicit Layer A, B, C, D reporting.
  */
 
 import {
@@ -22,12 +24,12 @@ import {
   uniformPressureModalCoupling,
 } from './plate.ts';
 import { calculateAnalyticalHarmonicResponse, ModalBank } from './modalSolver.ts';
-import { Mulberry32PRNG, ParticleTransportSystem } from './particleTransport.ts';
+import { ParticleTransportSystem, reflectCoordinate } from './particleTransport.ts';
 import { runFullScientificAudit } from './verificationSuite.ts';
 
 async function runIndependentAudit() {
   console.log('================================================================');
-  console.log('  CHALIDNI: STAGE 5 INDEPENDENT SCIENTIFIC & CODEBASE AUDIT     ');
+  console.log('  CHALIDNI: STAGE 6 INDEPENDENT SCIENTIFIC & CODEBASE AUDIT     ');
   console.log('================================================================\n');
 
   // --- SECTION 1: LAYER A - STRUCTURAL PHYSICS & ANALYTICAL EIGENVALUES ---
@@ -74,7 +76,7 @@ async function runIndependentAudit() {
     const dt = 1 / sr;
     const mb = new ModalBank(mat, geom, zeta, [{ m: 1, n: 1 }]);
     const mode = mb.modes[0];
-    const durationSec = 2.0; // 2 seconds settling (~ 6.8 time constants)
+    const durationSec = 2.5; // 2.5 seconds settling
     const steps = Math.floor(durationSec / dt);
     let peak = 0;
 
@@ -94,7 +96,7 @@ async function runIndependentAudit() {
     );
   }
 
-  // PRIORITY 1: Mode (3,3) (485.7 Hz) stability at 60 Hz frame rate (dt = 16.666 ms)
+  // STAGE 6: 485.7 Hz Mode Stability at dt = 16.6 ms (60 FPS rendering step)
   console.log('\nTesting 485.7 Hz Mode Stability at dt = 16.6 ms (60 FPS rendering step):');
   const mbHigh = new ModalBank(mat, geom, zeta, [{ m: 3, n: 3 }]);
   const mode33 = mbHigh.modes[0];
@@ -112,7 +114,7 @@ async function runIndependentAudit() {
   console.log(`  Result: UNCONDITIONALLY STABLE (No RK4 numerical overflow)`);
 
   // --- SECTION 3: AUDIO COUPLING & ORTHOGONALITY ---
-  console.log('\n--- LAYER A/C: AUDIO COUPLING & MODAL INTEGRALS ---');
+  console.log('\n--- LAYER A: AUDIO COUPLING & MODAL INTEGRALS ---');
   const oddOddModes = [{ m: 1, n: 1 }, { m: 1, n: 3 }, { m: 3, n: 3 }];
   const evenModes = [{ m: 1, n: 2 }, { m: 2, n: 1 }, { m: 2, n: 2 }, { m: 2, n: 4 }];
 
@@ -126,7 +128,7 @@ async function runIndependentAudit() {
     console.log(`  Antisymmetric (${em.m},${em.n}): C_${em.m}${em.n} = ${c.toFixed(6)} m^2 [STRICTLY ZERO]`);
   }
 
-  // --- SECTION 4: PARTICLE TRANSPORT & ITÔ SDE (MULTIPLE SEEDS & COUNTS) ---
+  // --- SECTION 4: PARTICLE TRANSPORT & ITÔ SDE ---
   console.log('\n--- LAYER B: PARTICLE TRANSPORT & ITÔ SDE AUDIT ---');
   const seeds = [42, 99, 123, 777, 2026];
   const counts = [500, 1000, 2000, 4000];
@@ -137,10 +139,16 @@ async function runIndependentAudit() {
   for (let s = 0; s < 100; s++) zeroSys.step(0.016, () => 0);
   console.log(`Zero Vibration Drift Check: DeltaX = ${Math.abs(zeroSys.particles[0].x - initX).toFixed(12)} m (Strictly 0)`);
 
-  // Test 2: Multi-seed reproducibility and stationary density
+  // Test 2: Robust periodic boundary reflection
+  const testPoints = [0.35, -0.05, 1.35, -1.35];
+  for (const tp of testPoints) {
+    const mapped = reflectCoordinate(tp, geom.sideLength);
+    console.log(`  Reflection Map: Input = ${tp.toFixed(2)} m -> Reflected = ${mapped.toFixed(4)} m inside [0, ${geom.sideLength}]`);
+  }
+
+  // Test 3: Multi-seed reproducibility and stationary density
   console.log('Multi-seed and Multi-count Stationary Density Audit c ~ 1/D_g:');
   const D_field = (x: number) => 2e-3 * (1 + 2 * (x / geom.sideLength));
-  // Analytical theoretical ratio: ln(2) / ln(1.5) = 1.7093
 
   for (const cnt of counts) {
     const ratios: number[] = [];
@@ -149,8 +157,7 @@ async function runIndependentAudit() {
       for (let s = 0; s < 600; s++) {
         sys.step(0.016, D_field);
       }
-      let left = 0;
-      let right = 0;
+      let left = 0, right = 0;
       for (const p of sys.particles) {
         if (p.x < geom.sideLength / 2) left++;
         else right++;
@@ -168,10 +175,10 @@ async function runIndependentAudit() {
   }
 
   // --- SECTION 5: RIGOROUS SEGREGATED MEMORY AUDIT BREAKDOWN ---
-  console.log('\n--- RIGOROUS SEGREGATED MEMORY AUDIT BREAKDOWN (Priority 6) ---');
+  console.log('\n--- RIGOROUS SEGREGATED MEMORY AUDIT BREAKDOWN (Stage 6) ---');
   for (const cnt of counts) {
     const particleStateBytes = cnt * 64;
-    const gridBytes = 40 * 40 * 8 + 64 * 64 * 8; // Float64Arrays = 45.6 KB
+    const gridBytes = 40 * 40 * 8 + 64 * 64 * 8; // Float64Arrays = 44.5 KB
     const canvasBackingBytesDpr1 = 620 * 620 * 4;
     const canvasBackingBytesDpr2 = 620 * 2 * (620 * 2) * 4;
     const audioBufferBytes = (1024 + 512) * 4;
@@ -183,7 +190,6 @@ async function runIndependentAudit() {
     console.log(
       `  - Canvas RGBA Backing Store:   ${(canvasBackingBytesDpr1 / 1024 / 1024).toFixed(2)} MB (DPR=1) / ${(canvasBackingBytesDpr2 / 1024 / 1024).toFixed(2)} MB (DPR=2)`
     );
-    console.log(`  - JavaScript Engine / V8 Base: ~30-45 MB (V8 runtime heap baseline)`);
   }
 
   // --- SECTION 6: FULL LAYERED AUDIT SUITE EXECUTION ---
@@ -196,7 +202,7 @@ async function runIndependentAudit() {
 
   for (const r of fullReport.results) {
     const statusTag = r.status === 'PASS' ? '[PASS]' : r.status === 'FAIL' ? '[FAIL]' : '[NOT RUN]';
-    console.log(`  ${statusTag.padEnd(10)} [${r.layer.padEnd(20)}] ${r.testName.padEnd(50)} -> ${r.measured}`);
+    console.log(`  ${statusTag.padEnd(10)} [${r.layer.padEnd(20)}] ${r.testName.padEnd(55)} -> ${r.measured}`);
   }
 }
 
