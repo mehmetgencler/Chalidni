@@ -118,11 +118,7 @@ export const AudioExciter: React.FC<AudioExciterProps> = ({
   const handleToggleMute = () => {
     const next = !isMuted;
     setIsMuted(next);
-    audioEngine.isMuted = next;
-    // Reapply to current source
-    if (sourceType === 'generator') {
-      audioEngine.startGenerator(generatorType, freq1, freq2);
-    }
+    audioEngine.setMuted(next);
   };
 
   const handleGainSlider = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -147,7 +143,7 @@ export const AudioExciter: React.FC<AudioExciterProps> = ({
     if (!ctx) return;
 
     const renderOscilloscope = () => {
-      const { buffer } = audioEngine.getInstantaneousWaveform();
+      const buffer = audioEngine.getDiagnosticWaveform();
       ctx.fillStyle = '#090d16';
       ctx.fillRect(0, 0, canvas.width, canvas.height);
 

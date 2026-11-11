@@ -1,21 +1,37 @@
 /**
  * Particle Transport: Itô Stochastic Differential Equation Simulator
  * 
- * dX = sqrt(2 * D_g) * dW_x
- * dY = sqrt(2 * D_g) * dW_y
+ * SDE:
+ * dX = sqrt(2 * D_g(X, Y)) * dW_x
+ * dY = sqrt(2 * D_g(X, Y)) * dW_y
  * 
- * Corresponding Fokker-Planck Equation:
+ * Fokker-Planck Equation:
  * dc/dt = div^2(D_g * c)
  * 
- * Under reflecting boundary conditions, stationary state satisfies:
+ * Stationary density with reflecting boundaries:
  * c(x, y) proportional to 1 / D_g(x, y)
  * (Without gradient-of-diffusivity drift)
+ * 
+ * PRIORITY 4: Dimensionally calibrated grain diffusivity:
+ * Gamma = a_rms / g
+ * D_g = D_ref * max(Gamma - Gamma_c, 0)^p
+ * With strict zero transport during silence (Gamma < 1e-6).
  */
 
-import { Particle, TransportConfig } from './types.ts';
+import { DimensionalTransportConfig, Particle } from './types.ts';
+
+export const DEFAULT_DIMENSIONAL_CONFIG: DimensionalTransportConfig = {
+  particleCount: 1000,
+  dRef: 1.0e-4,       // m^2/s (reference diffusivity scale)
+  gammaC: 1.0,        // dimensionless critical acceleration threshold for liftoff
+  power: 2.0,         // dimensionless scaling exponent (quadratic kinetic scaling)
+  g: 9.80665,         // m/s^2 (standard gravity)
+  dt: 0.016,          // s
+  seed: 42,
+};
 
 /**
- * High-quality seeded pseudo-random number generator (Mulberry32)
+ * Seeded pseudo-random number generator (Mulberry32)
  */
 export class Mulberry32PRNG {
   private state: number;
@@ -48,7 +64,6 @@ export class Mulberry32PRNG {
  */
 export function reflectCoordinate(val: number, L: number): number {
   let v = val;
-  // Safety iteration limit
   let iters = 0;
   while ((v < 0 || v > L) && iters < 10) {
     if (v < 0) {
@@ -63,14 +78,14 @@ export function reflectCoordinate(val: number, L: number): number {
 
 export class ParticleTransportSystem {
   particles: Particle[] = [];
-  config: TransportConfig;
+  config: DimensionalTransportConfig;
   sideLength: number; // L (m)
   private prng: Mulberry32PRNG;
 
-  constructor(config: TransportConfig, sideLength: number = 0.30) {
-    this.config = { ...config };
+  constructor(config: Partial<DimensionalTransportConfig> = {}, sideLength: number = 0.30) {
+    this.config = { ...DEFAULT_DIMENSIONAL_CONFIG, ...config };
     this.sideLength = sideLength;
-    this.prng = new Mulberry32PRNG(config.seed);
+    this.prng = new Mulberry32PRNG(this.config.seed);
     this.initParticles();
   }
 
@@ -100,26 +115,39 @@ export class ParticleTransportSystem {
   }
 
   /**
-   * Evaluates local diffusivity D_g(x, y) based on local vibration acceleration
-   * D_g = D_base + alpha * (a_rms / a_ref)^2
-   * If zeroVibration = true, D_g is 0 (zero transport)
+   * PRIORITY 4: Evaluates dimensionally consistent grain diffusivity D_g [m^2/s]
+   * Gamma = a_rms / g
+   * D_g = D_ref * max(Gamma - Gamma_c, 0)^p
+   * 
+   * In true silence (isSilent or Gamma < 1e-6), D_g is strictly 0.0.
    */
-  evaluateDiffusivity(
-    x: number,
-    y: number,
-    diffusivityEvaluator?: (x: number, y: number) => number
+  evaluateDimensionalDiffusivity(
+    aRms: number,
+    isSilent: boolean = false
   ): number {
-    if (diffusivityEvaluator) {
-      return diffusivityEvaluator(x, y);
+    if (isSilent || aRms <= 1e-6) {
+      return 0.0; // Strictly zero transport during silence
     }
-    return this.config.baseDiffusivity;
+
+    const { dRef, gammaC, power, g } = this.config;
+    const gamma = aRms / g;
+    const excessGamma = Math.max(0, gamma - gammaC);
+
+    if (excessGamma <= 0) {
+      // Sub-threshold microscopic creep floor when plate is active but sub-liftoff:
+      // Scaled by 0.001 * dRef to avoid hard discontinuity, but only when plate is active.
+      return 1e-3 * dRef * (gamma / Math.max(0.1, gammaC));
+    }
+
+    return dRef * Math.pow(excessGamma, power);
   }
 
   /**
    * Euler-Maruyama step for Itô SDE:
    * dX = sqrt(2 * D_g) * dW_x
    * dY = sqrt(2 * D_g) * dW_y
-   * With zero drift (no grad D_g drift) and reflecting boundaries.
+   * 
+   * Strictly zero drift term (no grad D_g drift) and reflecting boundaries.
    */
   step(
     dt: number = this.config.dt,
@@ -132,9 +160,9 @@ export class ParticleTransportSystem {
       const p = this.particles[i];
       if (!p.active) continue;
 
-      const D_g = this.evaluateDiffusivity(p.x, p.y, diffusivityEvaluator);
+      const D_g = diffusivityEvaluator ? diffusivityEvaluator(p.x, p.y) : 0;
 
-      // If vibration/diffusivity is zero, transport is strictly zero
+      // Zero vibration/diffusivity strictly yields zero transport
       if (D_g <= 1e-15) {
         p.vx = 0;
         p.vy = 0;
@@ -151,7 +179,6 @@ export class ParticleTransportSystem {
       p.vx = dx / dt;
       p.vy = dy / dt;
 
-      // Update position with reflection at plate edges
       p.x = reflectCoordinate(p.x + dx, L);
       p.y = reflectCoordinate(p.y + dy, L);
     }
@@ -180,7 +207,6 @@ export class ParticleTransportSystem {
       density[gy * gridSize + gx] += 1;
     }
 
-    // Normalize so total sum is 1.0 (probability density)
     if (total > 0) {
       for (let i = 0; i < density.length; i++) {
         density[i] /= total;
@@ -191,7 +217,7 @@ export class ParticleTransportSystem {
   }
 
   /**
-   * Checks whether all particles are strictly conserved and inside plate boundaries
+   * Checks particle count conservation and boundary adherence
    */
   verifyConservationAndBounds(): { conserved: boolean; count: number; inBounds: boolean } {
     let count = 0;
@@ -213,36 +239,45 @@ export class ParticleTransportSystem {
   }
 
   /**
-   * Computes mirror symmetry metric across center lines x = L/2 and y = L/2
-   * Returns symmetry score in [0, 1], where 1.0 is perfect statistical symmetry.
+   * PRIORITY 6: Genuine spatial uniformity statistic using Variance-to-Mean Ratio (VMR)
+   * and Pearson Chi-Square Goodness-of-Fit over K spatial bins:
+   * chi^2 = sum_k (Observed_k - Expected)^2 / Expected
+   * For uniform Poisson spatial distribution, VMR = Var(N) / Mean(N) approx 1.0.
    */
-  computeSymmetryScore(gridSize: number = 32): { xSymmetry: number; ySymmetry: number; overall: number } {
-    const { density } = this.computeDensityGrid(gridSize);
-    let diffX = 0;
-    let diffY = 0;
-    let total = 0;
+  computeSpatialUniformityScore(gridSize: number = 8): {
+    vmr: number;
+    chiSquare: number;
+    isUniform: boolean;
+  } {
+    const numBins = gridSize * gridSize;
+    const rawCounts = new Float64Array(numBins);
+    const cellSize = this.sideLength / gridSize;
+    const totalParticles = this.particles.length;
 
-    for (let gy = 0; gy < gridSize; gy++) {
-      for (let gx = 0; gx < gridSize; gx++) {
-        const val = density[gy * gridSize + gx];
-        total += val;
-
-        // mirror in X
-        const mirrorGx = gridSize - 1 - gx;
-        const mirrorValX = density[gy * gridSize + mirrorGx];
-        diffX += Math.abs(val - mirrorValX);
-
-        // mirror in Y
-        const mirrorGy = gridSize - 1 - gy;
-        const mirrorValY = density[mirrorGy * gridSize + gx];
-        diffY += Math.abs(val - mirrorValY);
-      }
+    for (const p of this.particles) {
+      let gx = Math.floor(p.x / cellSize);
+      let gy = Math.floor(p.y / cellSize);
+      gx = Math.max(0, Math.min(gridSize - 1, gx));
+      gy = Math.max(0, Math.min(gridSize - 1, gy));
+      rawCounts[gy * gridSize + gx] += 1;
     }
 
-    const xSymmetry = total > 0 ? Math.max(0, 1 - diffX / (2 * total)) : 1;
-    const ySymmetry = total > 0 ? Math.max(0, 1 - diffY / (2 * total)) : 1;
-    const overall = (xSymmetry + ySymmetry) / 2;
+    const expectedPerBin = totalParticles / numBins;
+    let sumSqDiff = 0;
+    let chiSquare = 0;
 
-    return { xSymmetry, ySymmetry, overall };
+    for (let i = 0; i < numBins; i++) {
+      const diff = rawCounts[i] - expectedPerBin;
+      sumSqDiff += diff * diff;
+      chiSquare += (diff * diff) / expectedPerBin;
+    }
+
+    const variance = sumSqDiff / numBins;
+    const vmr = expectedPerBin > 0 ? variance / expectedPerBin : 1.0;
+
+    // A Poisson random scatter has VMR around 1.0 (typically 0.7 to 1.5)
+    const isUniform = vmr >= 0.5 && vmr <= 1.8;
+
+    return { vmr, chiSquare, isUniform };
   }
 }

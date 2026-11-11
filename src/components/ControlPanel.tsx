@@ -1,13 +1,14 @@
 /**
  * ControlPanel: Controls for Plate Physical Parameters, Active Modes,
- * Particle Transport Settings, and Display Overlays.
+ * Dimensional Particle Transport Settings, and Display Overlays.
  */
 
 import React from 'react';
-import { Sliders, RefreshCw, Eye, Sparkles, Layers } from 'lucide-react';
+import { Sliders, RefreshCw, Sparkles, Layers } from 'lucide-react';
 import { PlateGeometry, PlateMaterial } from '../physics/types.ts';
 import { ModalBank } from '../physics/modalSolver.ts';
 import { DEFAULT_ALUMINUM } from '../physics/plate.ts';
+import { HeatmapType } from './PlateCanvas.tsx';
 
 const MATERIAL_PRESETS: PlateMaterial[] = [
   DEFAULT_ALUMINUM,
@@ -36,14 +37,18 @@ interface ControlPanelProps {
   onToggleMode: (index: number) => void;
   particleCount: number;
   onParticleCountChange: (count: number) => void;
-  alphaCoupling: number;
-  onAlphaCouplingChange: (alpha: number) => void;
+  dRef: number;
+  onDRefChange: (d: number) => void;
+  gammaC: number;
+  onGammaCChange: (g: number) => void;
+  power: number;
+  onPowerChange: (p: number) => void;
   onResetParticles: () => void;
   onShakeParticles: () => void;
   showNodalLines: boolean;
   onToggleNodalLines: (show: boolean) => void;
-  showHeatmap: boolean;
-  onToggleHeatmap: (show: boolean) => void;
+  heatmapType: HeatmapType;
+  onHeatmapTypeChange: (type: HeatmapType) => void;
 }
 
 export const ControlPanel: React.FC<ControlPanelProps> = ({
@@ -57,14 +62,18 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
   onToggleMode,
   particleCount,
   onParticleCountChange,
-  alphaCoupling,
-  onAlphaCouplingChange,
+  dRef,
+  onDRefChange,
+  gammaC,
+  onGammaCChange,
+  power,
+  onPowerChange,
   onResetParticles,
   onShakeParticles,
   showNodalLines,
   onToggleNodalLines,
-  showHeatmap,
-  onToggleHeatmap,
+  heatmapType,
+  onHeatmapTypeChange,
 }) => {
   return (
     <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-4 shadow-xl flex flex-col gap-4 text-slate-200">
@@ -172,7 +181,7 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
         </div>
       </div>
 
-      {/* Particle Transport Configuration */}
+      {/* PRIORITY 4: Configurable Dimensional Transport Parameters */}
       <div className="flex flex-col gap-2 pt-1 border-t border-slate-800">
         <div className="flex justify-between items-center">
           <label className="text-xs text-slate-400 font-medium flex items-center gap-1.5">
@@ -196,20 +205,63 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
           </div>
         </div>
 
-        <div>
-          <div className="flex justify-between text-xs mb-1">
-            <span className="text-slate-400">Vibration Diffusivity Coupling (&alpha;):</span>
-            <span className="font-mono text-slate-200 font-semibold">{alphaCoupling.toFixed(1)}x</span>
+        {/* Diffusivity Model Sliders */}
+        <div className="bg-slate-950/50 p-2.5 rounded-lg border border-slate-800 flex flex-col gap-2">
+          <div className="text-[11px] text-amber-400 font-mono font-medium">
+            Diffusivity: D_g = D_ref &times; max(&Gamma; &minus; &Gamma;_c, 0)^p
+            <span className="block text-[10px] text-slate-400 font-normal">
+              (&Gamma; = a_rms / g &bull; Uncalibrated Demonstration Parameters)
+            </span>
           </div>
-          <input
-            type="range"
-            min="0.1"
-            max="4.0"
-            step="0.1"
-            value={alphaCoupling}
-            onChange={(e) => onAlphaCouplingChange(parseFloat(e.target.value))}
-            className="w-full accent-amber-500 cursor-pointer"
-          />
+
+          <div>
+            <div className="flex justify-between text-xs mb-1">
+              <span className="text-slate-400">D_ref Scale:</span>
+              <span className="font-mono text-slate-200 font-semibold">{(dRef * 1e4).toFixed(1)} &times; 10⁻⁴ m²/s</span>
+            </div>
+            <input
+              type="range"
+              min="0.1"
+              max="5.0"
+              step="0.1"
+              value={dRef * 1e4}
+              onChange={(e) => onDRefChange(parseFloat(e.target.value) * 1e-4)}
+              className="w-full accent-amber-500 cursor-pointer"
+            />
+          </div>
+
+          <div className="grid grid-cols-2 gap-2">
+            <div>
+              <div className="flex justify-between text-xs mb-1">
+                <span className="text-slate-400">&Gamma;_c (Liftoff):</span>
+                <span className="font-mono text-slate-200 font-semibold">{gammaC.toFixed(1)}g</span>
+              </div>
+              <input
+                type="range"
+                min="0.5"
+                max="2.5"
+                step="0.1"
+                value={gammaC}
+                onChange={(e) => onGammaCChange(parseFloat(e.target.value))}
+                className="w-full accent-amber-500 cursor-pointer"
+              />
+            </div>
+            <div>
+              <div className="flex justify-between text-xs mb-1">
+                <span className="text-slate-400">Power p:</span>
+                <span className="font-mono text-slate-200 font-semibold">{power.toFixed(1)}</span>
+              </div>
+              <input
+                type="range"
+                min="1.0"
+                max="3.0"
+                step="0.2"
+                value={power}
+                onChange={(e) => onPowerChange(parseFloat(e.target.value))}
+                className="w-full accent-amber-500 cursor-pointer"
+              />
+            </div>
+          </div>
         </div>
 
         <div className="grid grid-cols-2 gap-2 mt-1">
@@ -230,8 +282,26 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
         </div>
       </div>
 
-      {/* Visual Display Toggles */}
-      <div className="flex items-center justify-between pt-1 border-t border-slate-800 text-xs">
+      {/* PRIORITY 5: Visual Field Display Toggles */}
+      <div className="flex flex-col gap-2 pt-1 border-t border-slate-800 text-xs">
+        <div className="flex items-center justify-between">
+          <span className="text-slate-400 font-medium flex items-center gap-1">
+            <Layers className="w-3.5 h-3.5 text-sky-400" />
+            <span>Surface Field Heatmap:</span>
+          </span>
+          <select
+            value={heatmapType}
+            onChange={(e) => onHeatmapTypeChange(e.target.value as HeatmapType)}
+            className="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-slate-200 text-xs font-medium cursor-pointer"
+          >
+            <option value="none">Off (Clean Plate)</option>
+            <option value="rmsAcceleration">RMS Acceleration a_rms(x,y)</option>
+            <option value="displacement">Instantaneous Deflection w(x,y,t)</option>
+            <option value="diffusivity">Diffusivity D_g(x,y)</option>
+            <option value="density">Particle Density c(x,y)</option>
+          </select>
+        </div>
+
         <label className="flex items-center gap-1.5 cursor-pointer">
           <input
             type="checkbox"
@@ -239,16 +309,9 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
             onChange={(e) => onToggleNodalLines(e.target.checked)}
             className="rounded accent-amber-500"
           />
-          <span className="text-slate-300">Nodal Lines (&phi;=0)</span>
-        </label>
-        <label className="flex items-center gap-1.5 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={showHeatmap}
-            onChange={(e) => onToggleHeatmap(e.target.checked)}
-            className="rounded accent-sky-500"
-          />
-          <span className="text-slate-300">Surface Heatmap</span>
+          <span className="text-slate-300">
+            Nodal Zero-Contour (Combined a_rms min / &phi;=0)
+          </span>
         </label>
       </div>
     </div>

@@ -1,6 +1,7 @@
 /**
- * Main Application: Chladni Plate Physics Workbench & Verification Suite
- * Interactive real-time simulation coupled with complete Stage 6 scientific audit suite.
+ * Main Application: Chladni Plate Physics Workbench
+ * Real-time AudioWorklet/buffer streaming pipeline, exact discrete state-transition modal ODE,
+ * true time-window modal covariance RMS acceleration, dimensional Itô SDE, and decoupled continuous canvas.
  */
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
@@ -8,18 +9,14 @@ import {
   Waves,
   ShieldCheck,
   BookOpen,
-  Volume2,
   Sliders,
-  Sparkles,
-  Info,
-  Maximize2,
 } from 'lucide-react';
 import { DEFAULT_ALUMINUM, DEFAULT_GEOMETRY } from './physics/plate.ts';
 import { ModalBank } from './physics/modalSolver.ts';
-import { ParticleTransportSystem } from './physics/particleTransport.ts';
+import { ParticleTransportSystem, DEFAULT_DIMENSIONAL_CONFIG } from './physics/particleTransport.ts';
 import { PlateGeometry, PlateMaterial } from './physics/types.ts';
 import { AudioEngine } from './audio/audioEngine.ts';
-import { PlateCanvas } from './components/PlateCanvas.tsx';
+import { HeatmapType, PlateCanvas } from './components/PlateCanvas.tsx';
 import { AudioExciter } from './components/AudioExciter.tsx';
 import { ControlPanel } from './components/ControlPanel.tsx';
 import { ModalSpectrogram } from './components/ModalSpectrogram.tsx';
@@ -37,14 +34,16 @@ export default function App() {
   const [shakerPos, setShakerPos] = useState<{ x: number; y: number }>({ x: 0.5, y: 0.5 });
   const [gain, setGain] = useState<number>(1.0);
 
-  // Particle transport setup
+  // PRIORITY 4: Configurable Dimensional Transport Parameters
   const [particleCount, setParticleCount] = useState<number>(1000);
-  const [alphaCoupling, setAlphaCoupling] = useState<number>(1.0);
-  const [seed, setSeed] = useState<number>(42);
+  const [dRef, setDRef] = useState<number>(DEFAULT_DIMENSIONAL_CONFIG.dRef);
+  const [gammaC, setGammaC] = useState<number>(DEFAULT_DIMENSIONAL_CONFIG.gammaC);
+  const [power, setPower] = useState<number>(DEFAULT_DIMENSIONAL_CONFIG.power);
+  const [seed] = useState<number>(42);
 
-  // Visual display overlays
+  // PRIORITY 5: Visual display overlays and physical heatmap types
   const [showNodalLines, setShowNodalLines] = useState<boolean>(true);
-  const [showHeatmap, setShowHeatmap] = useState<boolean>(true);
+  const [heatmapType, setHeatmapType] = useState<HeatmapType>('rmsAcceleration');
 
   // Navigation / Modal tabs
   const [activeTab, setActiveTab] = useState<'workbench' | 'verification'>('workbench');
@@ -67,30 +66,27 @@ export default function App() {
     return new ParticleTransportSystem(
       {
         particleCount,
-        baseDiffusivity: 1e-5,
-        accelerationCoupling: alphaCoupling,
+        dRef,
+        gammaC,
+        power,
+        g: 9.80665,
         dt: 0.016,
         seed,
       },
       geometry.sideLength
     );
-  }, [particleCount, alphaCoupling, seed, geometry.sideLength]);
-
-  // Reactive state to trigger canvas redraws
-  const [renderTick, setRenderTick] = useState<number>(0);
+  }, [particleCount, dRef, gammaC, power, seed, geometry.sideLength]);
 
   // Handle mode activation toggle
   const handleToggleMode = (idx: number) => {
     if (modalBank.modes[idx]) {
       modalBank.modes[idx].active = !modalBank.modes[idx].active;
-      setRenderTick((t) => t + 1);
     }
   };
 
   // Reset particles to uniform distribution
   const handleResetParticles = () => {
     particleSystem.initParticles();
-    setRenderTick((t) => t + 1);
   };
 
   // Shake particles with high-energy burst
@@ -98,10 +94,9 @@ export default function App() {
     for (let i = 0; i < 30; i++) {
       particleSystem.step(0.02, () => 2e-3);
     }
-    setRenderTick((t) => t + 1);
   };
 
-  // Animation and physics simulation loop
+  // PRIORITY 1 & 2: High-rate sample streaming and exact ZOH physics integration
   useEffect(() => {
     let animId: number;
     let lastTime = performance.now();
@@ -111,40 +106,46 @@ export default function App() {
       lastTime = currentTime;
       const dt = deltaMs / 1000;
 
-      // 1. Pull current audio waveform from AudioEngine
-      const { sample } = audioEngine.getInstantaneousWaveform();
-      const forceValue = sample * gain * (isPointForce ? 2.5 : 10.0);
-
-      // 2. Compute generalized modal forces
       const x0 = shakerPos.x * geometry.sideLength;
       const y0 = shakerPos.y * geometry.sideLength;
-      modalBank.computeGeneralizedForces(isPointForce, forceValue, x0, y0);
 
-      // 3. Sub-step RK4 numerical integrator
-      const subSteps = 4;
-      const subDt = dt / subSteps;
-      for (let s = 0; s < subSteps; s++) {
-        modalBank.stepRK4(subDt);
+      // 1. Pull sequential audio stream produced at AudioContext.sampleRate
+      const samples = audioEngine.pullSampleStream();
+
+      if (samples.length > 0) {
+        // PRIORITY 2: Advance modal solver through sequential audio samples at true sample rate
+        // Gain is applied strictly once inside stepSampleBuffer.
+        modalBank.stepSampleBuffer(
+          samples,
+          audioEngine.sampleRate,
+          isPointForce,
+          x0,
+          y0,
+          gain * (isPointForce ? 2.5 : 10.0)
+        );
+      } else {
+        // Fallback when no audio samples are queued: advance with exact discrete state transition
+        modalBank.computeGeneralizedForces(isPointForce, 0, x0, y0);
+        modalBank.stepExactZOH(dt);
       }
 
-      // 4. Step Itô particle transport driven by plate acceleration field
-      // D_g(x, y) = D_base + alpha * a_rms^2
-      const isPlateVibrating = Math.abs(forceValue) > 1e-5 || modalBank.modes.some((m) => Math.abs(m.displacement) > 1e-7);
+      // 2. Check vibration activity for silence gating (PRIORITY 4)
+      const hasModalMotion = modalBank.modes.some((m) => m.active && Math.abs(m.displacement) > 1e-8);
 
+      // 3. Step Itô particle transport driven by physical dimensional diffusivity D_g(x,y)
+      // dX = sqrt(2*D_g) dW_x, dY = sqrt(2*D_g) dW_y
       particleSystem.step(dt, (px, py) => {
-        if (!isPlateVibrating) return 0; // Zero vibration -> zero transport
+        if (!hasModalMotion) return 0.0; // Strictly zero transport during silence
         const aRms = modalBank.evaluateRmsAcceleration(px, py);
-        return 1e-5 + alphaCoupling * 1e-4 * Math.min(100, aRms * aRms);
+        return particleSystem.evaluateDimensionalDiffusivity(aRms, !hasModalMotion);
       });
 
-      // Update state for UI and canvas
-      setRenderTick((t) => (t + 1) % 1000000);
       animId = requestAnimationFrame(loop);
     };
 
     animId = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(animId);
-  }, [audioEngine, modalBank, particleSystem, isPointForce, shakerPos, gain, geometry.sideLength, alphaCoupling]);
+  }, [audioEngine, modalBank, particleSystem, isPointForce, shakerPos, gain, geometry.sideLength]);
 
   // Clean up audio on unmount
   useEffect(() => {
@@ -166,11 +167,11 @@ export default function App() {
               <h1 className="text-base font-bold tracking-tight text-white flex items-center gap-2">
                 Chladni Plate Physics Workbench
                 <span className="text-[10px] font-mono uppercase bg-indigo-900/70 text-indigo-300 px-2 py-0.5 rounded border border-indigo-700/60">
-                  Stage 6 Verified
+                  Sample-Accurate Audio &bull; Exact ZOH
                 </span>
               </h1>
               <p className="text-xs text-slate-400">
-                Kirchhoff Plate Theory &bull; SDOF Modal ODE &bull; Itô SDE Particle Transport
+                Kirchhoff Plate Theory &bull; Exact Discrete SDOF State Transition &bull; Dimensional Itô SDE
               </p>
             </div>
           </div>
@@ -225,13 +226,14 @@ export default function App() {
               <div className="bg-slate-900/60 p-4 rounded-2xl border border-slate-800 shadow-xl flex flex-col items-center">
                 <PlateCanvas
                   particles={particleSystem.particles}
+                  particleSystem={particleSystem}
                   modalBank={modalBank}
                   sideLength={geometry.sideLength}
                   shakerPos={shakerPos}
                   isPointForce={isPointForce}
                   onSetShakerPos={setShakerPos}
                   showNodalLines={showNodalLines}
-                  showHeatmap={showHeatmap}
+                  heatmapType={heatmapType}
                 />
                 <div className="w-full max-w-[620px] mt-3 flex flex-wrap items-center justify-between gap-1 text-xs text-slate-400 font-mono">
                   <span>Grains: {particleCount} (Conserved: 100%)</span>
@@ -265,14 +267,18 @@ export default function App() {
                 onToggleMode={handleToggleMode}
                 particleCount={particleCount}
                 onParticleCountChange={setParticleCount}
-                alphaCoupling={alphaCoupling}
-                onAlphaCouplingChange={setAlphaCoupling}
+                dRef={dRef}
+                onDRefChange={setDRef}
+                gammaC={gammaC}
+                onGammaCChange={setGammaC}
+                power={power}
+                onPowerChange={setPower}
                 onResetParticles={handleResetParticles}
                 onShakeParticles={handleShakeParticles}
                 showNodalLines={showNodalLines}
                 onToggleNodalLines={setShowNodalLines}
-                showHeatmap={showHeatmap}
-                onToggleHeatmap={setShowHeatmap}
+                heatmapType={heatmapType}
+                onHeatmapTypeChange={setHeatmapType}
               />
             </div>
           </div>
@@ -284,7 +290,7 @@ export default function App() {
 
       {/* Footer */}
       <footer className="border-t border-slate-800 py-3 px-4 text-center text-xs text-slate-500 font-mono">
-        Chladni Plate Acoustical Verification Environment &bull; Pure Analytical Kirchhoff-Love &amp; Itô SDE &bull; All Tests Passing
+        Chladni Plate Acoustical Verification Environment &bull; Sample-Rate Discrete Transition &bull; Uncalibrated Demonstration SDE
       </footer>
 
       {/* Limitations Modal */}

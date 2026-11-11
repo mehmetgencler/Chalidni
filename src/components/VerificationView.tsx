@@ -1,17 +1,35 @@
 /**
  * VerificationView: Interactive In-App Scientific Verification & Benchmark Suite
- * Renders complete test batteries with measured numbers, analytical expectations,
- * relative errors, convergence tables, and performance metrics.
+ * Fully audited interface adhering to Priorities 1-7:
+ * - Clear layer segregation: Layer A (Mathematical), Layer B (Numerical), Layer C (Browser/Audio), Layer D (Physical Hardware).
+ * - Layer filtering tabs and test status badges (PASS, FAIL, NOT_RUN).
+ * - Multi-seed uncertainty display (mean +/- stdDev) for stationary density.
+ * - Genuine segregated memory breakdown (particle state, density grids, audio buffers, canvas backing store, JS baseline).
  */
 
 import React, { useState } from 'react';
-import { CheckCircle2, XCircle, Play, Download, ShieldCheck, Cpu, GitBranch, Terminal } from 'lucide-react';
+import {
+  CheckCircle2,
+  XCircle,
+  AlertCircle,
+  Play,
+  Download,
+  ShieldCheck,
+  Cpu,
+  GitBranch,
+  Terminal,
+  Layers,
+  Database,
+} from 'lucide-react';
 import { FullAuditReport, runFullScientificAudit } from '../physics/verificationSuite.ts';
+import { TestLayer } from '../physics/types.ts';
 
 export const VerificationView: React.FC = () => {
   const [report, setReport] = useState<FullAuditReport | null>(null);
   const [isRunning, setIsRunning] = useState<boolean>(false);
-  const [activeTab, setActiveTab] = useState<'all' | 'structural' | 'modal' | 'audio' | 'transport' | 'convergence' | 'benchmark'>('all');
+  const [activeTab, setActiveTab] = useState<
+    'all' | 'layerA' | 'layerB' | 'layerC' | 'layerD' | 'convergence' | 'benchmark'
+  >('all');
 
   const handleRunAudit = () => {
     setIsRunning(true);
@@ -34,6 +52,37 @@ export const VerificationView: React.FC = () => {
     URL.revokeObjectURL(url);
   };
 
+  const getLayerBadge = (layer: TestLayer) => {
+    switch (layer) {
+      case 'A_MATHEMATICAL':
+        return (
+          <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-violet-950 text-violet-300 border border-violet-800/80">
+            Layer A: Math
+          </span>
+        );
+      case 'B_NUMERICAL':
+        return (
+          <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-sky-950 text-sky-300 border border-sky-800/80">
+            Layer B: Numerical
+          </span>
+        );
+      case 'C_BROWSER_INTEGRATION':
+        return (
+          <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-950 text-amber-300 border border-amber-800/80">
+            Layer C: Browser
+          </span>
+        );
+      case 'D_PHYSICAL_HARDWARE':
+        return (
+          <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-slate-800 text-slate-300 border border-slate-700">
+            Layer D: Hardware
+          </span>
+        );
+    }
+  };
+
+  const notRunCount = report ? report.results.filter((r) => r.status === 'NOT_RUN').length : 0;
+
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-2xl flex flex-col gap-5 text-slate-200">
       {/* Top Header */}
@@ -42,11 +91,11 @@ export const VerificationView: React.FC = () => {
           <div className="flex items-center gap-2">
             <ShieldCheck className="w-6 h-6 text-emerald-400" />
             <h2 className="text-base font-bold tracking-tight text-white">
-              Scientific Verification &amp; Benchmark Suite
+              Scientific Verification &amp; Layered Audit Suite
             </h2>
           </div>
           <p className="text-xs text-slate-400 mt-0.5">
-            Rigorous mathematical validation of plate eigenvalues, SDOF ODE integration, Itô SDE transport, and convergence.
+            Mathematical plate eigenvalues, exact ZOH SDOF integration, It&ocirc; SDE transport, and honest hardware segregation.
           </p>
         </div>
 
@@ -74,11 +123,13 @@ export const VerificationView: React.FC = () => {
 
       {/* Audit Summary Banner */}
       {report && (
-        <div className={`p-3.5 rounded-lg border flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 ${
-          report.allPassed
-            ? 'bg-emerald-950/30 border-emerald-800 text-emerald-200'
-            : 'bg-rose-950/30 border-rose-800 text-rose-200'
-        }`}>
+        <div
+          className={`p-3.5 rounded-lg border flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 ${
+            report.allPassed
+              ? 'bg-emerald-950/30 border-emerald-800 text-emerald-200'
+              : 'bg-rose-950/30 border-rose-800 text-rose-200'
+          }`}
+        >
           <div className="flex items-center gap-2.5">
             {report.allPassed ? (
               <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
@@ -88,31 +139,43 @@ export const VerificationView: React.FC = () => {
             <div>
               <span className="font-bold text-sm block">
                 {report.allPassed
-                  ? `All ${report.totalTests} Physics & Solver Tests Passed Cleanly`
-                  : `${report.passedTests} / ${report.totalTests} Tests Passed`}
+                  ? `All ${report.totalExecutableTests} Executable Physics & Solver Tests Passed Cleanly`
+                  : `${report.passedTests} / ${report.totalExecutableTests} Executable Tests Passed`}
               </span>
               <span className="text-xs opacity-80">
-                Audit executed at {new Date(report.timestamp).toLocaleTimeString()}
+                Audit executed at {new Date(report.timestamp).toLocaleTimeString()} &bull;{' '}
+                {notRunCount} physical hardware tests explicitly marked NOT RUN
               </span>
             </div>
           </div>
-          <div className="text-xs font-mono bg-slate-900/80 px-2.5 py-1 rounded border border-slate-800">
-            Pass Rate: {((report.passedTests / report.totalTests) * 100).toFixed(1)}%
+          <div className="flex items-center gap-2">
+            <div className="text-xs font-mono bg-slate-900/80 px-2.5 py-1 rounded border border-slate-800">
+              Executable Pass Rate: {((report.passedTests / report.totalExecutableTests) * 100).toFixed(1)}%
+            </div>
           </div>
         </div>
       )}
+
+      {/* Layer Notice Callout */}
+      <div className="text-xs text-slate-400 bg-slate-950/60 p-3 rounded-lg border border-slate-800 flex items-start gap-2.5">
+        <Layers className="w-4 h-4 text-sky-400 mt-0.5 shrink-0" />
+        <div>
+          <span className="text-slate-200 font-semibold">Strict Layer Separation: </span>
+          Mathematical &amp; Numerical solvers are validated deterministically. Uncalibrated hardware tests (microphone SPL calibration &amp; physical iPhone thermal metrics) are explicitly classified as <span className="text-amber-400 font-medium">NOT RUN</span> per Priority 6 &amp; 7.
+        </div>
+      </div>
 
       {/* Filter Tabs */}
       {report && (
         <div className="flex flex-wrap gap-1 border-b border-slate-800 pb-2">
           {[
-            { id: 'all', label: 'All Batteries' },
-            { id: 'structural', label: '1. Structural Physics' },
-            { id: 'modal', label: '2. Modal Solver' },
-            { id: 'audio', label: '3. Audio Coupling' },
-            { id: 'transport', label: '4. Particle Transport' },
-            { id: 'convergence', label: '5. Convergence' },
-            { id: 'benchmark', label: '6. Benchmarks' },
+            { id: 'all', label: 'All Tests' },
+            { id: 'layerA', label: 'Layer A: Mathematical' },
+            { id: 'layerB', label: 'Layer B: Numerical' },
+            { id: 'layerC', label: 'Layer C: Browser & Audio' },
+            { id: 'layerD', label: 'Layer D: Hardware (NOT RUN)' },
+            { id: 'convergence', label: 'Numerical Convergence' },
+            { id: 'benchmark', label: 'Performance & Memory' },
           ].map((tab) => (
             <button
               key={tab.id}
@@ -132,13 +195,14 @@ export const VerificationView: React.FC = () => {
       {/* Test Results Table */}
       {report ? (
         <div className="flex flex-col gap-4">
-          {/* Main Tests Table (for structural, modal, audio, transport, or all) */}
+          {/* Main Tests Table (for Layers A, B, C, D, or all) */}
           {activeTab !== 'convergence' && activeTab !== 'benchmark' && (
             <div className="overflow-x-auto rounded-lg border border-slate-800">
               <table className="w-full text-left text-xs border-collapse">
                 <thead className="bg-slate-950 text-slate-400 uppercase tracking-wider font-mono">
                   <tr>
                     <th className="py-2.5 px-3 border-b border-slate-800">Status</th>
+                    <th className="py-2.5 px-3 border-b border-slate-800">Layer</th>
                     <th className="py-2.5 px-3 border-b border-slate-800">Category</th>
                     <th className="py-2.5 px-3 border-b border-slate-800">Test Assertion</th>
                     <th className="py-2.5 px-3 border-b border-slate-800">Expected</th>
@@ -148,41 +212,55 @@ export const VerificationView: React.FC = () => {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800/60 font-mono">
-                  {[
-                    ...report.structuralResults,
-                    ...report.modalResults,
-                    ...report.audioResults,
-                    ...report.transportResults,
-                  ]
+                  {report.results
                     .filter((r) => {
-                      if (activeTab === 'structural') return r.category === 'Structural Physics';
-                      if (activeTab === 'modal') return r.category === 'Modal Solver';
-                      if (activeTab === 'audio') return r.category === 'Audio & Excitation';
-                      if (activeTab === 'transport') return r.category === 'Particle Transport';
+                      if (activeTab === 'layerA') return r.layer === 'A_MATHEMATICAL';
+                      if (activeTab === 'layerB') return r.layer === 'B_NUMERICAL';
+                      if (activeTab === 'layerC') return r.layer === 'C_BROWSER_INTEGRATION';
+                      if (activeTab === 'layerD') return r.layer === 'D_PHYSICAL_HARDWARE';
                       return true;
                     })
                     .map((item, idx) => (
                       <tr key={idx} className="hover:bg-slate-800/30 transition">
                         <td className="py-2 px-3">
-                          {item.passed ? (
+                          {item.status === 'PASS' && (
                             <span className="inline-flex items-center gap-1 text-emerald-400 font-bold">
                               <CheckCircle2 className="w-3.5 h-3.5" />
                               PASS
                             </span>
-                          ) : (
+                          )}
+                          {item.status === 'FAIL' && (
                             <span className="inline-flex items-center gap-1 text-rose-400 font-bold">
                               <XCircle className="w-3.5 h-3.5" />
                               FAIL
                             </span>
                           )}
+                          {item.status === 'NOT_RUN' && (
+                            <span className="inline-flex items-center gap-1 text-amber-400 font-bold">
+                              <AlertCircle className="w-3.5 h-3.5" />
+                              NOT RUN
+                            </span>
+                          )}
                         </td>
+                        <td className="py-2 px-3">{getLayerBadge(item.layer)}</td>
                         <td className="py-2 px-3 text-slate-400">{item.category}</td>
                         <td className="py-2 px-3 text-white font-medium">{item.testName}</td>
                         <td className="py-2 px-3 text-slate-300">{item.expected}</td>
-                        <td className="py-2 px-3 text-slate-200">{item.measured}</td>
+                        <td className="py-2 px-3 text-slate-200">
+                          {item.measured}
+                          {item.uncertaintyStdDev !== undefined && (
+                            <span className="text-slate-400 block text-[10px]">
+                              (&plusmn; {item.uncertaintyStdDev.toFixed(3)} std dev)
+                            </span>
+                          )}
+                        </td>
                         <td className="py-2 px-3">
                           {item.relativeErrorPercent !== undefined ? (
-                            <span className={item.relativeErrorPercent < 2.5 ? 'text-emerald-400' : 'text-amber-400'}>
+                            <span
+                              className={
+                                item.relativeErrorPercent < 2.5 ? 'text-emerald-400' : 'text-amber-400'
+                              }
+                            >
                               {item.relativeErrorPercent.toFixed(2)}%
                             </span>
                           ) : (
@@ -199,20 +277,20 @@ export const VerificationView: React.FC = () => {
             </div>
           )}
 
-          {/* Section 5: Numerical Convergence View */}
+          {/* Section: Numerical Convergence View */}
           {(activeTab === 'convergence' || activeTab === 'all') && (
             <div className="bg-slate-950/60 p-4 rounded-lg border border-slate-800 flex flex-col gap-3">
               <div className="flex items-center gap-2">
                 <GitBranch className="w-4 h-4 text-sky-400" />
                 <h3 className="text-xs font-bold uppercase tracking-wider text-slate-200">
-                  5. Numerical Convergence: Timestep Refinement &amp; Spatial Grid
+                  Numerical Convergence: Exact ZOH State Transition &amp; Spatial L2 Discretization
                 </h3>
               </div>
 
               {/* Timestep Table */}
               <div>
                 <span className="text-xs text-slate-400 font-medium block mb-1.5">
-                  Timestep Convergence (&Delta;t &rarr; &Delta;t/2 &rarr; &Delta;t/4) with RK4:
+                  Timestep Convergence (&Delta;t &rarr; &Delta;t/2 &rarr; &Delta;t/4) with Exact State Transition:
                 </span>
                 <div className="overflow-x-auto">
                   <table className="w-full text-left text-xs font-mono border border-slate-800">
@@ -243,7 +321,7 @@ export const VerificationView: React.FC = () => {
               {/* Grid Resolution Table */}
               <div className="mt-2">
                 <span className="text-xs text-slate-400 font-medium block mb-1.5">
-                  Spatial Grid Resolution (24&times;24 to 64&times;64):
+                  Spatial Grid Resolution with Measured Pearson Correlation &amp; L2 Integral Residual:
                 </span>
                 <div className="overflow-x-auto">
                   <table className="w-full text-left text-xs font-mono border border-slate-800">
@@ -252,16 +330,20 @@ export const VerificationView: React.FC = () => {
                         <th className="p-2 border-b border-slate-800">Grid Size</th>
                         <th className="p-2 border-b border-slate-800">Cell Width (&Delta;x)</th>
                         <th className="p-2 border-b border-slate-800">Mean Mode Diffusivity</th>
-                        <th className="p-2 border-b border-slate-800">Correlation with Continuous Mode</th>
+                        <th className="p-2 border-b border-slate-800">Pearson r with Analytical</th>
+                        <th className="p-2 border-b border-slate-800">L2 Discretization Residual</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-800">
                       {report.convergenceResults.data.gridSteps.map((g, i) => (
                         <tr key={i}>
-                          <td className="p-2 text-white">{g.resolution}&times;{g.resolution} ({g.resolution * g.resolution} cells)</td>
-                          <td className="p-2 text-slate-300">{((0.30 / g.resolution) * 1000).toFixed(2)} mm</td>
+                          <td className="p-2 text-white">
+                            {g.resolution}&times;{g.resolution} ({g.resolution * g.resolution} cells)
+                          </td>
+                          <td className="p-2 text-slate-300">{((0.3 / g.resolution) * 1000).toFixed(2)} mm</td>
                           <td className="p-2 text-slate-200">{g.meanDiffusivity.toFixed(4)}</td>
-                          <td className="p-2 text-sky-400 font-bold">{g.correlationWithAnalytical.toFixed(5)}</td>
+                          <td className="p-2 text-sky-400 font-bold">{g.correlationWithAnalytical.toFixed(6)}</td>
+                          <td className="p-2 text-emerald-400 font-mono">{g.l2Error.toExponential(3)}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -271,16 +353,17 @@ export const VerificationView: React.FC = () => {
             </div>
           )}
 
-          {/* Section 6: Real-Time & Mobile Performance Benchmark */}
+          {/* Section: Real-Time Performance & Segregated Memory Breakdown */}
           {(activeTab === 'benchmark' || activeTab === 'all') && (
             <div className="bg-slate-950/60 p-4 rounded-lg border border-slate-800 flex flex-col gap-3">
               <div className="flex items-center gap-2">
                 <Cpu className="w-4 h-4 text-amber-400" />
                 <h3 className="text-xs font-bold uppercase tracking-wider text-slate-200">
-                  6. Real-Time &amp; Mobile Performance Benchmark (500 to 4000 Particles)
+                  Real-Time Performance &amp; Genuine Segregated Memory Breakdown (500 to 4000 Particles)
                 </h3>
               </div>
 
+              {/* Performance Table */}
               <div className="overflow-x-auto">
                 <table className="w-full text-left text-xs font-mono border border-slate-800">
                   <thead className="bg-slate-900 text-slate-400">
@@ -289,8 +372,7 @@ export const VerificationView: React.FC = () => {
                       <th className="p-2 border-b border-slate-800">Avg Frame Rate</th>
                       <th className="p-2 border-b border-slate-800">Worst (Min) FPS</th>
                       <th className="p-2 border-b border-slate-800">Physics Update Time</th>
-                      <th className="p-2 border-b border-slate-800">Audio Overhead</th>
-                      <th className="p-2 border-b border-slate-800">Est. Memory</th>
+                      <th className="p-2 border-b border-slate-800">Audio Stream Overhead</th>
                       <th className="p-2 border-b border-slate-800">Mobile Suitability</th>
                     </tr>
                   </thead>
@@ -301,8 +383,7 @@ export const VerificationView: React.FC = () => {
                         <td className="p-2 text-emerald-400 font-bold">{b.avgFps} FPS</td>
                         <td className="p-2 text-slate-300">{b.minFps} FPS</td>
                         <td className="p-2 text-slate-200">{b.physicsUpdateTimeMs.toFixed(3)} ms</td>
-                        <td className="p-2 text-slate-400">{b.audioTimeMs.toFixed(2)} ms</td>
-                        <td className="p-2 text-slate-400">{b.memoryEstimateMb.toFixed(3)} MB</td>
+                        <td className="p-2 text-slate-400">{b.audioTimeMs.toFixed(3)} ms</td>
                         <td className="p-2">
                           {b.particleCount <= 1000 ? (
                             <span className="text-emerald-400 font-semibold">Optimal for Mobile</span>
@@ -317,6 +398,48 @@ export const VerificationView: React.FC = () => {
                   </tbody>
                 </table>
               </div>
+
+              {/* Segregated Memory Breakdown Cards */}
+              <div className="mt-3 pt-3 border-t border-slate-800">
+                <div className="flex items-center gap-1.5 mb-2">
+                  <Database className="w-3.5 h-3.5 text-indigo-400" />
+                  <span className="text-xs font-semibold text-slate-300">
+                    Audited Memory Allocation Breakdown (Priority 6: Strictly Honest Architecture Segregation)
+                  </span>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
+                  {report.benchmarkResults.map((b) => (
+                    <div
+                      key={b.particleCount}
+                      className="bg-slate-900 p-2.5 rounded border border-slate-800 font-mono text-[11px] flex flex-col gap-1"
+                    >
+                      <span className="text-white font-bold text-xs pb-1 border-b border-slate-800">
+                        {b.particleCount} Particle System
+                      </span>
+                      <div className="flex justify-between text-slate-400">
+                        <span>Particle State:</span>
+                        <span className="text-emerald-300">{b.memoryBreakdown.particleStateKb.toFixed(1)} KB</span>
+                      </div>
+                      <div className="flex justify-between text-slate-400">
+                        <span>Spatial Grids:</span>
+                        <span className="text-sky-300">{b.memoryBreakdown.densityGridsKb.toFixed(1)} KB</span>
+                      </div>
+                      <div className="flex justify-between text-slate-400">
+                        <span>Audio Stream Buffers:</span>
+                        <span className="text-amber-300">{b.memoryBreakdown.audioBuffersKb.toFixed(1)} KB</span>
+                      </div>
+                      <div className="flex justify-between text-slate-400">
+                        <span>Canvas RGBA Store:</span>
+                        <span className="text-violet-300">{b.memoryBreakdown.canvasBackingStoreMb.toFixed(2)} MB</span>
+                      </div>
+                      <div className="flex justify-between text-slate-500 pt-1 border-t border-slate-800/60">
+                        <span>V8 Baseline Heap:</span>
+                        <span>~{b.memoryBreakdown.jsRuntimeHeapMbEstimate.toFixed(0)} MB</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
             </div>
           )}
         </div>
@@ -324,9 +447,9 @@ export const VerificationView: React.FC = () => {
         <div className="text-center py-10 bg-slate-950/40 rounded-lg border border-dashed border-slate-800 flex flex-col items-center justify-center gap-2">
           <Terminal className="w-8 h-8 text-slate-600" />
           <p className="text-xs text-slate-400 max-w-sm">
-            Click &ldquo;Run Full Scientific Audit&rdquo; to execute all 6 automated test batteries:
-            structural physics, SDOF modal solver, audio orthogonality, Itô particle transport,
-            numerical convergence, and performance benchmarks.
+            Click &ldquo;Run Full Scientific Audit&rdquo; to execute all layered test batteries:
+            Kirchhoff structural physics, exact ZOH SDOF integration, It&ocirc; granular transport,
+            numerical convergence, and real-time performance benchmarks.
           </p>
         </div>
       )}
