@@ -1,0 +1,6 @@
+{
+  "name": "Chladni Plate Physics Workbench & Verification Suite",
+  "description": "Rigorous scientific simulation, numerical modal solver, Itô particle transport, and verification workbench for Chladni plate acoustics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
