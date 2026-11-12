@@ -146,9 +146,12 @@ export class ParticleTransportSystem {
   }
 
   /**
-   * Euler-Maruyama step for driftless Itô SDE:
+   * Adaptive Euler-Maruyama step for driftless Itô SDE:
    * dX = sqrt(2 * D_g) * dW_x
    * dY = sqrt(2 * D_g) * dW_y
+   *
+   * Subdivides dt into non-anticipative micro-steps when sqrt(2 * D_g * dt) > 0.008 m
+   * so particles do not leap across narrow nodal lines under high-amplitude excitation.
    */
   step(
     dt: number = this.config.dt,
@@ -158,35 +161,52 @@ export class ParticleTransportSystem {
 
     const L = this.sideLength;
     const sqrtDt = Math.sqrt(dt);
+    const maxStepVar = 0.008 * 0.008; // 8 mm RMS step bound per micro-step
+    const maxMicroSteps = 12;
 
     for (let i = 0; i < this.particles.length; i++) {
       const p = this.particles[i];
       if (!p.active) continue;
 
-      const D_g = diffusivityEvaluator ? diffusivityEvaluator(p.x, p.y) : 0;
+      const D0 = diffusivityEvaluator ? diffusivityEvaluator(p.x, p.y) : 0;
 
-      if (D_g <= 1e-15) {
+      if (D0 <= 1e-15) {
         p.vx = 0;
         p.vy = 0;
         continue;
       }
 
-      // Diffusion noise amplitude: sigma = sqrt(2 * D_g)
-      const sigma = Math.sqrt(2.0 * D_g);
+      const stepVar = 2.0 * D0 * dt;
+      if (stepVar <= maxStepVar || !diffusivityEvaluator) {
+        // Fast single step for moderate/low diffusivities
+        const sigma = Math.sqrt(2.0 * D0);
+        const dx = sigma * sqrtDt * this.prng.nextGaussian();
+        const dy = sigma * sqrtDt * this.prng.nextGaussian();
+        p.vx = dx / dt;
+        p.vy = dy / dt;
+        p.x = reflectCoordinate(p.x + dx, L);
+        p.y = reflectCoordinate(p.y + dy, L);
+      } else {
+        // Non-anticipative adaptive micro-stepping for high-amplitude antinodes
+        const nSub = Math.min(maxMicroSteps, Math.max(2, Math.ceil(stepVar / maxStepVar)));
+        const subDt = dt / nSub;
+        const sqrtSubDt = Math.sqrt(subDt);
+        const startX = p.x;
+        const startY = p.y;
 
-      // Wiener increments: dW = sqrt(dt) * N(0, 1)
-      const dWx = sqrtDt * this.prng.nextGaussian();
-      const dWy = sqrtDt * this.prng.nextGaussian();
+        for (let k = 0; k < nSub; k++) {
+          const D_k = k === 0 ? D0 : diffusivityEvaluator(p.x, p.y);
+          if (D_k <= 1e-15) break;
+          const sigma = Math.sqrt(2.0 * D_k);
+          const dx = sigma * sqrtSubDt * this.prng.nextGaussian();
+          const dy = sigma * sqrtSubDt * this.prng.nextGaussian();
+          p.x = reflectCoordinate(p.x + dx, L);
+          p.y = reflectCoordinate(p.y + dy, L);
+        }
 
-      const dx = sigma * dWx;
-      const dy = sigma * dWy;
-
-      p.vx = dx / dt;
-      p.vy = dy / dt;
-
-      // Periodic boundary reflection mapping
-      p.x = reflectCoordinate(p.x + dx, L);
-      p.y = reflectCoordinate(p.y + dy, L);
+        p.vx = (p.x - startX) / dt;
+        p.vy = (p.y - startY) / dt;
+      }
     }
   }
 

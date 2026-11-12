@@ -1,17 +1,27 @@
 /**
- * AudioEngine: Minimal Realistic Audio Engine for Chladni Plate Simulation
+ * AudioEngine: Stage 8 Unified Audio Engine for Chladni Plate Simulation
  * 
- * Conforms to STAGE 7 Requirements:
- * - Pure sine test tone (20 Hz - 20,000 Hz) with logarithmic frequency slider support.
- * - Streaming HTML5 audio file playback with full stereo speaker output.
- * - Proper stereo-to-mono downmixing: (L + R) / 2 to the AudioWorklet excitation pipeline.
+ * - Routes BOTH single-tone sine generator (20 Hz - 20,000 Hz) and streamed audio files
+ *   through the exact same AudioWorkletProcessor modal engine.
+ * - Configures the AudioWorklet with the complete 146-mode center-coupled catalogue up to 20 kHz,
+ *   preserving queued configuration messages sent prior to AudioWorkletNode readiness.
+ * - Full stereo playback to speakers with unclipped 0.5 * (L + R) mono downmix to Worklet.
+ * - Connects Worklet output through a silent zero-gain sink to destination so browsers always pull process().
  * - Authoritative AudioWorklet simulation clock: t = sampleFramesProcessed / sampleRate.
  * - Zero microphone code, zero getUserMedia(), zero microphone permissions.
- * - Natural modal free decay when audio input ceases or pauses.
- * - Stores pending worklet configurations to guarantee zero lost initialization messages.
+ * - Preserves modal states on pause/stop/end for natural physical free decay.
  */
 
 import { ModalSnapshot } from '../physics/types.ts';
+
+export interface WorkletModeConfig {
+  m: number;
+  n: number;
+  frequency: number;
+  omega: number;
+  zeta: number;
+  modalMass: number;
+}
 
 export type AudioSourceType = 'generator' | 'file';
 
@@ -27,14 +37,15 @@ export class AudioEngine {
   private workletNode: AudioWorkletNode | null = null;
   private isWorkletReady = false;
   private workletInitPromise: Promise<boolean> | null = null;
-  private pendingWorkletMessages: unknown[] = [];
+  private pendingWorkletMessages: { type: string; [key: string]: unknown }[] = [];
+  private configuredModes: WorkletModeConfig[] | null = null;
 
   private sourceType: AudioSourceType = 'generator';
 
   // Single sine test tone generator (20 Hz – 20,000 Hz)
   private osc: OscillatorNode | null = null;
   private toneGain: GainNode | null = null;
-  private currentFrequency = 53.96; // Default to fundamental resonance
+  private currentFrequency = 269.82; // Default to (1,3)+(3,1) Chladni resonance
   private isTonePlaying = false;
 
   // HTML5 audio file streaming
@@ -134,9 +145,15 @@ export class AudioEngine {
         this.fileGain.gain.setValueAtTime(1.0, this.ctx.currentTime);
         this.fileGain.connect(this.workletNode);
 
+        // Silent zero-gain sink guarantees browser audio graph continuously pulls process()
+        const workletSink = this.ctx.createGain();
+        workletSink.gain.setValueAtTime(0.0, this.ctx.currentTime);
+        this.workletNode.connect(workletSink);
+        workletSink.connect(this.ctx.destination);
+
         this.isWorkletReady = true;
 
-        // Flush any buffered messages sent prior to initialization
+        // Flush any buffered messages sent prior to initialization (including CONFIGURE_MODES)
         while (this.pendingWorkletMessages.length > 0) {
           const msg = this.pendingWorkletMessages.shift();
           this.workletNode.port.postMessage(msg);
@@ -151,6 +168,34 @@ export class AudioEngine {
     })();
 
     return this.workletInitPromise;
+  }
+
+  /**
+   * Configures the AudioWorkletProcessor with the active analytical plate modal catalogue.
+   * Preserves configuration in the initialization queue if called prior to AudioWorkletNode readiness.
+   */
+  configureModes(modes: WorkletModeConfig[]): void {
+    this.configuredModes = modes;
+    const message = { type: 'CONFIGURE_MODES', modes };
+    if (this.workletNode && this.isWorkletReady) {
+      this.workletNode.port.postMessage(message);
+    } else {
+      // Replace any earlier un-flushed CONFIGURE_MODES so latest full catalogue is delivered
+      const existingIdx = this.pendingWorkletMessages.findIndex((m) => m.type === 'CONFIGURE_MODES');
+      if (existingIdx >= 0) {
+        this.pendingWorkletMessages[existingIdx] = message;
+      } else {
+        this.pendingWorkletMessages.push(message);
+      }
+    }
+  }
+
+  getConfiguredModeCount(): number {
+    return this.configuredModes ? this.configuredModes.length : 0;
+  }
+
+  getPendingMessageCount(): number {
+    return this.pendingWorkletMessages.length;
   }
 
   /**
@@ -199,8 +244,8 @@ export class AudioEngine {
     }
   }
 
-  postMessageToWorklet(message: unknown): void {
-    if (this.workletNode) {
+  postMessageToWorklet(message: { type: string; [key: string]: unknown }): void {
+    if (this.workletNode && this.isWorkletReady) {
       this.workletNode.port.postMessage(message);
     } else {
       this.pendingWorkletMessages.push(message);

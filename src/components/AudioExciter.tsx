@@ -53,7 +53,7 @@ export const AudioExciter: React.FC<AudioExciterProps> = ({
   onToneStateChange,
 }) => {
   const [activeTab, setActiveTab] = useState<'tone' | 'file'>('tone');
-  const [frequency, setFrequency] = useState<number>(53.96); // Fundamental mode by default
+  const [frequency, setFrequency] = useState<number>(269.82); // (1,3)+(3,1) Chladni resonance by default
   const [isToneActive, setIsToneActive] = useState<boolean>(false);
 
   // File playback state

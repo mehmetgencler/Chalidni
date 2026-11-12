@@ -1,67 +1,56 @@
 /**
- * ModalWorkletProcessor: Stage 7 Real-Time AudioWorklet Processor
- * 
- * Executes the authoritative simulation clock and exact ZOH modal integration:
- * - Authoritative physical simulation clock: t = sampleFramesProcessed / sampleRate.
- * - Exact discrete-time Zero-Order-Held (ZOH) state transitions at sampleRate.
+ * ModalWorkletProcessor: Stage 8 Unified Real-Time AudioWorklet Processor
+ *
+ * Unified modal physics engine and simulation clock for both single-tone and audio-file excitation:
+ * - Single authoritative physical simulation clock: t = sampleFramesProcessed / sampleRate.
+ * - Full 20 Hz - 20 kHz active modal catalogue (146 odd-odd Kirchhoff modes for center shaker).
+ * - Exact discrete-time Zero-Order-Held (ZOH) state transitions at sampleRate:
+ *   q_ddot_mn + 2*zeta_mn*omega_mn*q_dot_mn + omega_mn^2*q_mn = Q_mn / M
+ * - Physically authentic modal free decay: each mode retains its own natural frequency and damping rate.
+ * - Block-averaged covariance integration across all 146 diagonals, all degenerate equal-frequency
+ *   pairs, and all active top-K (K=24) modal cross-pairs per 128-sample quantum.
  * - Single center-shaker excitation at (L/2, L/2) = (0.15m, 0.15m).
- * - Processes continuous audio samples from test-tone sine generator or streamed audio file.
- * - Maintains natural modal free decay during silence or when audio stops.
- * - Efficient block covariance update (auto-variances and degenerate mode cross-terms).
- * - Publishes compact modal snapshots at controlled ~60 Hz rate to drive main-thread rendering.
+ * - Publishes compact ~60 Hz snapshots with sparse covariance to synchronize main-thread rendering.
  */
 
-class ModalWorkletProcessor extends AudioWorkletProcessor {
-  constructor() {
+const _BaseWorkletProcessor =
+  typeof AudioWorkletProcessor !== 'undefined'
+    ? AudioWorkletProcessor
+    : class {
+        constructor() {
+          this.port = {
+            onmessage: null,
+            postMessage: () => {},
+          };
+        }
+      };
+
+class ModalWorkletProcessor extends _BaseWorkletProcessor {
+  constructor(options) {
     super();
+
+    const sr =
+      typeof sampleRate !== 'undefined'
+        ? sampleRate
+        : options && options.processorOptions && options.processorOptions.sampleRate
+          ? options.processorOptions.sampleRate
+          : 44100;
 
     this.sampleFramesProcessed = 0;
     this.quantumCount = 0;
-    this.sampleRate = sampleRate; // Global in AudioWorkletGlobalScope
+    this.sampleRate = sr;
 
-    // Fixed physical plate geometry (0.30 m aluminum) and center excitation
     this.sideLength = 0.30;
-    this.shakerPos = { x: 0.15, y: 0.15 };
     this.isSilent = true;
 
-    // Active coupled odd-odd Kirchhoff modes (centered excitation couples strictly to odd-odd modes)
-    this.modes = [
-      { m: 1, n: 1, frequency: 53.963, omega: 339.059, zeta: 0.01, M: 0.06075 },
-      { m: 1, n: 3, frequency: 269.815, omega: 1695.297, zeta: 0.01, M: 0.06075 },
-      { m: 3, n: 1, frequency: 269.815, omega: 1695.297, zeta: 0.01, M: 0.06075 },
-      { m: 3, n: 3, frequency: 485.667, omega: 3051.534, zeta: 0.01, M: 0.06075 },
-      { m: 1, n: 5, frequency: 701.519, omega: 4407.771, zeta: 0.01, M: 0.06075 },
-      { m: 5, n: 1, frequency: 701.519, omega: 4407.771, zeta: 0.01, M: 0.06075 },
-      { m: 3, n: 5, frequency: 917.371, omega: 5764.008, zeta: 0.01, M: 0.06075 },
-      { m: 5, n: 3, frequency: 917.371, omega: 5764.008, zeta: 0.01, M: 0.06075 },
-      { m: 5, n: 5, frequency: 1349.075, omega: 8476.482, zeta: 0.01, M: 0.06075 },
-      { m: 1, n: 7, frequency: 1349.075, omega: 8476.482, zeta: 0.01, M: 0.06075 },
-      { m: 7, n: 1, frequency: 1349.075, omega: 8476.482, zeta: 0.01, M: 0.06075 },
-      { m: 3, n: 7, frequency: 1564.927, omega: 9832.719, zeta: 0.01, M: 0.06075 },
-      { m: 7, n: 3, frequency: 1564.927, omega: 9832.719, zeta: 0.01, M: 0.06075 },
-      { m: 5, n: 7, frequency: 1996.631, omega: 12545.193, zeta: 0.01, M: 0.06075 },
-      { m: 7, n: 5, frequency: 1996.631, omega: 12545.193, zeta: 0.01, M: 0.06075 },
-      { m: 7, n: 7, frequency: 2644.187, omega: 16613.904, zeta: 0.01, M: 0.06075 },
-    ];
-
-    const n = this.modes.length;
-    this.displacements = new Float64Array(n);
-    this.velocities = new Float64Array(n);
-    this.accelerations = new Float64Array(n);
-    this.covarianceMatrix = new Float64Array(n * n);
-
-    this.expDecays = new Float64Array(n);
-    this.cosTerms = new Float64Array(n);
-    this.sinTerms = new Float64Array(n);
-    this.omegas = new Float64Array(n);
-    this.omegaDs = new Float64Array(n);
-    this.zetas = new Float64Array(n);
-    this.modalMasses = new Float64Array(n);
-    this.couplings = new Float64Array(n);
+    // Build default 146 odd-odd active modes catalogue up to 20,000 Hz
+    this.modes = this.generateDefaultActiveModes(20000);
+    this.lastQuantumLen = 128;
+    this.initModeArrays();
 
     this.rmsWindowTimeConstant = 0.08; // tau = 80 ms
     this.dt = 1.0 / this.sampleRate;
-    this.covAlpha = 1.0 - Math.exp(- (128.0 * this.dt) / this.rmsWindowTimeConstant);
+    this.covAlpha = 1.0 - Math.exp(-(128.0 * this.dt) / this.rmsWindowTimeConstant);
 
     this.recomputeCoefficients();
 
@@ -74,9 +63,88 @@ class ModalWorkletProcessor extends AudioWorkletProcessor {
     };
   }
 
+  /**
+   * Generates analytical 146 odd-odd modes up to maxFrequency (default 20,000 Hz)
+   * Aluminum plate: E=69e9, rho=2700, nu=0.33, L=0.30, h=0.001 -> f11 = 53.96303 Hz
+   */
+  generateDefaultActiveModes(maxFrequency = 20000) {
+    const modes = [];
+    const E = 69e9;
+    const rho = 2700;
+    const nu = 0.33;
+    const L = 0.30;
+    const h = 0.001;
+    const D = (E * h * h * h) / (12.0 * (1.0 - nu * nu));
+    const M = (rho * h * L * L) / 4.0;
+    const prefactor = (Math.PI / (2.0 * L * L)) * Math.sqrt(D / (rho * h));
+    const f11 = prefactor * 2.0;
+    const maxM = Math.ceil(Math.sqrt((2.0 * maxFrequency) / f11));
+
+    for (let m = 1; m <= maxM; m += 2) {
+      for (let n = 1; n <= maxM; n += 2) {
+        const f = prefactor * (m * m + n * n);
+        if (f <= maxFrequency) {
+          modes.push({
+            m,
+            n,
+            frequency: f,
+            omega: 2.0 * Math.PI * f,
+            zeta: 0.01,
+            modalMass: M,
+            centerCoupling: Math.sin((m * Math.PI) / 2.0) * Math.sin((n * Math.PI) / 2.0),
+          });
+        }
+      }
+    }
+
+    modes.sort((a, b) => a.frequency - b.frequency);
+    return modes;
+  }
+
+  initModeArrays() {
+    const n = this.modes.length;
+    this.displacements = new Float64Array(n);
+    this.velocities = new Float64Array(n);
+    this.accelerations = new Float64Array(n);
+    this.covarianceMatrix = new Float64Array(n * n);
+
+    // Exact ZOH state transition coefficients
+    this.A11 = new Float64Array(n);
+    this.A12 = new Float64Array(n);
+    this.A21 = new Float64Array(n);
+    this.A22 = new Float64Array(n);
+
+    this.omegas = new Float64Array(n);
+    this.omegaSq = new Float64Array(n);
+    this.zetas = new Float64Array(n);
+    this.twoZetaOmega = new Float64Array(n);
+    this.modalMasses = new Float64Array(n);
+    this.couplings = new Float64Array(n);
+
+    // Pre-allocated quantum work buffers (zero GC per quantum)
+    this.accBlock = new Float64Array(n * this.lastQuantumLen);
+    this.accSqSums = new Float64Array(n);
+    this.rankIndices = new Int32Array(n);
+    for (let i = 0; i < n; i++) {
+      this.rankIndices[i] = i;
+    }
+
+    // Track degenerate pairs and avoid duplicate dot-product work
+    this.degeneratePairs = [];
+    this.degenMask = new Uint8Array(n * n);
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        if (Math.abs(this.modes[i].omega - this.modes[j].omega) < 0.1) {
+          this.degeneratePairs.push({ i, j, rowI: i * n + j, rowJ: j * n + i });
+          this.degenMask[i * n + j] = 1;
+          this.degenMask[j * n + i] = 1;
+        }
+      }
+    }
+  }
+
   recomputeCoefficients() {
     const dt = this.dt;
-    const L = this.sideLength;
     const n = this.modes.length;
 
     for (let i = 0; i < n; i++) {
@@ -84,18 +152,26 @@ class ModalWorkletProcessor extends AudioWorkletProcessor {
       const omega = mode.omega;
       const zeta = mode.zeta || 0.01;
       const omegaD = omega * Math.sqrt(Math.max(0, 1.0 - zeta * zeta));
+      const M = mode.modalMass || mode.M || 0.06075;
 
       this.omegas[i] = omega;
+      this.omegaSq[i] = omega * omega;
       this.zetas[i] = zeta;
-      this.omegaDs[i] = omegaD;
-      this.modalMasses[i] = mode.M;
+      this.twoZetaOmega[i] = 2.0 * zeta * omega;
+      this.modalMasses[i] = M;
 
-      this.expDecays[i] = Math.exp(-zeta * omega * dt);
-      this.cosTerms[i] = Math.cos(omegaD * dt);
-      this.sinTerms[i] = Math.sin(omegaD * dt);
-
-      // Center shaker coupling: phi_mn(L/2, L/2) = sin(m*pi/2)*sin(n*pi/2)
+      // Exact center shaker coupling: phi_mn(L/2, L/2) = sin(m*pi/2)*sin(n*pi/2)
       this.couplings[i] = Math.sin((mode.m * Math.PI) / 2.0) * Math.sin((mode.n * Math.PI) / 2.0);
+
+      const expDecay = Math.exp(-zeta * omega * dt);
+      const cosTerm = Math.cos(omegaD * dt);
+      const sinTerm = Math.sin(omegaD * dt);
+      const sinOverOmegaD = omegaD > 1e-12 ? sinTerm / omegaD : dt;
+
+      this.A11[i] = expDecay * (cosTerm + zeta * omega * sinOverOmegaD);
+      this.A12[i] = expDecay * sinOverOmegaD;
+      this.A21[i] = -expDecay * (omega * omega * sinOverOmegaD);
+      this.A22[i] = expDecay * (cosTerm - zeta * omega * sinOverOmegaD);
     }
   }
 
@@ -105,20 +181,15 @@ class ModalWorkletProcessor extends AudioWorkletProcessor {
     switch (msg.type) {
       case 'CONFIGURE_MODES':
         if (Array.isArray(msg.modes) && msg.modes.length > 0) {
-          this.modes = msg.modes;
-          const n = this.modes.length;
-          this.displacements = new Float64Array(n);
-          this.velocities = new Float64Array(n);
-          this.accelerations = new Float64Array(n);
-          this.covarianceMatrix = new Float64Array(n * n);
-          this.expDecays = new Float64Array(n);
-          this.cosTerms = new Float64Array(n);
-          this.sinTerms = new Float64Array(n);
-          this.omegas = new Float64Array(n);
-          this.omegaDs = new Float64Array(n);
-          this.zetas = new Float64Array(n);
-          this.modalMasses = new Float64Array(n);
-          this.couplings = new Float64Array(n);
+          this.modes = msg.modes.map((m) => ({
+            m: m.m,
+            n: m.n,
+            frequency: m.frequency,
+            omega: m.omega || 2.0 * Math.PI * m.frequency,
+            zeta: m.zeta || 0.01,
+            modalMass: m.modalMass || m.M || 0.06075,
+          }));
+          this.initModeArrays();
           this.recomputeCoefficients();
         }
         break;
@@ -133,6 +204,50 @@ class ModalWorkletProcessor extends AudioWorkletProcessor {
     }
   }
 
+  buildSnapshot() {
+    const n = this.modes.length;
+    const covarianceDiag = new Array(n);
+    const covarianceCross = [];
+
+    let maxVar = 0;
+    let maxAcc = 0;
+
+    for (let i = 0; i < n; i++) {
+      const diag = this.covarianceMatrix[i * n + i];
+      covarianceDiag[i] = diag;
+      if (diag > maxVar) maxVar = diag;
+      const a = Math.abs(this.accelerations[i]);
+      if (a > maxAcc) maxAcc = a;
+
+      const rowOffset = i * n;
+      for (let j = i + 1; j < n; j++) {
+        const val = this.covarianceMatrix[rowOffset + j];
+        if (Math.abs(val) > 1e-8) {
+          covarianceCross.push(i, j, val);
+        }
+      }
+    }
+
+    // Use acceleration & covariance energy (never displacement, which scales as 1/omega^2 at 20kHz)
+    const hasVibration = maxAcc > 1e-3 || maxVar > 1e-4;
+
+    return {
+      type: 'MODAL_SNAPSHOT',
+      sampleFramesProcessed: this.sampleFramesProcessed,
+      sampleRate: this.sampleRate,
+      elapsedSimTime: this.sampleFramesProcessed / this.sampleRate,
+      modeCount: n,
+      displacements: Array.from(this.displacements),
+      velocities: Array.from(this.velocities),
+      accelerations: Array.from(this.accelerations),
+      covarianceDiag,
+      covarianceCross,
+      isPlaying: !this.isSilent || hasVibration,
+      isSilent: this.isSilent && !hasVibration,
+      quantumCount: this.quantumCount,
+    };
+  }
+
   process(inputs, outputs) {
     this.quantumCount++;
 
@@ -141,112 +256,154 @@ class ModalWorkletProcessor extends AudioWorkletProcessor {
     const inputChannel = input && input.length > 0 ? input[0] : null;
     const outputChannel = output && output.length > 0 ? output[0] : null;
 
-    // Zero output to prevent redundant system audio routing from worklet node
     if (outputChannel) {
       outputChannel.fill(0);
     }
 
     const quantumLen = inputChannel ? inputChannel.length : 128;
     const n = this.modes.length;
-    let localEnergy = 0;
 
-    // Track block RMS acceleration per mode
-    const accSqSums = new Float64Array(n);
+    if (quantumLen !== this.lastQuantumLen) {
+      this.lastQuantumLen = quantumLen;
+      this.accBlock = new Float64Array(n * quantumLen);
+      this.covAlpha = 1.0 - Math.exp(-(quantumLen * this.dt) / this.rmsWindowTimeConstant);
+    }
+
+    const accBlock = this.accBlock;
+    const accSqSums = this.accSqSums;
+    accSqSums.fill(0);
+    let localEnergy = 0;
 
     for (let s = 0; s < quantumLen; s++) {
       this.sampleFramesProcessed++;
 
       const rawSample = inputChannel ? inputChannel[s] : 0.0;
       localEnergy += rawSample * rawSample;
-      const excValue = rawSample * 3.0; // Scaled excitation force in N
+      const excValue = rawSample * 3.0; // Center shaker excitation force in Newtons
 
-      for (let i = 0; i < n; i++) {
-        const Q = excValue * this.couplings[i];
-        const omega = this.omegas[i];
-        const omegaD = this.omegaDs[i];
-        const zeta = this.zetas[i];
-        const M = this.modalMasses[i];
-        const u = Q / M;
+      if (Math.abs(excValue) > 1e-12) {
+        // Forced exact discrete-time ZOH modal transition
+        for (let i = 0; i < n; i++) {
+          const u = (excValue * this.couplings[i]) / this.modalMasses[i];
+          const w2 = this.omegaSq[i];
+          const qEq = u / w2;
+          const qTilde = this.displacements[i] - qEq;
+          const v0 = this.velocities[i];
 
-        const qEq = u / (omega * omega);
-        const q0Tilde = this.displacements[i] - qEq;
-        const v0 = this.velocities[i];
+          const qNew = this.A11[i] * qTilde + this.A12[i] * v0 + qEq;
+          const vNew = this.A21[i] * qTilde + this.A22[i] * v0;
+          const aNew = u - this.twoZetaOmega[i] * vNew - w2 * qNew;
 
-        const expDecay = this.expDecays[i];
-        const cosTerm = this.cosTerms[i];
-        const sinTerm = this.sinTerms[i];
+          this.displacements[i] = qNew;
+          this.velocities[i] = vNew;
+          this.accelerations[i] = aNew;
 
-        const qTildeNew = expDecay * (q0Tilde * cosTerm + ((v0 + zeta * omega * q0Tilde) / omegaD) * sinTerm);
-        const vNew = expDecay * (v0 * cosTerm - ((omega * omega * q0Tilde + zeta * omega * v0) / omegaD) * sinTerm);
+          accBlock[i * quantumLen + s] = aNew;
+          accSqSums[i] += aNew * aNew;
+        }
+      } else {
+        // Exact unforced free modal decay (q_ddot + 2*zeta*omega*q_dot + omega^2*q = 0)
+        for (let i = 0; i < n; i++) {
+          const q0 = this.displacements[i];
+          const v0 = this.velocities[i];
 
-        const qNew = qTildeNew + qEq;
-        const aNew = u - 2.0 * zeta * omega * vNew - omega * omega * qNew;
+          const qNew = this.A11[i] * q0 + this.A12[i] * v0;
+          const vNew = this.A21[i] * q0 + this.A22[i] * v0;
+          const aNew = -this.twoZetaOmega[i] * vNew - this.omegaSq[i] * qNew;
 
-        this.displacements[i] = qNew;
-        this.velocities[i] = vNew;
-        this.accelerations[i] = aNew;
+          this.displacements[i] = qNew;
+          this.velocities[i] = vNew;
+          this.accelerations[i] = aNew;
 
-        accSqSums[i] += aNew * aNew;
+          accBlock[i * quantumLen + s] = aNew;
+          accSqSums[i] += aNew * aNew;
+        }
       }
     }
 
-    // Efficient block covariance update once per quantum (every 2.9 ms):
-    // Preserves numerical accuracy within 0.05% of sample-by-sample update while reducing CPU by 128x.
+    // Exponentially smooth full covariance matrix over the quantum
     const alpha = this.covAlpha;
+    const oneMinusAlpha = 1.0 - alpha;
     const invQ = 1.0 / quantumLen;
+    const covLen = this.covarianceMatrix.length;
+    for (let k = 0; k < covLen; k++) {
+      this.covarianceMatrix[k] *= oneMinusAlpha;
+    }
 
+    // 1. All 146 diagonal auto-variances
     for (let i = 0; i < n; i++) {
-      const aRms_i = Math.sqrt(accSqSums[i] * invQ);
-      const rowOffset = i * n;
-      // Auto-variance
-      const varIdx = rowOffset + i;
-      this.covarianceMatrix[varIdx] = this.covarianceMatrix[varIdx] * (1.0 - alpha) + (aRms_i * aRms_i) * alpha;
+      this.covarianceMatrix[i * n + i] += accSqSums[i] * invQ * alpha;
+    }
 
-      // Degenerate mode cross-terms (modes with same frequency, e.g. (1,3) and (3,1))
-      for (let j = i + 1; j < n; j++) {
-        if (Math.abs(this.omegas[i] - this.omegas[j]) < 0.1) {
-          const crossTerm = this.accelerations[i] * this.accelerations[j];
-          const idx1 = rowOffset + j;
-          const idx2 = j * n + i;
-          const updated = this.covarianceMatrix[idx1] * (1.0 - alpha) + crossTerm * alpha;
-          this.covarianceMatrix[idx1] = updated;
-          this.covarianceMatrix[idx2] = updated;
+    // 2. All degenerate equal-frequency mode cross-terms (sample-averaged over entire quantum)
+    const numDegen = this.degeneratePairs.length;
+    for (let p = 0; p < numDegen; p++) {
+      const pair = this.degeneratePairs[p];
+      const offI = pair.i * quantumLen;
+      const offJ = pair.j * quantumLen;
+      let sum = 0;
+      for (let s = 0; s < quantumLen; s++) {
+        sum += accBlock[offI + s] * accBlock[offJ + s];
+      }
+      const deltaCov = sum * invQ * alpha;
+      this.covarianceMatrix[pair.rowI] += deltaCov;
+      this.covarianceMatrix[pair.rowJ] += deltaCov;
+    }
+
+    // 3. Top-K (K=24) highest-energy active non-degenerate modal cross-terms
+    const K = Math.min(24, n);
+    const rankIndices = this.rankIndices;
+    for (let a = 0; a < K; a++) {
+      let bestPos = a;
+      let bestEnergy = accSqSums[rankIndices[a]];
+      for (let b = a + 1; b < n; b++) {
+        const energy = accSqSums[rankIndices[b]];
+        if (energy > bestEnergy) {
+          bestEnergy = energy;
+          bestPos = b;
         }
+      }
+      if (bestPos !== a) {
+        const tmp = rankIndices[a];
+        rankIndices[a] = rankIndices[bestPos];
+        rankIndices[bestPos] = tmp;
+      }
+    }
+
+    for (let a = 0; a < K; a++) {
+      const i = rankIndices[a];
+      if (accSqSums[i] <= 1e-12) break;
+      const offI = i * quantumLen;
+      for (let b = a + 1; b < K; b++) {
+        const j = rankIndices[b];
+        if (accSqSums[j] <= 1e-12) break;
+        if (this.degenMask[i * n + j]) continue; // Already updated in step 2
+
+        const offJ = j * quantumLen;
+        let sum = 0;
+        for (let s = 0; s < quantumLen; s++) {
+          sum += accBlock[offI + s] * accBlock[offJ + s];
+        }
+        const deltaCov = sum * invQ * alpha;
+        this.covarianceMatrix[i * n + j] += deltaCov;
+        this.covarianceMatrix[j * n + i] += deltaCov;
       }
     }
 
     this.isSilent = localEnergy < 1e-10;
     this.samplesSinceLastSnapshot += quantumLen;
 
-    // Check if plate has residual vibration even if input is zero (free decay)
-    let maxDisp = 0;
-    for (let i = 0; i < n; i++) {
-      const d = Math.abs(this.displacements[i]);
-      if (d > maxDisp) maxDisp = d;
-    }
-    const hasVibration = maxDisp > 1e-8;
-
-    // Publish snapshot at controlled ~60 Hz rate
     if (this.samplesSinceLastSnapshot >= this.snapshotIntervalSamples) {
       this.samplesSinceLastSnapshot = 0;
-
-      this.port.postMessage({
-        type: 'MODAL_SNAPSHOT',
-        sampleFramesProcessed: this.sampleFramesProcessed,
-        sampleRate: this.sampleRate,
-        elapsedSimTime: this.sampleFramesProcessed / this.sampleRate,
-        displacements: Array.from(this.displacements),
-        velocities: Array.from(this.velocities),
-        accelerations: Array.from(this.accelerations),
-        covarianceMatrix: Array.from(this.covarianceMatrix),
-        isPlaying: !this.isSilent || hasVibration,
-        isSilent: this.isSilent && !hasVibration,
-        quantumCount: this.quantumCount,
-      });
+      this.port.postMessage(this.buildSnapshot());
     }
 
-    return true; // Keep worklet active
+    return true;
   }
 }
 
-registerProcessor('modal-worklet-processor', ModalWorkletProcessor);
+if (typeof AudioWorkletProcessor !== 'undefined' && typeof registerProcessor === 'function') {
+  registerProcessor('modal-worklet-processor', ModalWorkletProcessor);
+} else if (typeof globalThis !== 'undefined') {
+  globalThis.__ModalWorkletProcessorClass = ModalWorkletProcessor;
+}

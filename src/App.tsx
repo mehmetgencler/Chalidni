@@ -1,28 +1,32 @@
 /**
  * Chladni Plate Acoustical Simulator: Main Application
- * 
- * Conforms to STAGE 7 Requirements:
- * - Minimal, realistic Chladni plate visualization.
+ *
+ * Conforms to STAGE 8 Requirements:
+ * - Minimal, realistic Chladni plate visualization (UI unchanged from Stage 7).
  * - Perfectly square plate dominates the screen with dark brushed metallic realism.
- * - Only two input methods:
+ * - Two audio input methods routed through ONE unified AudioWorklet modal engine:
  *   1. Single-tone sine wave generator with logarithmic slider (20 Hz - 20,000 Hz).
- *   2. Uploaded stereo audio file playback through AudioWorklet.
- * - Natural damped free decay when input stops: particles gradually slow and settle into nodal lines.
- * - Authoritative AudioWorklet simulation clock with bounded time accumulator.
- * - Zero microphone functionality, zero parameter clutter.
+ *   2. Uploaded stereo audio file playback with Play/Pause and stereo speaker output.
+ * - Full 146-mode center-coupled Kirchhoff catalogue (up to 20 kHz) configured on Worklet.
+ * - Single authoritative simulation clock: t = sampleFramesProcessed / sampleRate.
+ * - Zero duplicate RAF physics loops; requestAnimationFrame only renders Canvas.
+ * - Bounded chunked catch-up preserves delayed physical time without discarding it.
+ * - True per-mode physical free decay when excitation pauses, stops, or ends.
  */
 
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef } from 'react';
 import { Waves } from 'lucide-react';
 import { AudioEngine } from './audio/audioEngine.ts';
 import { ModalBank } from './physics/modalSolver.ts';
 import { ParticleTransportSystem } from './physics/particleTransport.ts';
+import { SimulationClockAccumulator } from './physics/simulationClock.ts';
 import { DEFAULT_ALUMINUM, DEFAULT_GEOMETRY } from './physics/plate.ts';
 import { PlateCanvas } from './components/PlateCanvas.tsx';
 import { AudioExciter } from './components/AudioExciter.tsx';
 
 export function App() {
   const sideLength = DEFAULT_GEOMETRY.sideLength; // 0.30 m
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   // Audio Engine singleton
   const audioEngineRef = useRef<AudioEngine | null>(null);
@@ -31,7 +35,7 @@ export function App() {
   }
   const audioEngine = audioEngineRef.current;
 
-  // Fixed physical configuration: Simply supported aluminum plate, zeta = 0.01
+  // Unified 146-mode center-coupled physical plate model (20 Hz - 20 kHz, zeta = 0.01)
   const modalBank = useMemo(() => {
     return new ModalBank(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY, 0.01);
   }, []);
@@ -41,7 +45,7 @@ export function App() {
     return new ParticleTransportSystem(
       {
         particleCount: 3000,
-        dRef: 1.0e-4,
+        dRef: 2.0e-6,
         gammaC: 1.0,
         power: 2.0,
         g: 9.80665,
@@ -52,95 +56,44 @@ export function App() {
     );
   }, [sideLength]);
 
-  // AudioWorklet sample-frame tracking & bounded time accumulator
-  const lastSampleFramesRef = useRef<number>(0);
-  const timeAccumulatorRef = useRef<number>(0);
-  const DT_PARTICLE = 0.016; // 16 ms fixed physical step
+  // Single authoritative sample-frame clock accumulator
+  const simClock = useMemo(() => new SimulationClockAccumulator(), []);
+  const DT_PARTICLE = 0.016; // 16 ms fixed physical transport step
+  const MAX_SUBSTEPS_PER_SNAPSHOT = 4;
 
-  // Tone generator state tracking
-  const [isToneActive, setIsToneActive] = useState<boolean>(false);
-  const [toneFrequency, setToneFrequency] = useState<number>(53.96);
+  // Send complete 146-mode catalogue to AudioWorklet initialization queue
+  useEffect(() => {
+    audioEngine.configureModes(modalBank.getWorkletModeConfig());
+  }, [audioEngine, modalBank]);
 
-  const handleFrequencyChange = (f: number) => {
-    setToneFrequency(f);
-    modalBank.setHarmonicTone(f, isToneActive);
-  };
-
-  const handleToneStateChange = (isPlaying: boolean, f: number) => {
-    setIsToneActive(isPlaying);
-    setToneFrequency(f);
-    modalBank.setHarmonicTone(f, isPlaying);
-  };
-
-  // Subscribe to AudioWorklet snapshots (for broadband audio file mode and clock synchronization)
+  // Single unified physics & particle transport subscription driven strictly by AudioWorklet clock
   useEffect(() => {
     const unsubscribe = audioEngine.onSnapshot((snapshot) => {
-      // If an audio file is currently active, sync dynamic state from worklet
-      if (audioEngine.activeSourceType === 'file') {
-        modalBank.applySnapshot(snapshot);
-      }
+      // Apply modal displacements, velocities, accelerations, and covariance for both tone and file
+      modalBank.applySnapshot(snapshot);
 
-      // Authoritative physical time from monotonic sample frames
-      if (lastSampleFramesRef.current === 0) {
-        lastSampleFramesRef.current = snapshot.sampleFramesProcessed;
-        return;
-      }
+      // Advance particle transport strictly once per elapsed sample-frame interval
+      simClock.advanceFromSnapshot(snapshot, DT_PARTICLE, MAX_SUBSTEPS_PER_SNAPSHOT, (dt) => {
+        particleSystem.step(dt, (px, py) => {
+          const aRms = modalBank.sampleRmsFieldFast(px, py);
+          return particleSystem.evaluateDimensionalDiffusivity(aRms, snapshot.isSilent);
+        });
+      });
 
-      const deltaSamples = snapshot.sampleFramesProcessed - lastSampleFramesRef.current;
-      lastSampleFramesRef.current = snapshot.sampleFramesProcessed;
-
-      if (deltaSamples > 0 && snapshot.sampleRate > 0) {
-        const dtSim = deltaSamples / snapshot.sampleRate;
-        timeAccumulatorRef.current += dtSim;
-
-        // Bounded catch-up: allow up to 10 sub-steps per snapshot to prevent stalling
-        let subSteps = 0;
-        const maxSubSteps = 10;
-
-        while (timeAccumulatorRef.current >= DT_PARTICLE && subSteps < maxSubSteps) {
-          particleSystem.step(DT_PARTICLE, (px, py) => {
-            const aRms = modalBank.evaluateRmsAcceleration(px, py);
-            return particleSystem.evaluateDimensionalDiffusivity(aRms);
-          });
-          timeAccumulatorRef.current -= DT_PARTICLE;
-          subSteps++;
-        }
-
-        // Bound remaining lag to prevent unbounded drift if browser tab was suspended
-        if (timeAccumulatorRef.current > 0.1) {
-          timeAccumulatorRef.current = 0.1;
-        }
+      // Expose non-reactive observability attributes on canvas element for verification
+      const canvasEl = canvasRef.current;
+      if (canvasEl) {
+        canvasEl.dataset.simFrames = String(snapshot.sampleFramesProcessed);
+        canvasEl.dataset.simTime = snapshot.elapsedSimTime.toFixed(4);
+        canvasEl.dataset.modeCount = String(snapshot.modeCount ?? modalBank.modes.length);
+        canvasEl.dataset.particleSteps = String(simClock.stepsExecuted);
+        canvasEl.dataset.isSilent = String(snapshot.isSilent);
+        canvasEl.dataset.sourceType = audioEngine.activeSourceType;
       }
     });
 
     return unsubscribe;
-  }, [audioEngine, modalBank, particleSystem]);
-
-  // Single-tone RAF physics step (smoothly evaluates harmonic response & free decay)
-  useEffect(() => {
-    let animId: number;
-    let lastTime = performance.now();
-
-    const loop = (now: number) => {
-      const dt = Math.min(0.05, (now - lastTime) / 1000.0);
-      lastTime = now;
-
-      if (modalBank.isHarmonicToneMode) {
-        modalBank.updateHarmonicDecay(now);
-
-        // Step particle transport if plate is vibrating
-        particleSystem.step(dt, (px, py) => {
-          const aRms = modalBank.evaluateRmsAcceleration(px, py);
-          return particleSystem.evaluateDimensionalDiffusivity(aRms);
-        });
-      }
-
-      animId = requestAnimationFrame(loop);
-    };
-
-    animId = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(animId);
-  }, [modalBank, particleSystem]);
+  }, [audioEngine, modalBank, particleSystem, simClock]);
 
   // Clean up audio on unmount
   useEffect(() => {
@@ -148,6 +101,16 @@ export function App() {
       audioEngine.cleanup();
     };
   }, [audioEngine]);
+
+  const handleFrequencyChange = (_f: number) => {
+    // OscillatorNode frequency is updated directly in AudioEngine;
+    // ModalWorkletProcessor integrates physical plate response at sampleRate.
+  };
+
+  const handleToneStateChange = (_isPlaying: boolean, _f: number) => {
+    // Tone gain ramps smoothly in AudioEngine;
+    // ModalWorkletProcessor handles forced excitation and natural free modal decay.
+  };
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans select-none">
@@ -177,6 +140,7 @@ export function App() {
           <PlateCanvas
             particles={particleSystem.particles}
             sideLength={sideLength}
+            canvasRefExternal={canvasRef}
           />
         </section>
 

@@ -72,10 +72,13 @@ export interface ModalSnapshot {
   sampleFramesProcessed: number;
   sampleRate: number;
   elapsedSimTime: number;
+  modeCount?: number;
   displacements: number[];
   velocities: number[];
   accelerations: number[];
-  covarianceMatrix: number[];
+  covarianceMatrix?: number[];
+  covarianceDiag?: number[];
+  covarianceCross?: number[];
   isPlaying: boolean;
   isSilent: boolean;
   quantumCount: number;

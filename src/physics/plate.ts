@@ -158,6 +158,18 @@ export function generateModalCatalogue(
   return catalogue;
 }
 
+/**
+ * Returns only the active odd-odd modes coupled to the center point shaker (x0=L/2, y0=L/2).
+ * For the default 0.30 m aluminum plate up to 20,000 Hz, this yields exactly 146 modes.
+ */
+export function getActiveCenterCoupledModes(
+  maxFrequency: number = 20000,
+  material: PlateMaterial = DEFAULT_ALUMINUM,
+  geometry: PlateGeometry = DEFAULT_GEOMETRY
+): ModeCatalogueItem[] {
+  return generateModalCatalogue(maxFrequency, material, geometry).filter((m) => m.isOddOdd);
+}
+
 export interface ModalPhasorComponent {
   m: number;
   n: number;

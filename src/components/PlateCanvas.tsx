@@ -1,63 +1,76 @@
 /**
  * PlateCanvas: Top-down, orthographic, realistic visualization of a vibrating square metal plate.
- * 
- * Conforms to STAGE 7 Requirements:
+ *
+ * Conforms to STAGE 8 Requirements:
  * - Square plate dominates the view with zero perspective distortion.
  * - Realistic dark brushed aluminum plate surface with subtle metallic sheen and refined rim.
- * - Fine, pale sand or powder particles with natural variations in size and brightness.
- * - Subtle particle depth cues and contact shadows.
+ * - Fine, pale sand or powder particles using actual per-particle radius & brightness attributes.
+ * - Subtle pre-baked contact shadow in offscreen sprite tiers (zero expensive per-particle shadowBlur).
  * - Zero artificial glowing overlays, heatmaps, or drawn nodal lines.
- * - The nodal patterns emerge purely from simulated granular accumulation.
- * - Fixed high-density particle rendering with capped DPR = 2.
+ * - Pure rendering loop: never advances modal integration, free decay, or particle transport.
  */
 
 import React, { useEffect, useRef } from 'react';
 import { Particle } from '../physics/types.ts';
+import { computeParticleRenderParams, SPRITE_BASE_PX } from './plateVisuals.ts';
 
 export type HeatmapType = 'none' | 'diffusivity' | 'displacement' | 'nodal';
 
 interface PlateCanvasProps {
   particles: Particle[];
   sideLength: number; // m
+  canvasRefExternal?: React.RefObject<HTMLCanvasElement | null>;
 }
 
-export const PlateCanvas: React.FC<PlateCanvasProps> = ({ particles, sideLength }) => {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+const GRAIN_SPRITE_TIERS = [
+  { body: 'rgba(198, 206, 218, 0.80)', spec: 'rgba(255, 255, 255, 0.35)' }, // Dimmer cool silica
+  { body: 'rgba(215, 222, 232, 0.86)', spec: 'rgba(255, 255, 255, 0.44)' }, // Soft quartz
+  { body: 'rgba(232, 236, 240, 0.90)', spec: 'rgba(255, 255, 255, 0.52)' }, // Pale aluminum powder
+  { body: 'rgba(246, 241, 214, 0.92)', spec: 'rgba(255, 255, 255, 0.58)' }, // Warm fine sand
+  { body: 'rgba(244, 247, 251, 0.95)', spec: 'rgba(255, 255, 255, 0.68)' }, // Bright quartz
+  { body: 'rgba(254, 246, 198, 0.96)', spec: 'rgba(255, 255, 255, 0.78)' }, // High-luminance pale grain
+];
 
-  // Pre-rendered grain sprites for high-performance antialiased rendering
+export const PlateCanvas: React.FC<PlateCanvasProps> = ({
+  particles,
+  sideLength,
+  canvasRefExternal,
+}) => {
+  const internalCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const canvasRef = canvasRefExternal ?? internalCanvasRef;
+  const particlesRef = useRef<Particle[]>(particles);
+  particlesRef.current = particles;
+
+  // Pre-rendered grain sprite tiers ordered by luminance/tint
   const spritesRef = useRef<HTMLCanvasElement[] | null>(null);
+  // Cached brushed aluminum plate background (only re-rendered when size or dpr changes)
+  const plateSurfaceRef = useRef<{ canvas: HTMLCanvasElement; size: number; dpr: number } | null>(null);
 
-  // Initialize offscreen grain sprites with natural subtle variations and soft shadow
   useEffect(() => {
     const sprites: HTMLCanvasElement[] = [];
-    const tints = [
-      'rgba(241, 245, 249, 0.95)', // Pale quartz / salt
-      'rgba(226, 232, 240, 0.92)', // Fine aluminum powder
-      'rgba(254, 240, 138, 0.88)', // Pale brass grain
-      'rgba(203, 213, 225, 0.90)', // Natural silica
-    ];
+    const s = SPRITE_BASE_PX;
 
-    for (let i = 0; i < tints.length; i++) {
+    for (let i = 0; i < GRAIN_SPRITE_TIERS.length; i++) {
+      const tier = GRAIN_SPRITE_TIERS[i];
       const sprite = document.createElement('canvas');
-      const s = 12; // 12x12 sprite
       sprite.width = s;
       sprite.height = s;
       const sCtx = sprite.getContext('2d');
       if (sCtx) {
-        // Soft contact drop shadow
-        sCtx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+        // Subtle pre-baked contact drop shadow
+        sCtx.fillStyle = 'rgba(0, 0, 0, 0.42)';
         sCtx.beginPath();
-        sCtx.arc(s / 2 + 0.6, s / 2 + 0.8, 2.0, 0, Math.PI * 2);
+        sCtx.arc(s / 2 + 0.55, s / 2 + 0.75, 2.0, 0, Math.PI * 2);
         sCtx.fill();
 
         // Main grain body
-        sCtx.fillStyle = tints[i];
+        sCtx.fillStyle = tier.body;
         sCtx.beginPath();
-        sCtx.arc(s / 2, s / 2, 1.8, 0, Math.PI * 2);
+        sCtx.arc(s / 2, s / 2, 1.85, 0, Math.PI * 2);
         sCtx.fill();
 
         // Subtle specular micro-highlight
-        sCtx.fillStyle = 'rgba(255, 255, 255, 0.6)';
+        sCtx.fillStyle = tier.spec;
         sCtx.beginPath();
         sCtx.arc(s / 2 - 0.5, s / 2 - 0.5, 0.7, 0, Math.PI * 2);
         sCtx.fill();
@@ -67,7 +80,7 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({ particles, sideLength 
     spritesRef.current = sprites;
   }, []);
 
-  // Continuous rendering loop mounted once
+  // Pure rendering loop (never advances physics or particle transport)
   useEffect(() => {
     let animId: number;
 
@@ -84,105 +97,115 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({ particles, sideLength 
         return;
       }
 
-      // Handle high DPI display (capped at 2 for guaranteed 60 FPS)
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
       const width = canvas.clientWidth;
       const height = canvas.clientHeight;
       const size = Math.min(width, height);
 
-      if (canvas.width !== size * dpr || canvas.height !== size * dpr) {
-        canvas.width = size * dpr;
-        canvas.height = size * dpr;
+      if (size <= 0) {
+        animId = requestAnimationFrame(render);
+        return;
+      }
+
+      const targetPx = Math.round(size * dpr);
+      if (canvas.width !== targetPx || canvas.height !== targetPx) {
+        canvas.width = targetPx;
+        canvas.height = targetPx;
+      }
+
+      // Build or reuse cached brushed metal plate surface
+      let cached = plateSurfaceRef.current;
+      if (!cached || cached.size !== size || cached.dpr !== dpr) {
+        const off = document.createElement('canvas');
+        off.width = targetPx;
+        off.height = targetPx;
+        const oCtx = off.getContext('2d');
+        if (oCtx) {
+          oCtx.scale(dpr, dpr);
+
+          // 1. Realistic dark brushed metal plate surface
+          const plateGrad = oCtx.createRadialGradient(
+            size * 0.45,
+            size * 0.42,
+            size * 0.05,
+            size * 0.5,
+            size * 0.5,
+            size * 0.72
+          );
+          plateGrad.addColorStop(0.0, '#1c222c');
+          plateGrad.addColorStop(0.35, '#161b23');
+          plateGrad.addColorStop(0.7, '#11151c');
+          plateGrad.addColorStop(1.0, '#0c0f14');
+
+          oCtx.fillStyle = plateGrad;
+          oCtx.fillRect(0, 0, size, size);
+
+          // Subtle fine brushed horizontal grain lines
+          oCtx.strokeStyle = 'rgba(255, 255, 255, 0.015)';
+          oCtx.lineWidth = 1;
+          for (let y = 2; y < size - 2; y += 4) {
+            oCtx.beginPath();
+            oCtx.moveTo(2, y);
+            oCtx.lineTo(size - 2, y);
+            oCtx.stroke();
+          }
+
+          // 2. Refined beveled metal edge
+          oCtx.strokeStyle = '#0f172a';
+          oCtx.lineWidth = 2.5;
+          oCtx.strokeRect(1, 1, size - 2, size - 2);
+
+          oCtx.strokeStyle = '#334155';
+          oCtx.lineWidth = 1;
+          oCtx.strokeRect(2.5, 2.5, size - 5, size - 5);
+
+          // Center shaker probe mounting pin
+          oCtx.fillStyle = '#0f172a';
+          oCtx.beginPath();
+          oCtx.arc(size / 2, size / 2, 4.0, 0, Math.PI * 2);
+          oCtx.fill();
+          oCtx.fillStyle = '#475569';
+          oCtx.beginPath();
+          oCtx.arc(size / 2, size / 2, 2.5, 0, Math.PI * 2);
+          oCtx.fill();
+          oCtx.fillStyle = '#94a3b8';
+          oCtx.beginPath();
+          oCtx.arc(size / 2 - 0.5, size / 2 - 0.5, 0.8, 0, Math.PI * 2);
+          oCtx.fill();
+        }
+        cached = { canvas: off, size, dpr };
+        plateSurfaceRef.current = cached;
       }
 
       ctx.save();
       ctx.scale(dpr, dpr);
+      ctx.drawImage(cached.canvas, 0, 0, size, size);
 
-      // 1. Realistic dark brushed metal plate surface
-      // Radial metallic sheen gradient
-      const plateGrad = ctx.createRadialGradient(
-        size * 0.45,
-        size * 0.42,
-        size * 0.05,
-        size * 0.5,
-        size * 0.5,
-        size * 0.72
-      );
-      plateGrad.addColorStop(0.0, '#1c222c');
-      plateGrad.addColorStop(0.35, '#161b23');
-      plateGrad.addColorStop(0.7, '#11151c');
-      plateGrad.addColorStop(1.0, '#0c0f14');
-
-      ctx.fillStyle = plateGrad;
-      ctx.fillRect(0, 0, size, size);
-
-      // Subtle fine brushed texture lines across the metal surface
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.015)';
-      ctx.lineWidth = 1;
-      const step = 4;
-      for (let y = 2; y < size - 2; y += step) {
-        ctx.beginPath();
-        ctx.moveTo(2, y);
-        ctx.lineTo(size - 2, y);
-        ctx.stroke();
-      }
-
-      // 2. Refined plate rim / beveled metal edge
-      // Outer rim
-      ctx.strokeStyle = '#0f172a';
-      ctx.lineWidth = 2.5;
-      ctx.strokeRect(1, 1, size - 2, size - 2);
-
-      // Inner metallic highlight rim
-      ctx.strokeStyle = '#334155';
-      ctx.lineWidth = 1;
-      ctx.strokeRect(2.5, 2.5, size - 5, size - 5);
-
-      // Center shaker probe mounting pin (subtle lab fixture dot at center)
-      ctx.fillStyle = '#0f172a';
-      ctx.beginPath();
-      ctx.arc(size / 2, size / 2, 4.0, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = '#475569';
-      ctx.beginPath();
-      ctx.arc(size / 2, size / 2, 2.5, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = '#94a3b8';
-      ctx.beginPath();
-      ctx.arc(size / 2 - 0.5, size / 2 - 0.5, 0.8, 0, Math.PI * 2);
-      ctx.fill();
-
-      // 3. Render granular powder particles
+      // 3. Render granular powder particles using per-particle radius & brightness
+      const activeParticles = particlesRef.current;
       const scale = size / sideLength;
       const sprites = spritesRef.current;
 
       if (sprites && sprites.length > 0) {
-        const spriteCount = sprites.length;
-        const spriteSize = 12;
-        const halfSprite = spriteSize / 2;
-
-        for (let i = 0; i < particles.length; i++) {
-          const p = particles[i];
+        const tierCount = sprites.length;
+        for (let i = 0; i < activeParticles.length; i++) {
+          const p = activeParticles[i];
           if (!p.active) continue;
 
           const px = p.x * scale;
           const py = p.y * scale;
+          const { spriteTier, drawSize } = computeParticleRenderParams(p, tierCount);
+          const half = drawSize * 0.5;
 
-          // Select deterministic sprite per particle index
-          const spriteIdx = i % spriteCount;
-          const sprite = sprites[spriteIdx];
-
-          // Draw pre-rendered antialiased powder grain with contact shadow
-          ctx.drawImage(sprite, px - halfSprite, py - halfSprite);
+          ctx.drawImage(sprites[spriteTier], px - half, py - half, drawSize, drawSize);
         }
       } else {
-        // Fallback direct circle rendering if sprites loading
         ctx.fillStyle = 'rgba(241, 245, 249, 0.95)';
-        for (let i = 0; i < particles.length; i++) {
-          const p = particles[i];
+        for (let i = 0; i < activeParticles.length; i++) {
+          const p = activeParticles[i];
           if (!p.active) continue;
           ctx.beginPath();
-          ctx.arc(p.x * scale, p.y * scale, 1.4, 0, Math.PI * 2);
+          ctx.arc(p.x * scale, p.y * scale, p.radius ?? 1.2, 0, Math.PI * 2);
           ctx.fill();
         }
       }
@@ -193,7 +216,7 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({ particles, sideLength 
 
     animId = requestAnimationFrame(render);
     return () => cancelAnimationFrame(animId);
-  }, [particles, sideLength]);
+  }, [sideLength, canvasRef]);
 
   return (
     <div className="w-full flex items-center justify-center p-2">
