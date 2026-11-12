@@ -4,7 +4,7 @@
  */
 
 import React, { useRef, useState, useEffect } from 'react';
-import { Volume2, VolumeX, Mic, MicOff, Upload, Radio, Activity, Play, Pause, RotateCcw } from 'lucide-react';
+import { Volume2, VolumeX, Mic, MicOff, Upload, Radio, Activity, Play, Pause, RotateCcw, AlertCircle } from 'lucide-react';
 import { AudioEngine, AudioSourceType, GeneratorWaveform } from '../audio/audioEngine.ts';
 
 interface AudioExciterProps {
@@ -35,6 +35,7 @@ export const AudioExciter: React.FC<AudioExciterProps> = ({
   const [isFileLooping, setIsFileLooping] = useState<boolean>(false);
   const [isMicMonitoring, setIsMicMonitoring] = useState<boolean>(false);
   const [isMuted, setIsMuted] = useState<boolean>(false);
+  const [micErrorMessage, setMicErrorMessage] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const oscCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -80,6 +81,7 @@ export const AudioExciter: React.FC<AudioExciterProps> = ({
   };
 
   const handleToggleMic = async () => {
+    setMicErrorMessage(null);
     if (isMicActive) {
       audioEngine.stopMicrophone();
       setIsMicActive(false);
@@ -90,6 +92,12 @@ export const AudioExciter: React.FC<AudioExciterProps> = ({
       if (ok) {
         setIsMicActive(true);
         setSourceType('microphone');
+        setMicErrorMessage(null);
+      } else {
+        setMicErrorMessage(
+          audioEngine.lastMicError ||
+            'Microphone access could not be initialized. Please check your browser permissions.'
+        );
       }
     }
   };
@@ -339,6 +347,26 @@ export const AudioExciter: React.FC<AudioExciterProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Microphone Status Notice / Inline Alert */}
+      {micErrorMessage && (
+        <div className="bg-rose-950/70 border border-rose-800 p-2.5 rounded-lg text-xs text-rose-200 flex items-start justify-between gap-2 shadow-sm">
+          <div className="flex items-start gap-1.5">
+            <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+            <div className="space-y-0.5">
+              <span className="font-semibold block text-rose-300">Microphone Notice</span>
+              <p className="text-[11px] text-rose-200/90 leading-relaxed">{micErrorMessage}</p>
+            </div>
+          </div>
+          <button
+            onClick={() => setMicErrorMessage(null)}
+            className="text-rose-400 hover:text-white text-xs px-1.5 py-0.5 rounded hover:bg-rose-900/50 transition font-bold"
+            title="Dismiss notice"
+          >
+            ✕
+          </button>
+        </div>
+      )}
 
       {/* Mic Monitor Opt-In Warning (Feedback Prevention) */}
       {isMicActive && (

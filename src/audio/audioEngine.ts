@@ -61,6 +61,7 @@ export class AudioEngine {
 
   // Latest snapshot received from AudioWorklet
   latestSnapshot: ModalSnapshot | null = null;
+  lastMicError: string | null = null;
   private snapshotListeners: Set<(snapshot: ModalSnapshot) => void> = new Set();
 
   constructor() {
@@ -319,20 +320,54 @@ export class AudioEngine {
    * Strictly routed to AudioWorklet; monitoring to speakers is MUTED by default to prevent feedback.
    */
   async startMicrophone(): Promise<boolean> {
+    this.lastMicError = null;
     try {
       await this.initContext();
-      if (!this.ctx || !this.micGain) return false;
+      if (!this.ctx || !this.micGain) {
+        this.lastMicError = 'AudioContext could not be initialized.';
+        return false;
+      }
 
       this.stopAllSources();
       this.sourceType = 'microphone';
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-        },
-      });
+      if (
+        typeof navigator === 'undefined' ||
+        !navigator.mediaDevices ||
+        typeof navigator.mediaDevices.getUserMedia !== 'function'
+      ) {
+        this.lastMicError =
+          'Microphone API (getUserMedia) is unavailable. Please ensure the app is running in a secure HTTPS context.';
+        console.warn('Microphone unavailable:', this.lastMicError);
+        return false;
+      }
+
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+          },
+        });
+      } catch (mediaErr: unknown) {
+        const errObj = mediaErr as Error;
+        const errName = errObj?.name || '';
+        if (errName === 'NotAllowedError' || errName === 'PermissionDeniedError') {
+          this.lastMicError =
+            'Microphone access was denied. Please allow microphone permissions in your browser address bar/settings.';
+        } else if (errName === 'NotFoundError' || errName === 'DevicesNotFoundError') {
+          this.lastMicError = 'No physical microphone device was detected on your system.';
+        } else if (errName === 'NotReadableError' || errName === 'TrackStartError') {
+          this.lastMicError =
+            'The microphone is currently in use or blocked by another program or operating system setting.';
+        } else {
+          this.lastMicError = `Microphone could not be started: ${errObj?.message || String(mediaErr)}`;
+        }
+        console.warn('Microphone permission notice:', this.lastMicError);
+        return false;
+      }
 
       this.micStream = stream;
       this.micSource = this.ctx.createMediaStreamSource(stream);
@@ -344,8 +379,10 @@ export class AudioEngine {
       }
 
       return true;
-    } catch (err) {
-      console.error('Failed to open microphone:', err);
+    } catch (err: unknown) {
+      const errObj = err as Error;
+      this.lastMicError = errObj?.message || 'Failed to initialize microphone.';
+      console.warn('Microphone setup exception:', this.lastMicError);
       return false;
     }
   }
