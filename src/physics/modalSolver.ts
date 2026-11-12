@@ -1,19 +1,23 @@
 /**
  * Modal Solver: Generalized Single-Degree-of-Freedom Oscillators
- * Features exact discrete-time state transition under zero-order-held force,
- * sample-rate audio stream stepping, and true time-window modal covariance RMS acceleration.
+ * Features:
+ * - 20 Hz to 20,000 Hz full-band frequency coverage across the complete 557-mode Kirchhoff catalogue.
+ * - Coherent complex spatial superposition for pure test tones: A_hat(x, y) = sum [ a_hat_mn * phi_mn(x, y) ].
+ * - Exact discrete-time ZOH state transition for real-time audio playback.
+ * - Natural physical exponential free decay e^(-zeta * omega * t) when excitation ceases.
  */
 
 import { ModalSnapshot, ModeState, PlateGeometry, PlateMaterial } from './types.ts';
 import {
   calculateAnalyticalFrequency,
-  calculateAnalyticalOmega,
   calculateModalMass,
+  computeHarmonicModalAccelerations,
   DEFAULT_ALUMINUM,
   DEFAULT_GEOMETRY,
+  generateModalCatalogue,
+  ModalPhasorComponent,
+  ModeCatalogueItem,
   modeShape,
-  pointForceModalCoupling,
-  uniformPressureModalCoupling,
 } from './plate.ts';
 
 export interface AnalyticalHarmonicResponse {
@@ -54,67 +58,82 @@ export class ModalBank {
   geometry: PlateGeometry;
   dampingRatio: number;
 
-  // Modal acceleration covariance matrix R_ij for true time-window RMS acceleration
-  // Dimension: numModes x numModes
-  covarianceMatrix: Float64Array;
-  rmsWindowTimeConstant: number = 0.08; // 80 ms moving time-window
+  // Full 20 Hz – 20,000 Hz modal catalogue (557 modes for default plate)
+  fullCatalogue: ModeCatalogueItem[] = [];
 
-  // Cached typed array to eliminate allocation churn in evaluateRmsAcceleration()
+  // Single-tone harmonic mode state
+  isHarmonicToneMode: boolean = true;
+  harmonicToneFrequency: number = 53.96;
+  isHarmonicPlaying: boolean = false;
+  private harmonicPhasors: ModalPhasorComponent[] = [];
+  private harmonicEnvelope: number = 0.0;
+  private lastHarmonicUpdateTime: number = 0;
+  private dominantDecayRate: number = 3.39; // zeta * omega_11
+
+  // Audio file broadband covariance matrix R_ij
+  covarianceMatrix: Float64Array;
+  rmsWindowTimeConstant: number = 0.08;
+
+  // Cached typed array to eliminate allocation churn
   private phisCache: Float64Array;
 
   constructor(
     material: PlateMaterial = DEFAULT_ALUMINUM,
     geometry: PlateGeometry = DEFAULT_GEOMETRY,
     dampingRatio: number = 0.01,
-    activeIndices: { m: number; n: number }[] = [
-      { m: 1, n: 1 }, // 53.96 Hz
-      { m: 1, n: 2 }, // 134.91 Hz
-      { m: 2, n: 1 }, // 134.91 Hz
-      { m: 2, n: 2 }, // 215.85 Hz
-      { m: 1, n: 3 }, // 269.81 Hz
-      { m: 3, n: 1 }, // 269.81 Hz
-      { m: 2, n: 3 }, // 350.76 Hz
-      { m: 3, n: 3 }, // 485.67 Hz
-    ]
+    activeIndices?: { m: number; n: number }[]
   ) {
     this.material = material;
     this.geometry = geometry;
     this.dampingRatio = dampingRatio;
-    this.covarianceMatrix = new Float64Array(activeIndices.length * activeIndices.length);
-    this.phisCache = new Float64Array(activeIndices.length);
-    this.initModes(activeIndices);
-  }
 
-  initModes(indices: { m: number; n: number }[]): void {
-    const M = calculateModalMass(this.material, this.geometry);
-    const nModes = indices.length;
+    // Generate the full modal catalogue up to 20 kHz (557 modes)
+    this.fullCatalogue = generateModalCatalogue(20000, material, geometry);
+
+    const initialModes =
+      activeIndices && activeIndices.length > 0
+        ? activeIndices.map(({ m, n }) => {
+            const f = calculateAnalyticalFrequency(m, n, material, geometry);
+            return {
+              m,
+              n,
+              frequency: f,
+              omega: 2 * Math.PI * f,
+              modalMass: calculateModalMass(material, geometry),
+              centerCoupling: modeShape(m, n, geometry.sideLength / 2, geometry.sideLength / 2, geometry.sideLength),
+              isOddOdd: m % 2 !== 0 && n % 2 !== 0,
+            };
+          })
+        : this.fullCatalogue.filter((m) => m.isOddOdd && m.frequency <= 2700);
+
+    const nModes = initialModes.length;
     this.covarianceMatrix = new Float64Array(nModes * nModes);
     this.phisCache = new Float64Array(nModes);
 
-    this.modes = indices.map(({ m, n }) => {
-      const f = calculateAnalyticalFrequency(m, n, this.material, this.geometry);
-      const omega = 2 * Math.PI * f;
-      const omegaD = omega * Math.sqrt(Math.max(0, 1 - this.dampingRatio * this.dampingRatio));
-      const K = M * omega * omega;
-      const C = 2 * M * this.dampingRatio * omega;
-
+    const M = calculateModalMass(material, geometry);
+    this.modes = initialModes.map((m) => {
+      const omega = m.omega;
+      const omegaD = omega * Math.sqrt(Math.max(0, 1 - dampingRatio * dampingRatio));
       return {
-        m,
-        n,
-        frequency: f,
+        m: m.m,
+        n: m.n,
+        frequency: m.frequency,
         omega,
         omegaD,
         modalMass: M,
-        modalStiffness: K,
-        modalDamping: C,
+        modalStiffness: M * omega * omega,
+        modalDamping: 2 * M * dampingRatio * omega,
         displacement: 0,
         velocity: 0,
         acceleration: 0,
         generalizedForce: 0,
-        dampingRatio: this.dampingRatio,
+        dampingRatio,
         active: true,
       };
     });
+
+    // Initialize default test tone at fundamental mode (53.96 Hz)
+    this.setHarmonicTone(53.96, false);
   }
 
   reset(): void {
@@ -125,53 +144,32 @@ export class ModalBank {
       mode.generalizedForce = 0;
     }
     this.covarianceMatrix.fill(0);
+    this.harmonicEnvelope = 0;
   }
 
-  /**
-   * Computes generalized force for all modes from a single scalar excitation input.
-   */
   computeGeneralizedForces(
     isPointForce: boolean,
-    excitationValue: number, // N for point force, Pa for uniform pressure
+    excitationValue: number,
     x0: number = 0.15,
     y0: number = 0.15
   ): void {
     const L = this.geometry.sideLength;
     for (const mode of this.modes) {
-      if (!mode.active) {
-        mode.generalizedForce = 0;
-        continue;
-      }
       if (isPointForce) {
-        const coupling = pointForceModalCoupling(mode.m, mode.n, x0, y0, L);
-        mode.generalizedForce = excitationValue * coupling;
+        mode.generalizedForce = excitationValue * modeShape(mode.m, mode.n, x0, y0, L);
       } else {
-        const couplingArea = uniformPressureModalCoupling(mode.m, mode.n, L);
-        mode.generalizedForce = excitationValue * couplingArea;
+        if (mode.m % 2 !== 0 && mode.n % 2 !== 0) {
+          const couplingArea = (4 * L * L) / (mode.m * mode.n * Math.PI * Math.PI);
+          mode.generalizedForce = excitationValue * couplingArea;
+        } else {
+          mode.generalizedForce = 0;
+        }
       }
     }
   }
 
-  /**
-   * PRIORITY 1: Exact discrete-time state transition for damped linear oscillator
-   * under Zero-Order Held (ZOH) generalized force Q_k:
-   * 
-   * q̈ + 2ζωq̇ + ω²q = u, where u = Q / M.
-   * Static equilibrium q_eq = u / ω²
-   * Let q̃(t) = q(t) - q_eq.
-   * q̃(t + dt) = exp(-ζω dt) * [ q̃(0)*cos(ω_d dt) + ((v(0) + ζω q̃(0))/ω_d)*sin(ω_d dt) ]
-   * v(t + dt) = exp(-ζω dt) * [ v(0)*cos(ω_d dt) - ((ω² q̃(0) + ζω v(0))/ω_d)*sin(ω_d dt) ]
-   * q(t + dt) = q̃(t + dt) + q_eq
-   * 
-   * This analytical state transition has discrete eigenvalues with modulus exp(-ζω dt) < 1,
-   * guaranteeing unconditional numerical stability for ANY timestep dt > 0 (even dt = 16.6 ms on a 485 Hz mode).
-   */
   stepExactZOH(dt: number): void {
-    if (dt <= 0) return;
-
-    const n = this.modes.length;
-    for (let i = 0; i < n; i++) {
-      const mode = this.modes[i];
+    for (const mode of this.modes) {
       if (!mode.active) continue;
 
       const omega = mode.omega;
@@ -180,7 +178,6 @@ export class ModalBank {
       const M = mode.modalMass;
       const u = mode.generalizedForce / M;
 
-      // Equilibrium offset under constant piece of force
       const qEq = u / (omega * omega);
       const q0Tilde = mode.displacement - qEq;
       const v0 = mode.velocity;
@@ -189,152 +186,18 @@ export class ModalBank {
       const cosTerm = Math.cos(omegaD * dt);
       const sinTerm = Math.sin(omegaD * dt);
 
-      // Homogeneous step
       const qTildeNew = expDecay * (q0Tilde * cosTerm + ((v0 + zeta * omega * q0Tilde) / omegaD) * sinTerm);
       const vNew = expDecay * (v0 * cosTerm - ((omega * omega * q0Tilde + zeta * omega * v0) / omegaD) * sinTerm);
 
       mode.displacement = qTildeNew + qEq;
       mode.velocity = vNew;
-      // Instantaneous acceleration from equation of motion: a = u - 2*zeta*omega*v - omega^2*q
       mode.acceleration = u - 2 * zeta * omega * vNew - omega * omega * mode.displacement;
     }
 
-    // Update modal covariance matrix for true time RMS
     this.updateCovarianceMatrix(dt);
   }
 
-  /**
-   * PRIORITY 2: Advances modal oscillator through an entire buffer of sequential audio samples
-   * at sample rate f_s (e.g. 44.1 kHz or 48 kHz).
-   * Applies excitation gain exactly once.
-   */
-  stepSampleBuffer(
-    samples: Float32Array,
-    sampleRate: number,
-    isPointForce: boolean,
-    x0: number,
-    y0: number,
-    gain: number
-  ): void {
-    if (samples.length === 0 || sampleRate <= 0) return;
-
-    const dt = 1 / sampleRate;
-    const L = this.geometry.sideLength;
-    const nModes = this.modes.length;
-
-    // Precompute couplings and mode-specific exponential transition coefficients for sampleRate
-    const couplings = new Float64Array(nModes);
-    const expDecays = new Float64Array(nModes);
-    const cosTerms = new Float64Array(nModes);
-    const sinTerms = new Float64Array(nModes);
-
-    for (let i = 0; i < nModes; i++) {
-      const mode = this.modes[i];
-      if (!mode.active) continue;
-
-      couplings[i] = isPointForce
-        ? pointForceModalCoupling(mode.m, mode.n, x0, y0, L)
-        : uniformPressureModalCoupling(mode.m, mode.n, L);
-
-      expDecays[i] = Math.exp(-mode.dampingRatio * mode.omega * dt);
-      cosTerms[i] = Math.cos(mode.omegaD * dt);
-      sinTerms[i] = Math.sin(mode.omegaD * dt);
-    }
-
-    // Step through sequential samples
-    for (let s = 0; s < samples.length; s++) {
-      const rawSample = samples[s];
-      // Excitation value with gain applied strictly once here:
-      const excValue = rawSample * gain;
-
-      for (let i = 0; i < nModes; i++) {
-        const mode = this.modes[i];
-        if (!mode.active) continue;
-
-        const Q = excValue * couplings[i];
-        mode.generalizedForce = Q;
-
-        const omega = mode.omega;
-        const zeta = mode.dampingRatio;
-        const omegaD = mode.omegaD;
-        const M = mode.modalMass;
-        const u = Q / M;
-
-        const qEq = u / (omega * omega);
-        const q0Tilde = mode.displacement - qEq;
-        const v0 = mode.velocity;
-
-        const expDecay = expDecays[i];
-        const cosTerm = cosTerms[i];
-        const sinTerm = sinTerms[i];
-
-        const qTildeNew = expDecay * (q0Tilde * cosTerm + ((v0 + zeta * omega * q0Tilde) / omegaD) * sinTerm);
-        const vNew = expDecay * (v0 * cosTerm - ((omega * omega * q0Tilde + zeta * omega * v0) / omegaD) * sinTerm);
-
-        mode.displacement = qTildeNew + qEq;
-        mode.velocity = vNew;
-        mode.acceleration = u - 2 * zeta * omega * vNew - omega * omega * mode.displacement;
-      }
-
-      this.updateCovarianceMatrix(dt);
-    }
-  }
-
-  /**
-   * Classical 4th-order Runge-Kutta step (preserved for verification comparisons)
-   */
-  stepRK4(dt: number): void {
-    for (const mode of this.modes) {
-      if (!mode.active) continue;
-
-      const M = mode.modalMass;
-      const C = mode.modalDamping;
-      const K = mode.modalStiffness;
-      const Q = mode.generalizedForce;
-
-      const fAcc = (q: number, v: number): number => {
-        return (Q - C * v - K * q) / M;
-      };
-
-      const q0 = mode.displacement;
-      const v0 = mode.velocity;
-
-      // k1
-      const k1_v = fAcc(q0, v0);
-      const k1_q = v0;
-
-      // k2
-      const q_half1 = q0 + 0.5 * dt * k1_q;
-      const v_half1 = v0 + 0.5 * dt * k1_v;
-      const k2_v = fAcc(q_half1, v_half1);
-      const k2_q = v_half1;
-
-      // k3
-      const q_half2 = q0 + 0.5 * dt * k2_q;
-      const v_half2 = v0 + 0.5 * dt * k2_v;
-      const k3_v = fAcc(q_half2, v_half2);
-      const k3_q = v_half2;
-
-      // k4
-      const q_end = q0 + dt * k3_q;
-      const v_end = v0 + dt * k3_v;
-      const k4_v = fAcc(q_end, v_end);
-      const k4_q = v_end;
-
-      mode.displacement = q0 + (dt / 6) * (k1_q + 2 * k2_q + 2 * k3_q + k4_q);
-      mode.velocity = v0 + (dt / 6) * (k1_v + 2 * k2_v + 2 * k3_v + k4_v);
-      mode.acceleration = fAcc(mode.displacement, mode.velocity);
-    }
-
-    this.updateCovarianceMatrix(dt);
-  }
-
-  /**
-   * PRIORITY 3: Continuous update of the modal acceleration covariance matrix R_ij:
-   * R_ij = (1/T) ∫ a_i(t) a_j(t) dt
-   * Maintained via exponential moving window with time constant tau = 0.08s
-   */
-  private updateCovarianceMatrix(dt: number): void {
+  updateCovarianceMatrix(dt: number): void {
     const alpha = 1.0 - Math.exp(-dt / this.rmsWindowTimeConstant);
     const n = this.modes.length;
 
@@ -343,56 +206,73 @@ export class ModalBank {
       for (let j = 0; j < n; j++) {
         const aj = this.modes[j].active ? this.modes[j].acceleration : 0;
         const idx = i * n + j;
-        const currentVal = this.covarianceMatrix[idx];
-        this.covarianceMatrix[idx] = currentVal * (1 - alpha) + (ai * aj) * alpha;
+        this.covarianceMatrix[idx] = this.covarianceMatrix[idx] * (1 - alpha) + (ai * aj) * alpha;
       }
     }
   }
 
   /**
-   * Evaluates the surface displacement w(x, y, t) = sum q_mn(t) * phi_mn(x, y)
+   * Sets single-tone generator frequency (20 Hz - 20,000 Hz) and play state.
+   * Computes the exact coherent harmonic phasors across the entire modal catalogue.
    */
-  evaluateDisplacement(x: number, y: number): number {
-    let w = 0;
-    const L = this.geometry.sideLength;
-    for (const mode of this.modes) {
-      if (mode.active) {
-        w += mode.displacement * modeShape(mode.m, mode.n, x, y, L);
+  setHarmonicTone(frequency: number, isPlaying: boolean): void {
+    this.isHarmonicToneMode = true;
+    this.harmonicToneFrequency = Math.max(20, Math.min(20000, frequency));
+    this.isHarmonicPlaying = isPlaying;
+
+    // Evaluate complex frequency response across all 557 modes
+    this.harmonicPhasors = computeHarmonicModalAccelerations(
+      this.harmonicToneFrequency,
+      this.fullCatalogue,
+      3.0, // F0 = 3 N center shaker force
+      this.dampingRatio
+    );
+
+    // Find resonant mode nearest to frequency to determine physical free decay rate
+    let nearestDist = Infinity;
+    let resonantOmega = 2 * Math.PI * 53.96;
+    for (let i = 0; i < this.harmonicPhasors.length; i++) {
+      const p = this.harmonicPhasors[i];
+      const mag = Math.sqrt(p.aReal * p.aReal + p.aImag * p.aImag);
+      if (mag > 10.0) {
+        resonantOmega = 2 * Math.PI * this.harmonicToneFrequency;
+        break;
       }
     }
-    return w;
+    this.dominantDecayRate = Math.max(1.0, this.dampingRatio * resonantOmega);
+
+    if (isPlaying) {
+      this.harmonicEnvelope = 1.0;
+    }
+    this.lastHarmonicUpdateTime = performance.now();
   }
 
   /**
-   * Evaluates the instantaneous surface acceleration a_z(x, y, t) = sum a_mn(t) * phi_mn(x, y)
+   * Advances the harmonic tone free-decay envelope when tone is stopped.
    */
-  evaluateInstantaneousAcceleration(x: number, y: number): number {
-    let a = 0;
-    const L = this.geometry.sideLength;
-    for (const mode of this.modes) {
-      if (mode.active) {
-        a += mode.acceleration * modeShape(mode.m, mode.n, x, y, L);
+  updateHarmonicDecay(nowMs: number = performance.now()): void {
+    if (!this.isHarmonicToneMode) return;
+
+    const dt = (nowMs - this.lastHarmonicUpdateTime) / 1000.0;
+    this.lastHarmonicUpdateTime = nowMs;
+
+    if (this.isHarmonicPlaying) {
+      // Rapid smooth ramp-up
+      this.harmonicEnvelope = Math.min(1.0, this.harmonicEnvelope + dt * 20.0);
+    } else if (this.harmonicEnvelope > 0) {
+      // Physically authentic exponential decay e^(-zeta * omega * dt)
+      this.harmonicEnvelope *= Math.exp(-this.dominantDecayRate * dt);
+      if (this.harmonicEnvelope < 1e-5) {
+        this.harmonicEnvelope = 0;
       }
     }
-    return a;
   }
 
   /**
-   * PRIORITY 3: Calculates true time-window RMS acceleration field:
-   * a_rms(x, y) = sqrt[ (1/T) ∫ a_z(x, y, t)^2 dt ]
-   *             = sqrt[ sum_i sum_j R_ij * phi_i(x, y) * phi_j(x, y) ]
-   * 
-   * Strictly preserves phase relationships and cross-terms between modes.
-   * For single sinusoid of peak acceleration A: returns A / sqrt(2).
-   * For degenerate/coherent modes: correctly retains non-zero cross terms.
-   * Does NOT depend on Canvas frame rate.
-   */
-  /**
-   * Applies an authoritative ModalSnapshot emitted by the AudioWorklet thread.
-   * Keeps main-thread visualizer and particle transport 100% synchronized with
-   * the true audio sample-clock state without secondary re-integration.
+   * Switches to broadband audio file playback mode and applies worklet snapshot.
    */
   applySnapshot(snapshot: ModalSnapshot): void {
+    this.isHarmonicToneMode = false;
     const n = Math.min(this.modes.length, snapshot.displacements.length);
     for (let i = 0; i < n; i++) {
       this.modes[i].displacement = snapshot.displacements[i];
@@ -406,40 +286,75 @@ export class ModalBank {
   }
 
   /**
-   * PRIORITY 3: Calculates true time-window RMS acceleration field:
-   * a_rms(x, y) = sqrt[ (1/T) ∫ a_z(x, y, t)^2 dt ]
-   *             = sqrt[ sum_i sum_j R_ij * phi_i(x, y) * phi_j(x, y) ]
-   * 
-   * Strictly preserves phase relationships and cross-terms between modes.
-   * For single sinusoid of peak acceleration A: returns A / sqrt(2).
-   * For degenerate/coherent modes: correctly retains non-zero cross terms.
-   * Reuses phisCache to eliminate GC allocation churn.
-   * Does NOT depend on Canvas frame rate.
+   * Evaluates RMS acceleration field a_rms(x, y) [m/s^2]:
+   * - For single tone: Coherent complex spatial summation over all 557 modes:
+   *   A_hat(x, y) = sum_mn [ a_hat_mn * phi_mn(x, y) ]
+   *   a_rms = |A_hat| / sqrt(2) * envelope(t)
+   * - For audio file: Quadratic form sum_i sum_j R_ij * phi_i * phi_j from AudioWorklet covariance.
    */
   evaluateRmsAcceleration(x: number, y: number): number {
     const L = this.geometry.sideLength;
-    const n = this.modes.length;
-    let sumRmsSq = 0;
 
-    // Cache mode shapes at (x, y) in pre-allocated array (zero allocations)
-    const phis = this.phisCache;
-    for (let i = 0; i < n; i++) {
-      phis[i] = this.modes[i].active ? modeShape(this.modes[i].m, this.modes[i].n, x, y, L) : 0.0;
+    // Broadband audio file playback mode or direct covariance matrix evaluation:
+    if (!this.isHarmonicToneMode || this.covarianceMatrix[0] > 1e-12) {
+      const n = this.modes.length;
+      let sumRmsSq = 0;
+      const phis = this.phisCache;
+
+      for (let i = 0; i < n; i++) {
+        phis[i] = modeShape(this.modes[i].m, this.modes[i].n, x, y, L);
+      }
+
+      for (let i = 0; i < n; i++) {
+        if (phis[i] === 0.0) continue;
+        const phi_i = phis[i];
+        const rowOffset = i * n;
+
+        for (let j = 0; j < n; j++) {
+          if (phis[j] === 0.0) continue;
+          const R_ij = this.covarianceMatrix[rowOffset + j];
+          sumRmsSq += R_ij * phi_i * phis[j];
+        }
+      }
+
+      return Math.sqrt(Math.max(0, sumRmsSq));
     }
 
-    // sum_i sum_j R_ij * phi_i * phi_j
-    for (let i = 0; i < n; i++) {
-      if (!this.modes[i].active || phis[i] === 0.0) continue;
-      const phi_i = phis[i];
-      const rowOffset = i * n;
+    // Single-tone harmonic mode: evaluate coherent complex phasor sum across all 557 modes
+    if (this.harmonicEnvelope <= 1e-5) {
+      return 0.0;
+    }
 
-      for (let j = 0; j < n; j++) {
-        if (!this.modes[j].active || phis[j] === 0.0) continue;
-        const R_ij = this.covarianceMatrix[rowOffset + j];
-        sumRmsSq += R_ij * phi_i * phis[j];
+    let realSum = 0;
+    let imagSum = 0;
+    const phasors = this.harmonicPhasors;
+    const count = phasors.length;
+
+    for (let i = 0; i < count; i++) {
+      const p = phasors[i];
+      const phi = modeShape(p.m, p.n, x, y, L);
+      if (phi === 0) continue;
+      realSum += p.aReal * phi;
+      imagSum += p.aImag * phi;
+    }
+
+    // Phasor magnitude divided by sqrt(2) for true RMS
+    const aRmsSteady = Math.sqrt(realSum * realSum + imagSum * imagSum) / Math.SQRT2;
+    return aRmsSteady * this.harmonicEnvelope;
+  }
+
+  /**
+   * Evaluates instantaneous deflection w(x, y, t) [m]
+   */
+  evaluateDisplacement(x: number, y: number): number {
+    let w = 0;
+    const L = this.geometry.sideLength;
+    for (let i = 0; i < this.modes.length; i++) {
+      const mode = this.modes[i];
+      if (mode.active) {
+        w += mode.displacement * modeShape(mode.m, mode.n, x, y, L);
       }
     }
-
-    return Math.sqrt(Math.max(0, sumRmsSq));
+    return w;
   }
 }

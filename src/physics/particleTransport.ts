@@ -15,26 +15,19 @@
  * Dimensionally consistent grain diffusivity:
  * Gamma = a_rms / g  (g = 9.80665 m/s^2)
  * D_g = D_ref * max(Gamma - Gamma_c, 0)^p
- * With strict zero transport during silence (Gamma < 1e-6 or a_rms <= 1e-6).
- * 
- * Note on physical interpretation:
- * Gamma_c is an empirical activity threshold rather than an exact instantaneous contact-loss criterion.
- * Instantaneous contact loss depends on peak acceleration reaching g, whereas Gamma uses time-window RMS.
- * The stochastic particle velocities vx = dx/dt, vy = dy/dt represent the statistical Brownian velocity scale
- * (Delta X / Delta t ~ sqrt(2*D_g/Delta t) * N(0, 1)), not ballistic Newtonian inertia.
  */
 
 import { DimensionalTransportConfig, Particle } from './types.ts';
 
 export const DEFAULT_DIMENSIONAL_CONFIG: DimensionalTransportConfig = {
-  particleCount: 1000,
-  dRef: 1.0e-4,       // m^2/s (reference diffusivity scale)
-  gammaC: 1.0,        // dimensionless empirical activity threshold
-  power: 2.0,         // dimensionless scaling exponent (quadratic kinetic scaling)
-  g: 9.80665,         // m/s^2 (standard gravity)
-  dt: 0.016,          // s
+  particleCount: 3000, // Fixed high particle density for realistic powder accumulation
+  dRef: 1.0e-4,        // m^2/s reference diffusivity scale
+  gammaC: 1.0,         // dimensionless liftoff threshold (Gamma = a_rms / g)
+  power: 2.0,          // quadratic kinetic scaling
+  g: 9.80665,          // m/s^2
+  dt: 0.016,           // s
   seed: 42,
-  subThresholdCreepFloor: 0.0, // strictly 0.0: matches displayed equation identically
+  subThresholdCreepFloor: 0.0,
 };
 
 /**
@@ -113,12 +106,17 @@ export class ParticleTransportSystem {
     this.particles = [];
     const L = this.sideLength;
     for (let i = 0; i < this.config.particleCount; i++) {
+      // Natural subtle powder variations
+      const radius = 0.9 + 0.5 * this.prng.next(); // 0.9px - 1.4px
+      const brightness = 0.82 + 0.36 * this.prng.next(); // 0.82 - 1.18 brightness multiplier
       this.particles.push({
         x: this.prng.next() * L,
         y: this.prng.next() * L,
         vx: 0,
         vy: 0,
         active: true,
+        radius,
+        brightness,
       });
     }
   }
@@ -127,16 +125,13 @@ export class ParticleTransportSystem {
    * Evaluates dimensionally consistent grain diffusivity D_g [m^2/s]:
    * Gamma = a_rms / g
    * D_g = D_ref * max(Gamma - Gamma_c, 0)^p
-   * 
-   * Strictly matches displayed scientific equation with zero undocumented creep floor.
-   * In true silence (isSilent or a_rms <= 1e-6), D_g is strictly 0.0.
    */
   evaluateDimensionalDiffusivity(
     aRms: number,
     isSilent: boolean = false
   ): number {
     if (isSilent || aRms <= 1e-6) {
-      return 0.0; // Strictly zero transport during silence
+      return 0.0;
     }
 
     const { dRef, gammaC, power, g, subThresholdCreepFloor = 0.0 } = this.config;
@@ -144,7 +139,7 @@ export class ParticleTransportSystem {
     const excessGamma = Math.max(0, gamma - gammaC);
 
     if (excessGamma <= 0) {
-      return subThresholdCreepFloor; // strictly 0.0 by default
+      return subThresholdCreepFloor;
     }
 
     return dRef * Math.pow(excessGamma, power);
@@ -154,10 +149,6 @@ export class ParticleTransportSystem {
    * Euler-Maruyama step for driftless Itô SDE:
    * dX = sqrt(2 * D_g) * dW_x
    * dY = sqrt(2 * D_g) * dW_y
-   * 
-   * Note on pseudo-velocities vx, vy:
-   * These fields record the instantaneous Brownian displacement rate dx/dt for statistical visualization,
-   * reflecting the stochastic thermal/kinetic scale rather than ballistic momentum.
    */
   step(
     dt: number = this.config.dt,
@@ -174,14 +165,16 @@ export class ParticleTransportSystem {
 
       const D_g = diffusivityEvaluator ? diffusivityEvaluator(p.x, p.y) : 0;
 
-      // Zero vibration/diffusivity strictly yields zero transport
       if (D_g <= 1e-15) {
         p.vx = 0;
         p.vy = 0;
         continue;
       }
 
+      // Diffusion noise amplitude: sigma = sqrt(2 * D_g)
       const sigma = Math.sqrt(2.0 * D_g);
+
+      // Wiener increments: dW = sqrt(dt) * N(0, 1)
       const dWx = sqrtDt * this.prng.nextGaussian();
       const dWy = sqrtDt * this.prng.nextGaussian();
 
@@ -191,103 +184,57 @@ export class ParticleTransportSystem {
       p.vx = dx / dt;
       p.vy = dy / dt;
 
+      // Periodic boundary reflection mapping
       p.x = reflectCoordinate(p.x + dx, L);
       p.y = reflectCoordinate(p.y + dy, L);
     }
   }
 
   /**
-   * Computes a 2D density histogram of current particles on an N x N spatial grid
+   * Computes spatial histogram density grid for analysis and tests
    */
-  computeDensityGrid(gridSize: number): {
-    density: Float64Array; // size gridSize * gridSize
+  computeDensityGrid(gridSize: number = 32): {
+    density: Float64Array;
     gridSize: number;
-    cellSize: number;
+    cellWidth: number;
   } {
-    const total = this.particles.length;
     const density = new Float64Array(gridSize * gridSize);
-    const cellSize = this.sideLength / gridSize;
+    const cellWidth = this.sideLength / gridSize;
+    const invCell = 1.0 / cellWidth;
 
-    for (const p of this.particles) {
-      let gx = Math.floor(p.x / cellSize);
-      let gy = Math.floor(p.y / cellSize);
-      if (gx < 0) gx = 0;
-      if (gx >= gridSize) gx = gridSize - 1;
-      if (gy < 0) gy = 0;
-      if (gy >= gridSize) gy = gridSize - 1;
-
-      density[gy * gridSize + gx] += 1;
+    for (let i = 0; i < this.particles.length; i++) {
+      const p = this.particles[i];
+      const gx = Math.min(gridSize - 1, Math.max(0, Math.floor(p.x * invCell)));
+      const gy = Math.min(gridSize - 1, Math.max(0, Math.floor(p.y * invCell)));
+      density[gy * gridSize + gx]++;
     }
 
-    if (total > 0) {
-      for (let i = 0; i < density.length; i++) {
-        density[i] /= total;
-      }
-    }
-
-    return { density, gridSize, cellSize };
+    return { density, gridSize, cellWidth };
   }
 
   /**
-   * Checks particle count conservation and boundary adherence
+   * Computes spatial uniformity score (Variance-to-Mean Ratio and Chi-square across bins)
    */
-  verifyConservationAndBounds(): { conserved: boolean; count: number; inBounds: boolean } {
-    let count = 0;
-    let inBounds = true;
-    const L = this.sideLength;
-
-    for (const p of this.particles) {
-      count++;
-      if (p.x < 0 || p.x > L || p.y < 0 || p.y > L || isNaN(p.x) || isNaN(p.y)) {
-        inBounds = false;
-      }
-    }
-
-    return {
-      conserved: count === this.config.particleCount,
-      count,
-      inBounds,
-    };
-  }
-
-  /**
-   * Genuine spatial uniformity statistic using Variance-to-Mean Ratio (VMR)
-   * and Pearson Chi-Square Goodness-of-Fit over K spatial bins:
-   * chi^2 = sum_k (Observed_k - Expected)^2 / Expected
-   * For uniform Poisson spatial distribution, VMR = Var(N) / Mean(N) approx 1.0.
-   */
-  computeSpatialUniformityScore(gridSize: number = 8): {
+  computeSpatialUniformityScore(binsPerDim: number = 8): {
     vmr: number;
     chiSquare: number;
     isUniform: boolean;
   } {
-    const numBins = gridSize * gridSize;
-    const rawCounts = new Float64Array(numBins);
-    const cellSize = this.sideLength / gridSize;
-    const totalParticles = this.particles.length;
+    const totalBins = binsPerDim * binsPerDim;
+    const { density } = this.computeDensityGrid(binsPerDim);
+    const N = this.particles.length;
+    const expected = N / totalBins;
 
-    for (const p of this.particles) {
-      let gx = Math.floor(p.x / cellSize);
-      let gy = Math.floor(p.y / cellSize);
-      gx = Math.max(0, Math.min(gridSize - 1, gx));
-      gy = Math.max(0, Math.min(gridSize - 1, gy));
-      rawCounts[gy * gridSize + gx] += 1;
-    }
-
-    const expectedPerBin = totalParticles / numBins;
-    let sumSqDiff = 0;
+    let sumDiffSq = 0;
     let chiSquare = 0;
-
-    for (let i = 0; i < numBins; i++) {
-      const diff = rawCounts[i] - expectedPerBin;
-      sumSqDiff += diff * diff;
-      chiSquare += (diff * diff) / expectedPerBin;
+    for (let i = 0; i < totalBins; i++) {
+      const diff = density[i] - expected;
+      sumDiffSq += diff * diff;
+      chiSquare += (diff * diff) / expected;
     }
 
-    const variance = sumSqDiff / numBins;
-    const vmr = expectedPerBin > 0 ? variance / expectedPerBin : 1.0;
-
-    // A Poisson random scatter has VMR around 1.0 (typically 0.5 to 1.8)
+    const variance = sumDiffSq / (totalBins - 1);
+    const vmr = variance / expected;
     const isUniform = vmr >= 0.5 && vmr <= 1.8;
 
     return { vmr, chiSquare, isUniform };

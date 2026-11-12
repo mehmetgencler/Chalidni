@@ -50,6 +50,8 @@ export interface Particle {
   vx: number;
   vy: number;
   active: boolean;
+  radius?: number;
+  brightness?: number;
 }
 
 export interface DimensionalTransportConfig {

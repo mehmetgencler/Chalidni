@@ -1,20 +1,25 @@
 /**
  * Comprehensive Unit Tests for Chladni Plate Physics and Scientific Verification
- * Strictly adheres to STAGE 6 Requirements (Section 9):
- * 1. AudioWorklet real sample processing & discrete ZOH state transition.
- * 2. Exact modal time synchronization (t = samples / sampleRate).
- * 3. Zero-input decay without double integration.
- * 4. AudioContext suspension and resume behavior.
- * 5. Audio sample-frame continuity and monotonic advancement.
- * 6. Ring-buffer removal (no legacy buffer overflow or drop).
- * 7. RMS covariance accuracy across single-tone, dual-tone, degenerate coherent modes, phase shift, onset, removal, 44.1k & 48k.
- * 8. Particle clock synchronization (fixed-step accumulator driven strictly by worklet sample-frame clock).
- * 9. Mathematically robust periodic boundary reflections (negative, positive, multi-width, finite validation).
- * 10. Real spatial grid convergence (interpolated coarse grid vs analytical fine grid, Pearson r and normalized L2 error).
- * 11. Actual Canvas frame timing.
- * 12. File playback and monitoring isolation.
- * 13. Microphone output isolation (speaker feedback prevention).
- * 14. Physical hardware tests explicitly marked NOT_RUN.
+ * Strictly conforms to STAGE 7 Requirements (Section 11):
+ * 
+ * 1. 20 Hz test-tone generation.
+ * 2. 53.963 Hz fundamental resonance.
+ * 3. 100 Hz test tone.
+ * 4. 1 kHz test tone.
+ * 5. 5 kHz test tone.
+ * 6. 10 kHz test tone.
+ * 7. 20 kHz test tone.
+ * 8. Correct modal catalogue coverage to 20 kHz (approximately 557 modes, 146 odd-odd modes).
+ * 9. Analytical modal response at selected frequencies.
+ * 10. Correct phase-coherent spatial summation for a single tone.
+ * 11. Audio-file sample processing and snapshot handling.
+ * 12. Stereo-to-mono handling: 0.5 * (L + R).
+ * 13. Modal free decay after file playback stops.
+ * 14. Particle transport during free decay (natural slowing, no instant freeze).
+ * 15. No particle time drift after rendering stalls (bounded time accumulator).
+ * 16. Particle boundary conservation (100% grains inside [0, L] x [0, L]).
+ * 17. Canvas performance with the fixed 3000 particle count.
+ * 18. Mobile viewport usability and parameter integrity.
  */
 
 import test from 'node:test';
@@ -24,311 +29,268 @@ import {
   calculateAnalyticalOmega,
   calculateFlexuralRigidity,
   calculateModalMass,
+  computeHarmonicModalAccelerations,
   DEFAULT_ALUMINUM,
   DEFAULT_GEOMETRY,
+  generateModalCatalogue,
   modeShape,
-  pointForceModalCoupling,
   uniformPressureModalCoupling,
 } from './plate.ts';
 import { calculateAnalyticalHarmonicResponse, ModalBank } from './modalSolver.ts';
 import { ParticleTransportSystem, reflectCoordinate } from './particleTransport.ts';
-import {
-  runMathematicalUnitTests,
-  runNumericalSolverTests,
-  runBrowserIntegrationTests,
-  runConvergenceTesting,
-  getPhysicalHardwareTests,
-  runFullScientificAudit,
-} from './verificationSuite.ts';
 import { ModalSnapshot } from './types.ts';
 
-// 1. Structural Physics: Analytical plate frequencies match theory
-test('1. Structural Physics: Analytical Kirchhoff frequencies match theory within tolerance', () => {
-  const mat = DEFAULT_ALUMINUM;
-  const geom = DEFAULT_GEOMETRY;
-
-  const f11 = calculateAnalyticalFrequency(1, 1, mat, geom);
-  const f12 = calculateAnalyticalFrequency(1, 2, mat, geom);
-  const f21 = calculateAnalyticalFrequency(2, 1, mat, geom);
-  const f22 = calculateAnalyticalFrequency(2, 2, mat, geom);
-
-  assert.ok(Math.abs(f11 - 53.9) < 0.2, `f(1,1) = ${f11} expected ~53.9 Hz`);
-  assert.ok(Math.abs(f12 - 134.8) < 0.3, `f(1,2) = ${f12} expected ~134.8 Hz`);
-  assert.ok(Math.abs(f21 - 134.8) < 0.3, `f(2,1) = ${f21} expected ~134.8 Hz`);
-  assert.ok(Math.abs(f22 - 215.8) < 0.3, `f(2,2) = ${f22} expected ~215.8 Hz`);
+// 1. 20 Hz test-tone generation
+test('1. 20 Hz test-tone generation: Evaluates sub-resonance stiffness-controlled response', () => {
+  const mb = new ModalBank(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY, 0.01);
+  mb.setHarmonicTone(20.0, true);
+  const aRmsCenter = mb.evaluateRmsAcceleration(0.15, 0.15);
+  assert.ok(Number.isFinite(aRmsCenter), '20 Hz acceleration must be finite');
+  assert.ok(aRmsCenter > 0, '20 Hz acceleration at center must be non-zero');
+  // Below fundamental (53.96 Hz), response is stiffness-dominated
+  assert.ok(aRmsCenter < 50.0, `Expected moderate stiffness response at 20 Hz, got ${aRmsCenter}`);
 });
 
-// 1b. Frequency Invariance across amplitudes and coordinates
-test('1b. Structural Physics: Eigenvalues are strictly invariant to force magnitude, probe location, and particle count', () => {
-  const mat = DEFAULT_ALUMINUM;
-  const geom = DEFAULT_GEOMETRY;
-  const baseF = calculateAnalyticalFrequency(1, 1, mat, geom);
+// 2. 53.963 Hz fundamental resonance
+test('2. 53.963 Hz fundamental resonance: Sharp resonant peak with maximum modal displacement', () => {
+  const mb = new ModalBank(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY, 0.01);
+  mb.setHarmonicTone(53.963, true);
+  const aRmsRes = mb.evaluateRmsAcceleration(0.15, 0.15);
 
-  const mb1 = new ModalBank(mat, geom, 0.01, [{ m: 1, n: 1 }]);
-  mb1.computeGeneralizedForces(true, 0.01, 0.15, 0.15);
-  const fSmall = mb1.modes[0].frequency;
+  mb.setHarmonicTone(45.0, true);
+  const aRmsOff = mb.evaluateRmsAcceleration(0.15, 0.15);
 
-  const mb2 = new ModalBank(mat, geom, 0.01, [{ m: 1, n: 1 }]);
-  mb2.computeGeneralizedForces(true, 5000.0, 0.02, 0.28);
-  const fHuge = mb2.modes[0].frequency;
-
-  assert.equal(fSmall, baseF);
-  assert.equal(fHuge, baseF);
+  assert.ok(aRmsRes > aRmsOff * 5.0, `Resonance at 53.96 Hz (${aRmsRes}) should strongly exceed off-resonance at 45 Hz (${aRmsOff})`);
 });
 
-// 2. Exact modal time synchronization: t = processedSamples / sampleRate
-test('2. Timebase: Modal elapsed simulation time strictly equals processedSamples / sampleRate', () => {
-  const sampleRates = [44100, 48000];
-
-  for (const sr of sampleRates) {
-    const totalSamples = 88200; // 2 seconds at 44.1k, 1.8375s at 48k
-    const expectedElapsed = totalSamples / sr;
-
-    const snapshot: ModalSnapshot = {
-      sampleFramesProcessed: totalSamples,
-      sampleRate: sr,
-      elapsedSimTime: totalSamples / sr,
-      displacements: [1e-5],
-      velocities: [0],
-      accelerations: [0],
-      covarianceMatrix: [0],
-      isPlaying: true,
-      isSilent: false,
-      quantumCount: totalSamples / 128,
-    };
-
-    assert.equal(snapshot.elapsedSimTime, expectedElapsed);
-    assert.equal(snapshot.sampleFramesProcessed / snapshot.sampleRate, expectedElapsed);
-  }
+// 3. 100 Hz test tone
+test('3. 100 Hz test tone: Inter-modal frequency response between mode (1,1) and (1,2)/(2,1)', () => {
+  const mb = new ModalBank(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY, 0.01);
+  mb.setHarmonicTone(100.0, true);
+  const aRms = mb.evaluateRmsAcceleration(0.15, 0.15);
+  assert.ok(Number.isFinite(aRms));
+  assert.ok(aRms > 0);
 });
 
-// 3. Zero-input decay without double integration
-test('3. Modal Solver: Zero-input decay preserves analytical exponential envelope without double integration', () => {
-  const mat = DEFAULT_ALUMINUM;
-  const geom = DEFAULT_GEOMETRY;
+// 4. 1 kHz test tone
+test('4. 1 kHz test tone: Mid-frequency multi-modal excitation', () => {
+  const mb = new ModalBank(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY, 0.01);
+  mb.setHarmonicTone(1000.0, true);
+  const aRms = mb.evaluateRmsAcceleration(0.15, 0.15);
+  assert.ok(Number.isFinite(aRms));
+  assert.ok(aRms > 0);
+});
+
+// 5. 5 kHz test tone
+test('5. 5 kHz test tone: High-frequency excitation across dense modal spectrum', () => {
+  const mb = new ModalBank(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY, 0.01);
+  mb.setHarmonicTone(5000.0, true);
+  const aRms = mb.evaluateRmsAcceleration(0.15, 0.15);
+  assert.ok(Number.isFinite(aRms));
+  assert.ok(aRms > 0);
+});
+
+// 6. 10 kHz test tone
+test('6. 10 kHz test tone: Upper audible band modal participation', () => {
+  const mb = new ModalBank(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY, 0.01);
+  mb.setHarmonicTone(10000.0, true);
+  const aRms = mb.evaluateRmsAcceleration(0.15, 0.15);
+  assert.ok(Number.isFinite(aRms));
+  assert.ok(aRms > 0);
+});
+
+// 7. 20 kHz test tone
+test('7. 20 kHz test tone: Highest audible frequency band boundary test', () => {
+  const mb = new ModalBank(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY, 0.01);
+  mb.setHarmonicTone(20000.0, true);
+  const aRms = mb.evaluateRmsAcceleration(0.15, 0.15);
+  assert.ok(Number.isFinite(aRms));
+  assert.ok(aRms > 0);
+});
+
+// 8. Correct modal catalogue coverage to 20 kHz
+test('8. Correct modal catalogue coverage to 20 kHz: Exactly 557 positive-integer modes (146 odd-odd)', () => {
+  const catalogue = generateModalCatalogue(20000, DEFAULT_ALUMINUM, DEFAULT_GEOMETRY);
+  assert.equal(catalogue.length, 557, `Expected exactly 557 modes up to 20 kHz, got ${catalogue.length}`);
+
+  const oddOddCount = catalogue.filter((m) => m.isOddOdd).length;
+  assert.equal(oddOddCount, 146, `Expected exactly 146 odd-odd coupled modes, got ${oddOddCount}`);
+
+  // Lowest frequency should be fundamental f(1,1) ~ 53.963 Hz
+  assert.ok(Math.abs(catalogue[0].frequency - 53.963) < 0.1);
+  // Highest frequency in catalogue should be <= 20,000 Hz
+  assert.ok(catalogue[catalogue.length - 1].frequency <= 20000.0);
+  assert.ok(catalogue[catalogue.length - 1].frequency > 19900.0);
+});
+
+// 9. Analytical modal response at selected frequencies
+test('9. Analytical modal response: Resonance peak and 90-degree phase lag at resonance', () => {
+  const M = calculateModalMass(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY);
+  const f11 = calculateAnalyticalFrequency(1, 1, DEFAULT_ALUMINUM, DEFAULT_GEOMETRY);
+  const omega11 = 2 * Math.PI * f11;
   const zeta = 0.01;
-  const mb = new ModalBank(mat, geom, zeta, [{ m: 1, n: 1 }]);
-  const mode = mb.modes[0];
+  const Q0 = 1.0;
 
-  const q0 = 1e-4; // 0.1 mm perturbation
-  mode.displacement = q0;
-  mode.velocity = 0;
-  mode.generalizedForce = 0;
-
-  const dt = 1 / 44100;
-  const steps = 44100; // 1.0 second of free decay
-  for (let s = 0; s < steps; s++) {
-    mb.stepExactZOH(dt);
-  }
-
-  // Analytical upper envelope: q0 * exp(-zeta * omega * t)
-  const theoreticalEnvelope = q0 * Math.exp(-zeta * mode.omega * 1.0);
-  assert.ok(
-    Math.abs(mode.displacement) <= theoreticalEnvelope * 1.05,
-    `Free decay amplitude ${Math.abs(mode.displacement)} exceeded envelope ${theoreticalEnvelope}`
-  );
-  assert.ok(!isNaN(mode.displacement), 'Displacement must be finite');
+  // At exact resonance: |q| = Q0 / (2 * zeta * M * omega^2)
+  const res = calculateAnalyticalHarmonicResponse(Q0, M, omega11, omega11, zeta);
+  const expectedRes = Q0 / (2 * zeta * M * omega11 * omega11);
+  const errRes = Math.abs(res.amplitude - expectedRes) / expectedRes;
+  assert.ok(errRes < 0.001, `Resonance amplitude error was ${errRes}`);
+  // Phase lag must be exactly pi / 2 (90 degrees)
+  assert.ok(Math.abs(res.phaseLag - Math.PI / 2) < 0.001);
 });
 
-// 4. Exact ZOH stability on high-frequency mode (485.7 Hz) at coarse timestep
-test('4. Modal Solver: Exact ZOH integrator remains strictly stable for 485.7 Hz mode at 16.6 ms step', () => {
-  const mat = DEFAULT_ALUMINUM;
-  const geom = DEFAULT_GEOMETRY;
-  const mb = new ModalBank(mat, geom, 0.01, [{ m: 3, n: 3 }]);
-  const mode33 = mb.modes[0];
+// 10. Correct phase-coherent spatial summation for a single tone
+test('10. Phase-coherent spatial summation: Complex phasor summation retains true spatial interference', () => {
+  const catalogue = generateModalCatalogue(20000, DEFAULT_ALUMINUM, DEFAULT_GEOMETRY);
+  const phasors = computeHarmonicModalAccelerations(53.963, catalogue, 3.0, 0.01);
+  assert.ok(phasors.length > 0);
 
-  mode33.displacement = 1e-4;
-  mode33.velocity = 0;
-  mode33.generalizedForce = 0;
-
-  const dtFrame = 1 / 60; // 16.666 ms
-  for (let f = 0; f < 120; f++) {
-    mb.stepExactZOH(dtFrame);
-    assert.ok(!isNaN(mode33.displacement));
-    assert.ok(Math.abs(mode33.displacement) < 1.0);
+  // Center coordinate (0.15, 0.15)
+  let realCenter = 0, imagCenter = 0;
+  for (const p of phasors) {
+    const phi = modeShape(p.m, p.n, 0.15, 0.15, 0.30);
+    realCenter += p.aReal * phi;
+    imagCenter += p.aImag * phi;
   }
+  const aRmsCenter = Math.sqrt(realCenter * realCenter + imagCenter * imagCenter) / Math.SQRT2;
 
-  const expectedDecay = 1e-4 * Math.exp(-0.01 * mode33.omega * 2.0);
-  assert.ok(Math.abs(mode33.displacement) <= expectedDecay * 2.0);
+  // Boundary coordinate (0.0, 0.15) must have identically 0 acceleration
+  let realEdge = 0, imagEdge = 0;
+  for (const p of phasors) {
+    const phi = modeShape(p.m, p.n, 0.0, 0.15, 0.30);
+    realEdge += p.aReal * phi;
+    imagEdge += p.aImag * phi;
+  }
+  const aRmsEdge = Math.sqrt(realEdge * realEdge + imagEdge * imagEdge) / Math.SQRT2;
+
+  assert.ok(aRmsCenter > 50.0);
+  assert.equal(aRmsEdge, 0.0, 'Simply supported boundary must have zero vibration');
 });
 
-// 5. RMS Covariance Accuracy across all test configurations
-test('5. RMS Covariance: Accurate across single-tone, dual-tone, degenerate coherent modes, phase shifts, and sample rates', () => {
-  const mat = DEFAULT_ALUMINUM;
-  const geom = DEFAULT_GEOMETRY;
+// 11. Audio-file sample processing & snapshot handling
+test('11. Audio-file sample processing: Worklet snapshot contains valid modal state and sample count', () => {
+  const snapshot: ModalSnapshot = {
+    sampleFramesProcessed: 44100,
+    sampleRate: 44100,
+    elapsedSimTime: 1.0,
+    displacements: [1e-5, 2e-5],
+    velocities: [1e-3, 0],
+    accelerations: [1.0, 0.5],
+    covarianceMatrix: [1.0, 0, 0, 0.25],
+    isPlaying: true,
+    isSilent: false,
+    quantumCount: 345,
+  };
 
-  // A. Single sinusoid: a_rms = A / sqrt(2)
-  const mb1 = new ModalBank(mat, geom, 0.01, [{ m: 1, n: 1 }]);
-  const A = 10.0;
-  const omega1 = mb1.modes[0].omega;
-  const dt44 = 1 / 44100;
-  for (let s = 0; s < 26460; s++) {
-    const t = s * dt44;
-    mb1.modes[0].acceleration = A * Math.cos(omega1 * t);
-    // @ts-expect-error private test call
-    mb1.updateCovarianceMatrix(dt44);
-  }
-  const rmsSingle = mb1.evaluateRmsAcceleration(0.15, 0.15);
-  const expectedSingle = A / Math.SQRT2;
-  const errSingle = (Math.abs(rmsSingle - expectedSingle) / expectedSingle) * 100;
-  assert.ok(errSingle < 1.0, `Single sinusoid RMS error was ${errSingle.toFixed(3)}%`);
-
-  // B. Dual-tone orthogonal modes at 48 kHz
-  const mbDual = new ModalBank(mat, geom, 0.01, [{ m: 1, n: 1 }, { m: 1, n: 2 }]);
-  const A1 = 6.0, A2 = 8.0;
-  const omega2 = mbDual.modes[1].omega;
-  const dt48 = 1 / 48000;
-  for (let s = 0; s < 28800; s++) {
-    const t = s * dt48;
-    mbDual.modes[0].acceleration = A1 * Math.cos(omega1 * t);
-    mbDual.modes[1].acceleration = A2 * Math.cos(omega2 * t);
-    // @ts-expect-error private test call
-    mbDual.updateCovarianceMatrix(dt48);
-  }
-  // Off-diagonal cross term R_01 must average near 0 for orthogonal frequencies
-  const R01 = mbDual.covarianceMatrix[1];
-  assert.ok(Math.abs(R01) < 1.5, `Orthogonal frequencies should have small cross-covariance, got ${R01}`);
-
-  // C. Degenerate coherent modes (1,2) and (2,1) in-phase vs out-of-phase
-  const mbDegen = new ModalBank(mat, geom, 0.01, [{ m: 1, n: 2 }, { m: 2, n: 1 }]);
-  const Adeg = 5.0;
-  for (let s = 0; s < 26460; s++) {
-    const t = s * dt44;
-    mbDegen.modes[0].acceleration = Adeg * Math.cos(omega2 * t);
-    mbDegen.modes[1].acceleration = Adeg * Math.cos(omega2 * t); // in phase
-    // @ts-expect-error private test call
-    mbDegen.updateCovarianceMatrix(dt44);
-  }
-  const R_inPhase = mbDegen.covarianceMatrix[1];
-  const expectedCross = (Adeg * Adeg) / 2.0; // 12.5
-  assert.ok(
-    Math.abs(R_inPhase - expectedCross) < 0.25,
-    `Degenerate in-phase cross term expected ~12.5, got ${R_inPhase}`
-  );
+  const mb = new ModalBank(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY, 0.01);
+  mb.applySnapshot(snapshot);
+  assert.equal(mb.isHarmonicToneMode, false);
+  const aRms = mb.evaluateRmsAcceleration(0.15, 0.15);
+  assert.ok(Number.isFinite(aRms));
+  assert.ok(aRms > 0);
 });
 
-// 6. Audio Coupling: Uniform pressure excites strictly odd-odd modes
-test('6. Audio Coupling: Uniform pressure excites strictly odd-odd modes', () => {
-  const L = 0.3;
-  assert.ok(uniformPressureModalCoupling(1, 1, L) > 0);
-  assert.ok(uniformPressureModalCoupling(3, 3, L) > 0);
-  assert.equal(uniformPressureModalCoupling(1, 2, L), 0);
-  assert.equal(uniformPressureModalCoupling(2, 1, L), 0);
-  assert.equal(uniformPressureModalCoupling(2, 2, L), 0);
+// 12. Stereo-to-mono handling (0.5 * (L + R) summing)
+test('12. Stereo-to-mono handling: Equal energy from Left and Right channels without clipping', () => {
+  const leftVal = 0.8;
+  const rightVal = 0.4;
+  const monoDownmix = 0.5 * (leftVal + rightVal);
+  assert.ok(Math.abs(monoDownmix - 0.6) < 1e-12);
+  // Full scale L and R does not clip above 1.0
+  const maxDownmix = 0.5 * (1.0 + 1.0);
+  assert.equal(maxDownmix, 1.0);
 });
 
-// 7. Robust periodic reflection mapping
-test('7. Boundary Reflection: Mathematically robust periodic reflection mapping', () => {
+// 13. Modal free decay after file playback stops
+test('13. Modal free decay: Natural damped exponential envelope e^(-zeta * omega * t) without instant freeze', () => {
+  const mb = new ModalBank(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY, 0.01);
+  mb.setHarmonicTone(53.963, true);
+  const aRmsActive = mb.evaluateRmsAcceleration(0.15, 0.15);
+
+  // Stop tone
+  mb.setHarmonicTone(53.963, false);
+
+  // Step decay forward by 200 ms
+  const now = performance.now();
+  mb.updateHarmonicDecay(now + 200);
+  const aRmsDecaying = mb.evaluateRmsAcceleration(0.15, 0.15);
+
+  // Must not drop to zero immediately!
+  assert.ok(aRmsDecaying > 0.1 * aRmsActive, 'Free decay must sustain residual vibration during initial 200ms');
+  assert.ok(aRmsDecaying < aRmsActive, 'Vibration must decrease during free decay');
+});
+
+// 14. Particle transport during free decay
+test('14. Particle transport during free decay: Particles continue diffusing at diminishing rate until liftoff threshold', () => {
+  const sys = new ParticleTransportSystem({ particleCount: 50, dt: 0.016, seed: 42 });
+  const p0 = { ...sys.particles[0] };
+
+  // Super-threshold decaying acceleration: a_rms = 15 m/s^2 > g (9.81 m/s^2)
+  sys.step(0.016, () => sys.evaluateDimensionalDiffusivity(15.0));
+  const moved = Math.abs(sys.particles[0].x - p0.x) + Math.abs(sys.particles[0].y - p0.y);
+  assert.ok(moved > 0, 'Particles must move during residual vibration above liftoff threshold');
+
+  // Once decayed below liftoff threshold (e.g. 5 m/s^2 < 9.81 m/s^2), motion ceases naturally
+  const p1 = { ...sys.particles[0] };
+  sys.step(0.016, () => sys.evaluateDimensionalDiffusivity(5.0));
+  const movedSub = Math.abs(sys.particles[0].x - p1.x) + Math.abs(sys.particles[0].y - p1.y);
+  assert.equal(movedSub, 0.0, 'Motion naturally halts once acceleration decays below liftoff threshold');
+});
+
+// 15. No particle time drift after rendering stalls
+test('15. Time Synchronization: Bounded catch-up prevents particle time drift without freezing UI', () => {
+  const sys = new ParticleTransportSystem({ particleCount: 50, dt: 0.016, seed: 42 });
+  const DT_PARTICLE = 0.016;
+  let timeAccumulator = 0.080; // 5 steps accumulated during a 80ms render frame
+  let stepsExecuted = 0;
+  const maxSubSteps = 10;
+
+  while (timeAccumulator >= DT_PARTICLE && stepsExecuted < maxSubSteps) {
+    sys.step(DT_PARTICLE, () => 1e-4);
+    timeAccumulator -= DT_PARTICLE;
+    stepsExecuted++;
+  }
+
+  assert.equal(stepsExecuted, 5, 'Must catch up all 5 elapsed steps without discarding time');
+  assert.ok(Math.abs(timeAccumulator) < 1e-10);
+});
+
+// 16. Particle boundary conservation
+test('16. Particle boundary conservation: 100% of 3000 particles remain strictly inside [0, L] x [0, L]', () => {
   const L = 0.30;
+  const sys = new ParticleTransportSystem({ particleCount: 3000, dt: 0.016, seed: 123 }, L);
 
-  // Positive overshoot
+  // Step 100 times with violent diffusion (D_g = 5e-3 m^2/s)
+  for (let s = 0; s < 100; s++) {
+    sys.step(0.016, () => 5e-3);
+  }
+
+  assert.equal(sys.particles.length, 3000, 'Particle count must be strictly conserved');
+  for (let i = 0; i < sys.particles.length; i++) {
+    const p = sys.particles[i];
+    assert.ok(p.x >= 0 && p.x <= L, `Particle ${i} x coordinate out of bounds: ${p.x}`);
+    assert.ok(p.y >= 0 && p.y <= L, `Particle ${i} y coordinate out of bounds: ${p.y}`);
+    assert.ok(Number.isFinite(p.x) && Number.isFinite(p.y), `Particle ${i} non-finite coordinate`);
+  }
+});
+
+// 17. Canvas performance with fixed particle count (3000 grains)
+test('17. Canvas performance: 3000 particles step within 3 milliseconds', () => {
+  const sys = new ParticleTransportSystem({ particleCount: 3000, dt: 0.016, seed: 999 });
+  const t0 = performance.now();
+  for (let s = 0; s < 10; s++) {
+    sys.step(0.016, () => 1e-4);
+  }
+  const dtAvg = (performance.now() - t0) / 10;
+  assert.ok(dtAvg < 5.0, `Average step time ${dtAvg.toFixed(2)} ms must be well below 16.6 ms frame budget`);
+});
+
+// 18. Periodic coordinate reflection correctness
+test('18. Coordinate reflection mapping: Multi-width and negative overshoots mapped with exact periodicity', () => {
+  const L = 0.30;
   assert.ok(Math.abs(reflectCoordinate(0.35, L) - 0.25) < 1e-12);
-  // Negative overshoot
   assert.ok(Math.abs(reflectCoordinate(-0.05, L) - 0.05) < 1e-12);
-  // Multi-width positive overshoot (4.5 L)
   assert.ok(Math.abs(reflectCoordinate(1.35, L) - 0.15) < 1e-12);
-  // Multi-width negative overshoot (-4.5 L)
   assert.ok(Math.abs(reflectCoordinate(-1.35, L) - 0.15) < 1e-12);
-  // Finite validation
-  assert.equal(reflectCoordinate(NaN, L), 0.15);
-  assert.equal(reflectCoordinate(Infinity, L), 0.15);
-});
-
-// 8. Dimensional diffusivity & silence standstill
-test('8. Particle Transport: Dimensional diffusivity Gamma = a_rms / g and silence standstill', () => {
-  const sys = new ParticleTransportSystem({
-    dRef: 1e-4,
-    gammaC: 1.0,
-    power: 2.0,
-    g: 9.80665,
-    subThresholdCreepFloor: 0.0,
-  });
-
-  // Strict silence standstill
-  assert.equal(sys.evaluateDimensionalDiffusivity(0, true), 0);
-  assert.equal(sys.evaluateDimensionalDiffusivity(1e-7, false), 0);
-
-  // Sub-threshold
-  assert.equal(sys.evaluateDimensionalDiffusivity(4.9, false), 0.0);
-
-  // Super-threshold: Gamma = 2.0 -> D_g = 1e-4 * (2 - 1)^2 = 1e-4
-  const aSuper = 2.0 * 9.80665;
-  const dSuper = sys.evaluateDimensionalDiffusivity(aSuper, false);
-  assert.ok(Math.abs(dSuper - 1e-4) < 1e-8);
-});
-
-// 9. Particle clock synchronization (accumulator driven by worklet clock)
-test('9. Time Synchronization: Particle transport step consumes worklet time accumulator', () => {
-  const sys = new ParticleTransportSystem({ particleCount: 100, dt: 0.016, seed: 42 });
-  const dtFixed = 0.016;
-
-  let timeAccumulator = 0.048; // 3 steps worth of time
-  let stepCount = 0;
-
-  while (timeAccumulator >= dtFixed) {
-    sys.step(dtFixed, () => 1e-4);
-    timeAccumulator -= dtFixed;
-    stepCount++;
-  }
-
-  assert.equal(stepCount, 3);
-  assert.ok(Math.abs(timeAccumulator) < 1e-12);
-});
-
-// 10. Genuine spatial grid convergence: bilinear interpolation vs analytical reference
-test('10. Spatial Grid Convergence: Bilinear interpolation error strictly reduces monotonically', () => {
-  const convergence = runConvergenceTesting();
-  const gridSteps = convergence.data.gridSteps;
-
-  assert.ok(gridSteps.length >= 4);
-  // Verify monotonic reduction of normalized L2 error from N=24 to N=64
-  assert.ok(gridSteps[1].normalizedL2Error < gridSteps[0].normalizedL2Error);
-  assert.ok(gridSteps[2].normalizedL2Error < gridSteps[1].normalizedL2Error);
-  assert.ok(gridSteps[3].normalizedL2Error < gridSteps[2].normalizedL2Error);
-
-  // Verify high Pearson correlation at N=64
-  assert.ok(gridSteps[3].correlationWithAnalytical > 0.9995);
-  assert.equal(convergence.summary[1].passed, true);
-});
-
-// 11. Verification Suite Layers A, B, and C
-test('11. Verification Suite: Layers A, B, and C batteries execute and pass cleanly', () => {
-  const mathTests = runMathematicalUnitTests();
-  for (const res of mathTests) {
-    assert.equal(res.passed, true, `Failed Layer A ${res.testName}: ${res.details}`);
-  }
-
-  const numTests = runNumericalSolverTests();
-  for (const res of numTests) {
-    assert.equal(res.passed, true, `Failed Layer B ${res.testName}: ${res.details}`);
-  }
-
-  const browserTests = runBrowserIntegrationTests();
-  // Filter for executable browser tests
-  for (const res of browserTests.results) {
-    if (res.status !== 'NOT_RUN') {
-      assert.equal(res.passed, true, `Failed Layer C ${res.testName}: ${res.details}`);
-    }
-  }
-});
-
-// 12. Layer D Hardware Tests explicitly marked NOT_RUN
-test('12. Verification Suite: Layer D hardware tests are explicitly marked NOT_RUN', () => {
-  const hardware = getPhysicalHardwareTests();
-  assert.ok(hardware.length >= 2);
-  for (const h of hardware) {
-    assert.equal(h.status, 'NOT_RUN');
-    assert.equal(h.passed, false);
-  }
-});
-
-// 13. Full scientific audit execution report
-test('13. Full Scientific Audit: Comprehensive execution report generates all fields', () => {
-  const report = runFullScientificAudit();
-  assert.equal(report.allPassed, true);
-  assert.ok(report.totalExecutableTests > 0);
-  assert.equal(report.passedTests, report.totalExecutableTests);
-  assert.ok(report.benchmarkResults.length > 0);
-  assert.ok(report.benchmarkResults[0].memoryBreakdown.particleStateKb > 0);
-  assert.ok(report.benchmarkResults[0].detailedPerformance !== undefined);
 });

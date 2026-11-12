@@ -145,7 +145,6 @@ export function runMathematicalUnitTests(): VerificationResult[] {
   for (let s = 0; s < 26460; s++) { // 600 ms (~7.5 time constants of 80ms window)
     const t = s * simDt;
     mbTest.modes[0].acceleration = A * Math.cos(omega11 * t);
-    // @ts-expect-error private method call for verification
     mbTest.updateCovarianceMatrix(simDt);
   }
   const measuredRms = mbTest.evaluateRmsAcceleration(0.15, 0.15);
@@ -177,7 +176,6 @@ export function runMathematicalUnitTests(): VerificationResult[] {
     const t = s * simDt;
     mbDegen.modes[0].acceleration = A1 * Math.cos(omegaDegen * t);
     mbDegen.modes[1].acceleration = A2 * Math.cos(omegaDegen * t); // in phase
-    // @ts-expect-error private test call
     mbDegen.updateCovarianceMatrix(simDt);
   }
   const measuredCrossTerm = mbDegen.covarianceMatrix[1]; // R_01

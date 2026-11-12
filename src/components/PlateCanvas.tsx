@@ -1,45 +1,73 @@
 /**
- * PlateCanvas: High-performance Canvas rendering of the vibrating plate,
- * particle positions, true total-field nodal contours, and physical heatmaps.
+ * PlateCanvas: Top-down, orthographic, realistic visualization of a vibrating square metal plate.
  * 
- * PRIORITY 5: Continuous 60 FPS canvas loop decoupled from React state updates.
- * Renders actual displacement w(x,y,t), RMS acceleration a_rms(x,y),
- * particle density, or diffusivity fields.
- * Nodal overlay draws either single-mode lines or combined zero contours.
+ * Conforms to STAGE 7 Requirements:
+ * - Square plate dominates the view with zero perspective distortion.
+ * - Realistic dark brushed aluminum plate surface with subtle metallic sheen and refined rim.
+ * - Fine, pale sand or powder particles with natural variations in size and brightness.
+ * - Subtle particle depth cues and contact shadows.
+ * - Zero artificial glowing overlays, heatmaps, or drawn nodal lines.
+ * - The nodal patterns emerge purely from simulated granular accumulation.
+ * - Fixed high-density particle rendering with capped DPR = 2.
  */
 
 import React, { useEffect, useRef } from 'react';
 import { Particle } from '../physics/types.ts';
-import { ModalBank } from '../physics/modalSolver.ts';
-import { ParticleTransportSystem } from '../physics/particleTransport.ts';
-import { modeShape } from '../physics/plate.ts';
 
-export type HeatmapType = 'none' | 'rmsAcceleration' | 'displacement' | 'diffusivity' | 'density';
+export type HeatmapType = 'none' | 'diffusivity' | 'displacement' | 'nodal';
 
 interface PlateCanvasProps {
   particles: Particle[];
-  particleSystem: ParticleTransportSystem;
-  modalBank: ModalBank;
   sideLength: number; // m
-  shakerPos: { x: number; y: number }; // [0, 1] normalized
-  isPointForce: boolean;
-  onSetShakerPos: (pos: { x: number; y: number }) => void;
-  showNodalLines: boolean;
-  heatmapType: HeatmapType;
 }
 
-export const PlateCanvas: React.FC<PlateCanvasProps> = (props) => {
-  const { isPointForce, onSetShakerPos } = props;
+export const PlateCanvas: React.FC<PlateCanvasProps> = ({ particles, sideLength }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const isDraggingRef = useRef(false);
 
-  // Keep latest props in ref so continuous RAF loop always accesses latest physics state
-  const propsRef = useRef(props);
+  // Pre-rendered grain sprites for high-performance antialiased rendering
+  const spritesRef = useRef<HTMLCanvasElement[] | null>(null);
+
+  // Initialize offscreen grain sprites with natural subtle variations and soft shadow
   useEffect(() => {
-    propsRef.current = props;
-  });
+    const sprites: HTMLCanvasElement[] = [];
+    const tints = [
+      'rgba(241, 245, 249, 0.95)', // Pale quartz / salt
+      'rgba(226, 232, 240, 0.92)', // Fine aluminum powder
+      'rgba(254, 240, 138, 0.88)', // Pale brass grain
+      'rgba(203, 213, 225, 0.90)', // Natural silica
+    ];
 
-  // PRIORITY 5: Continuous rendering loop mounted once
+    for (let i = 0; i < tints.length; i++) {
+      const sprite = document.createElement('canvas');
+      const s = 12; // 12x12 sprite
+      sprite.width = s;
+      sprite.height = s;
+      const sCtx = sprite.getContext('2d');
+      if (sCtx) {
+        // Soft contact drop shadow
+        sCtx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+        sCtx.beginPath();
+        sCtx.arc(s / 2 + 0.6, s / 2 + 0.8, 2.0, 0, Math.PI * 2);
+        sCtx.fill();
+
+        // Main grain body
+        sCtx.fillStyle = tints[i];
+        sCtx.beginPath();
+        sCtx.arc(s / 2, s / 2, 1.8, 0, Math.PI * 2);
+        sCtx.fill();
+
+        // Subtle specular micro-highlight
+        sCtx.fillStyle = 'rgba(255, 255, 255, 0.6)';
+        sCtx.beginPath();
+        sCtx.arc(s / 2 - 0.5, s / 2 - 0.5, 0.7, 0, Math.PI * 2);
+        sCtx.fill();
+      }
+      sprites.push(sprite);
+    }
+    spritesRef.current = sprites;
+  }, []);
+
+  // Continuous rendering loop mounted once
   useEffect(() => {
     let animId: number;
 
@@ -56,19 +84,7 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = (props) => {
         return;
       }
 
-      const currentProps = propsRef.current;
-      const {
-        particles,
-        particleSystem,
-        modalBank,
-        sideLength,
-        shakerPos,
-        isPointForce: currentIsPointForce,
-        showNodalLines,
-        heatmapType,
-      } = currentProps;
-
-      // Handle high DPI (capped at 2 for performance)
+      // Handle high DPI display (capped at 2 for guaranteed 60 FPS)
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
       const width = canvas.clientWidth;
       const height = canvas.clientHeight;
@@ -82,224 +98,93 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = (props) => {
       ctx.save();
       ctx.scale(dpr, dpr);
 
-      // 1. Draw plate base
-      ctx.fillStyle = '#090d16'; // Deep metallic slate plate background
+      // 1. Realistic dark brushed metal plate surface
+      // Radial metallic sheen gradient
+      const plateGrad = ctx.createRadialGradient(
+        size * 0.45,
+        size * 0.42,
+        size * 0.05,
+        size * 0.5,
+        size * 0.5,
+        size * 0.72
+      );
+      plateGrad.addColorStop(0.0, '#1c222c');
+      plateGrad.addColorStop(0.35, '#161b23');
+      plateGrad.addColorStop(0.7, '#11151c');
+      plateGrad.addColorStop(1.0, '#0c0f14');
+
+      ctx.fillStyle = plateGrad;
       ctx.fillRect(0, 0, size, size);
 
-      // Plate metallic rim
-      ctx.strokeStyle = '#334155';
-      ctx.lineWidth = 2;
+      // Subtle fine brushed texture lines across the metal surface
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.015)';
+      ctx.lineWidth = 1;
+      const step = 4;
+      for (let y = 2; y < size - 2; y += step) {
+        ctx.beginPath();
+        ctx.moveTo(2, y);
+        ctx.lineTo(size - 2, y);
+        ctx.stroke();
+      }
+
+      // 2. Refined plate rim / beveled metal edge
+      // Outer rim
+      ctx.strokeStyle = '#0f172a';
+      ctx.lineWidth = 2.5;
       ctx.strokeRect(1, 1, size - 2, size - 2);
 
-      // 2. Heatmap: True Physical Field Visualization
-      if (heatmapType !== 'none') {
-        const heatGrid = 40;
-        const cellPx = size / heatGrid;
+      // Inner metallic highlight rim
+      ctx.strokeStyle = '#334155';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(2.5, 2.5, size - 5, size - 5);
 
-        if (heatmapType === 'density') {
-          // 2A. Particle Density Histogram
-          const { density } = particleSystem.computeDensityGrid(heatGrid);
-          let maxD = 0;
-          for (let i = 0; i < density.length; i++) {
-            if (density[i] > maxD) maxD = density[i];
-          }
-          maxD = Math.max(1e-6, maxD);
+      // Center shaker probe mounting pin (subtle lab fixture dot at center)
+      ctx.fillStyle = '#0f172a';
+      ctx.beginPath();
+      ctx.arc(size / 2, size / 2, 4.0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#475569';
+      ctx.beginPath();
+      ctx.arc(size / 2, size / 2, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#94a3b8';
+      ctx.beginPath();
+      ctx.arc(size / 2 - 0.5, size / 2 - 0.5, 0.8, 0, Math.PI * 2);
+      ctx.fill();
 
-          for (let j = 0; j < heatGrid; j++) {
-            for (let i = 0; i < heatGrid; i++) {
-              const val = density[j * heatGrid + i] / maxD;
-              if (val > 0.05) {
-                const alpha = Math.min(0.6, val * 0.7);
-                ctx.fillStyle = `rgba(56, 189, 248, ${alpha})`; // sky blue
-                ctx.fillRect(i * cellPx, j * cellPx, cellPx + 0.5, cellPx + 0.5);
-              }
-            }
-          }
-        } else {
-          // 2B. Physical continuous fields: a_rms, displacement w(x,y,t), or D_g(x,y)
-          for (let j = 0; j < heatGrid; j++) {
-            const y = ((j + 0.5) / heatGrid) * sideLength;
-            for (let i = 0; i < heatGrid; i++) {
-              const x = ((i + 0.5) / heatGrid) * sideLength;
-
-              let normVal = 0;
-              let r = 15;
-              let g = 23;
-              let b = 42;
-              let alpha = 0.2;
-
-              if (heatmapType === 'rmsAcceleration') {
-                const aRms = modalBank.evaluateRmsAcceleration(x, y);
-                // Scaled relative to gravity g = 9.81 m/s^2 (typically 0 to 5g)
-                normVal = Math.min(1.0, aRms / (3 * 9.80665));
-                r = Math.floor(15 + normVal * 40);
-                g = Math.floor(23 + normVal * 120);
-                b = Math.floor(42 + normVal * 200);
-                alpha = 0.15 + normVal * 0.55;
-              } else if (heatmapType === 'displacement') {
-                const w = modalBank.evaluateDisplacement(x, y);
-                normVal = Math.min(1.0, Math.abs(w) / 1e-4); // typical 0.1mm scale
-                if (w >= 0) {
-                  r = 30; g = Math.floor(80 + normVal * 150); b = 240;
-                } else {
-                  r = Math.floor(180 + normVal * 70); g = 40; b = 70;
-                }
-                alpha = 0.15 + normVal * 0.5;
-              } else if (heatmapType === 'diffusivity') {
-                const aRms = modalBank.evaluateRmsAcceleration(x, y);
-                const D_g = particleSystem.evaluateDimensionalDiffusivity(aRms);
-                normVal = Math.min(1.0, D_g / (2 * particleSystem.config.dRef));
-                r = Math.floor(180 * normVal);
-                g = Math.floor(100 * normVal);
-                b = Math.floor(220 * normVal);
-                alpha = 0.1 + normVal * 0.5;
-              }
-
-              ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${alpha})`;
-              ctx.fillRect(i * cellPx, j * cellPx, cellPx + 0.5, cellPx + 0.5);
-            }
-          }
-        }
-      }
-
-      // 3. Nodal Overlay — Explicit Distinction: Single-Mode Lines, Low-RMS Mask, and Total Zero Contours
-      if (showNodalLines) {
-        const activeModes = modalBank.modes.filter((m) => m.active);
-
-        if (activeModes.length === 1) {
-          // Exact analytical straight lines for pure single mode (m, n)
-          const m = activeModes[0].m;
-          const n = activeModes[0].n;
-          ctx.strokeStyle = 'rgba(234, 179, 8, 0.75)'; // amber-500 line
-          ctx.lineWidth = 1.5;
-          ctx.setLineDash([4, 4]);
-
-          for (let k = 1; k < m; k++) {
-            const px = (k / m) * size;
-            ctx.beginPath();
-            ctx.moveTo(px, 0);
-            ctx.lineTo(px, size);
-            ctx.stroke();
-          }
-          for (let l = 1; l < n; l++) {
-            const py = (l / n) * size;
-            ctx.beginPath();
-            ctx.moveTo(0, py);
-            ctx.lineTo(size, py);
-            ctx.stroke();
-          }
-          ctx.setLineDash([]);
-        } else if (activeModes.length > 1) {
-          // A. Low-Vibration Zone Mask (a_rms <= 0.12 * max_a_rms)
-          const sampleN = 50;
-          const step = size / sampleN;
-          let maxRms = 0;
-
-          for (let j = 0; j <= sampleN; j += 5) {
-            const y = (j / sampleN) * sideLength;
-            for (let i = 0; i <= sampleN; i += 5) {
-              const x = (i / sampleN) * sideLength;
-              const val = modalBank.evaluateRmsAcceleration(x, y);
-              if (val > maxRms) maxRms = val;
-            }
-          }
-
-          if (maxRms > 1e-4) {
-            const threshold = maxRms * 0.12;
-            ctx.fillStyle = 'rgba(234, 179, 8, 0.18)'; // Low-vibration zone tint
-
-            for (let j = 0; j < sampleN; j++) {
-              const y = ((j + 0.5) / sampleN) * sideLength;
-              for (let i = 0; i < sampleN; i++) {
-                const x = ((i + 0.5) / sampleN) * sideLength;
-                const aRms = modalBank.evaluateRmsAcceleration(x, y);
-                if (aRms <= threshold) {
-                  ctx.fillRect(i * step, j * step, step, step);
-                }
-              }
-            }
-          }
-
-          // B. Instantaneous Total Displacement Zero Contours: w(x, y, t) = 0
-          ctx.strokeStyle = 'rgba(56, 189, 248, 0.85)'; // sky-400 zero-contour segments
-          ctx.lineWidth = 1.0;
-          const cN = 36;
-          const cStep = size / cN;
-          const dispGrid = new Float64Array((cN + 1) * (cN + 1));
-
-          for (let j = 0; j <= cN; j++) {
-            const y = (j / cN) * sideLength;
-            for (let i = 0; i <= cN; i++) {
-              const x = (i / cN) * sideLength;
-              dispGrid[j * (cN + 1) + i] = modalBank.evaluateDisplacement(x, y);
-            }
-          }
-
-          ctx.beginPath();
-          for (let j = 0; j < cN; j++) {
-            for (let i = 0; i < cN; i++) {
-              const v00 = dispGrid[j * (cN + 1) + i];
-              const v10 = dispGrid[j * (cN + 1) + (i + 1)];
-              const v01 = dispGrid[(j + 1) * (cN + 1) + i];
-
-              if (v00 * v10 < 0) {
-                const frac = Math.abs(v00) / (Math.abs(v00) + Math.abs(v10));
-                const zx = (i + frac) * cStep;
-                const zy = j * cStep;
-                ctx.moveTo(zx - 1, zy);
-                ctx.lineTo(zx + 1, zy);
-              }
-              if (v00 * v01 < 0) {
-                const frac = Math.abs(v00) / (Math.abs(v00) + Math.abs(v01));
-                const zx = i * cStep;
-                const zy = (j + frac) * cStep;
-                ctx.moveTo(zx, zy - 1);
-                ctx.lineTo(zx, zy + 1);
-              }
-            }
-          }
-          ctx.stroke();
-        }
-      }
-
-      // 4. Draw Particles (Crisp granular salt/sand particles)
+      // 3. Render granular powder particles
       const scale = size / sideLength;
-      ctx.fillStyle = '#f8fafc'; // Clean sand/salt grains
+      const sprites = spritesRef.current;
 
-      for (let i = 0; i < particles.length; i++) {
-        const p = particles[i];
-        if (!p.active) continue;
+      if (sprites && sprites.length > 0) {
+        const spriteCount = sprites.length;
+        const spriteSize = 12;
+        const halfSprite = spriteSize / 2;
 
-        const px = p.x * scale;
-        const py = p.y * scale;
+        for (let i = 0; i < particles.length; i++) {
+          const p = particles[i];
+          if (!p.active) continue;
 
-        ctx.beginPath();
-        ctx.arc(px, py, 1.25, 0, Math.PI * 2);
-        ctx.fill();
-      }
+          const px = p.x * scale;
+          const py = p.y * scale;
 
-      // 5. Draw Excitation Shaker Point (if point force enabled)
-      if (currentIsPointForce) {
-        const sx = shakerPos.x * size;
-        const sy = shakerPos.y * size;
+          // Select deterministic sprite per particle index
+          const spriteIdx = i % spriteCount;
+          const sprite = sprites[spriteIdx];
 
-        ctx.strokeStyle = '#ef4444';
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.arc(sx, sy, 8, 0, Math.PI * 2);
-        ctx.stroke();
-
-        ctx.beginPath();
-        ctx.moveTo(sx - 12, sy);
-        ctx.lineTo(sx + 12, sy);
-        ctx.moveTo(sx, sy - 12);
-        ctx.lineTo(sx, sy + 12);
-        ctx.stroke();
-
-        ctx.fillStyle = '#ef4444';
-        ctx.beginPath();
-        ctx.arc(sx, sy, 3, 0, Math.PI * 2);
-        ctx.fill();
+          // Draw pre-rendered antialiased powder grain with contact shadow
+          ctx.drawImage(sprite, px - halfSprite, py - halfSprite);
+        }
+      } else {
+        // Fallback direct circle rendering if sprites loading
+        ctx.fillStyle = 'rgba(241, 245, 249, 0.95)';
+        for (let i = 0; i < particles.length; i++) {
+          const p = particles[i];
+          if (!p.active) continue;
+          ctx.beginPath();
+          ctx.arc(p.x * scale, p.y * scale, 1.4, 0, Math.PI * 2);
+          ctx.fill();
+        }
       }
 
       ctx.restore();
@@ -308,53 +193,17 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = (props) => {
 
     animId = requestAnimationFrame(render);
     return () => cancelAnimationFrame(animId);
-  }, []);
-
-  const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (!isPointForce) return;
-    isDraggingRef.current = true;
-    updateShakerFromEvent(e);
-  };
-
-  const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (isDraggingRef.current && isPointForce) {
-      updateShakerFromEvent(e);
-    }
-  };
-
-  const handlePointerUp = () => {
-    isDraggingRef.current = false;
-  };
-
-  const updateShakerFromEvent = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const xNorm = Math.max(0.01, Math.min(0.99, (e.clientX - rect.left) / rect.width));
-    const yNorm = Math.max(0.01, Math.min(0.99, (e.clientY - rect.top) / rect.height));
-    onSetShakerPos({ x: xNorm, y: yNorm });
-  };
+  }, [particles, sideLength]);
 
   return (
-    <div className="relative w-full aspect-square max-w-[620px] mx-auto rounded-xl overflow-hidden shadow-2xl border border-slate-700 bg-slate-950 flex items-center justify-center">
-      <canvas
-        ref={canvasRef}
-        data-testid="plate-canvas"
-        onPointerDown={handlePointerDown}
-        onPointerMove={handlePointerMove}
-        onPointerUp={handlePointerUp}
-        onPointerLeave={handlePointerUp}
-        className={`w-full h-full block ${isPointForce ? 'cursor-crosshair' : 'cursor-default'}`}
-      />
-      <div className="absolute top-2 left-2 bg-slate-900/80 backdrop-blur border border-slate-700 rounded px-2 py-1 text-xs font-mono text-slate-300">
-        L = {(props.sideLength * 100).toFixed(0)} cm (Simply Supported)
+    <div className="w-full flex items-center justify-center p-2">
+      <div className="relative w-full max-w-[min(80vw,560px)] aspect-square rounded-lg shadow-2xl overflow-hidden bg-black/80 ring-1 ring-slate-800">
+        <canvas
+          ref={canvasRef}
+          data-testid="chladni-plate-canvas"
+          className="w-full h-full block cursor-default"
+        />
       </div>
-      {isPointForce && (
-        <div className="absolute bottom-2 left-2 bg-slate-900/85 backdrop-blur border border-red-500/50 rounded px-2 py-1 text-xs font-mono text-red-300 flex items-center gap-1.5">
-          <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
-          Shaker: ({(props.shakerPos.x * props.sideLength).toFixed(3)}m, {(props.shakerPos.y * props.sideLength).toFixed(3)}m)
-        </div>
-      )}
     </div>
   );
 };

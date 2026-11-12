@@ -1,462 +1,298 @@
 /**
- * AudioExciter: Audio generator, microphone, and file upload excitation interface.
- * Real-time oscilloscope, resonance frequency presets, and wave monitoring.
+ * AudioExciter: Minimal Realistic Audio Controls for Chladni Plate Simulation
+ * 
+ * Conforms to STAGE 7 Requirements:
+ * 1. Single test-tone sine generator: 20 Hz to 20,000 Hz with logarithmic slider mapping.
+ * 2. Uploaded audio file playback: File selection, Play/Pause, playback progress bar.
+ * 3. Zero microphone code or controls.
+ * 4. Zero unnecessary presets, gain sliders, or mode toggles.
  */
 
 import React, { useRef, useState, useEffect } from 'react';
-import { Volume2, VolumeX, Mic, MicOff, Upload, Radio, Activity, Play, Pause, RotateCcw, AlertCircle } from 'lucide-react';
-import { AudioEngine, AudioSourceType, GeneratorWaveform } from '../audio/audioEngine.ts';
+import { Play, Pause, Upload, Volume2, Square, Music } from 'lucide-react';
+import { AudioEngine, PlaybackProgress } from '../audio/audioEngine.ts';
 
 interface AudioExciterProps {
   audioEngine: AudioEngine;
-  onFrequencyChange?: (f: number) => void;
-  gain: number;
-  onGainChange: (g: number) => void;
-  isPointForce: boolean;
-  onTogglePointForce: (isPoint: boolean) => void;
+  onFrequencyChange: (f: number) => void;
+  onToneStateChange: (isPlaying: boolean, frequency: number) => void;
+}
+
+// Logarithmic slider mapping: f = 20 * (20000 / 20)^u, for u in [0, 1]
+const F_MIN = 20;
+const F_MAX = 20000;
+const LOG_RATIO = Math.log10(F_MAX / F_MIN); // log10(1000) = 3
+
+function freqToSlider(f: number): number {
+  const clamped = Math.max(F_MIN, Math.min(F_MAX, f));
+  return Math.log10(clamped / F_MIN) / LOG_RATIO;
+}
+
+function sliderToFreq(u: number): number {
+  const clamped = Math.max(0, Math.min(1, u));
+  return F_MIN * Math.pow(10, clamped * LOG_RATIO);
+}
+
+function formatFrequency(f: number): string {
+  if (f < 100) return `${f.toFixed(2)} Hz`;
+  if (f < 1000) return `${f.toFixed(1)} Hz`;
+  if (f < 10000) return `${(f / 1000).toFixed(2)} kHz (${Math.round(f)} Hz)`;
+  return `${(f / 1000).toFixed(1)} kHz (${Math.round(f)} Hz)`;
+}
+
+function formatTime(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '0:00';
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${m}:${s < 10 ? '0' : ''}${s}`;
 }
 
 export const AudioExciter: React.FC<AudioExciterProps> = ({
   audioEngine,
   onFrequencyChange,
-  gain,
-  onGainChange,
-  isPointForce,
-  onTogglePointForce,
+  onToneStateChange,
 }) => {
-  const [sourceType, setSourceType] = useState<AudioSourceType>('generator');
-  const [generatorType, setGeneratorType] = useState<GeneratorWaveform>('sine');
-  const [freq1, setFreq1] = useState<number>(53.9);
-  const [freq2, setFreq2] = useState<number>(215.8);
-  const [isMicActive, setIsMicActive] = useState<boolean>(false);
-  const [isFileLoaded, setIsFileLoaded] = useState<boolean>(false);
-  const [fileName, setFileName] = useState<string>('');
-  const [isPlayingFile, setIsPlayingFile] = useState<boolean>(false);
-  const [isFileLooping, setIsFileLooping] = useState<boolean>(false);
-  const [isMicMonitoring, setIsMicMonitoring] = useState<boolean>(false);
-  const [isMuted, setIsMuted] = useState<boolean>(false);
-  const [micErrorMessage, setMicErrorMessage] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<'tone' | 'file'>('tone');
+  const [frequency, setFrequency] = useState<number>(53.96); // Fundamental mode by default
+  const [isToneActive, setIsToneActive] = useState<boolean>(false);
+
+  // File playback state
+  const [fileProgress, setFileProgress] = useState<PlaybackProgress>({
+    currentTime: 0,
+    duration: 0,
+    isPlaying: false,
+    fileName: '',
+  });
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const oscCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  // Preset resonances
-  const presets = [
-    { label: 'f(1,1) = 53.9 Hz', f: 53.9 },
-    { label: 'f(1,2) = 134.8 Hz', f: 134.8 },
-    { label: 'f(2,2) = 215.8 Hz', f: 215.8 },
-  ];
+  // Subscribe to file progress
+  useEffect(() => {
+    const unsub = audioEngine.onProgress((progress) => {
+      setFileProgress(progress);
+    });
+    return unsub;
+  }, [audioEngine]);
 
-  // Select sine preset
-  const handleSelectPreset = (f: number) => {
-    audioEngine.resumeContext();
-    setSourceType('generator');
-    setGeneratorType('sine');
-    setFreq1(f);
-    audioEngine.startGenerator('sine', f);
-    if (onFrequencyChange) onFrequencyChange(f);
+  // Handle logarithmic slider change
+  const handleSliderChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const u = parseFloat(e.target.value);
+    const newFreq = sliderToFreq(u);
+    setFrequency(newFreq);
+    audioEngine.setGeneratorFrequency(newFreq);
+    onFrequencyChange(newFreq);
   };
 
-  const handleSelectDual = () => {
-    audioEngine.resumeContext();
-    setSourceType('generator');
-    setGeneratorType('dual');
-    setFreq1(53.9);
-    setFreq2(215.8);
-    audioEngine.startGenerator('dual', 53.9, 215.8);
-  };
-
-  const handleSelectSweep = () => {
-    audioEngine.resumeContext();
-    setSourceType('generator');
-    setGeneratorType('sweep');
-    audioEngine.startGenerator('sweep');
-  };
-
-  const handleSelectSilence = () => {
-    audioEngine.resumeContext();
-    setSourceType('generator');
-    setGeneratorType('silence');
-    audioEngine.startGenerator('silence');
-  };
-
-  const handleToggleMic = async () => {
-    setMicErrorMessage(null);
-    if (isMicActive) {
-      audioEngine.stopMicrophone();
-      setIsMicActive(false);
-      handleSelectPreset(freq1);
+  // Toggle test tone generator
+  const handleToggleTone = async () => {
+    if (isToneActive) {
+      audioEngine.stopTone();
+      setIsToneActive(false);
+      onToneStateChange(false, frequency);
     } else {
       await audioEngine.resumeContext();
-      const ok = await audioEngine.startMicrophone();
-      if (ok) {
-        setIsMicActive(true);
-        setSourceType('microphone');
-        setMicErrorMessage(null);
-      } else {
-        setMicErrorMessage(
-          audioEngine.lastMicError ||
-            'Microphone access could not be initialized. Please check your browser permissions.'
-        );
-      }
+      await audioEngine.startTone(frequency);
+      setIsToneActive(true);
+      onToneStateChange(true, frequency);
     }
   };
 
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  // Handle audio file selection
+  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+
+    if (isToneActive) {
+      audioEngine.stopTone();
+      setIsToneActive(false);
+      onToneStateChange(false, frequency);
+    }
+
     await audioEngine.resumeContext();
     const ok = await audioEngine.loadAudioFile(file);
     if (ok) {
-      setIsFileLoaded(true);
-      setFileName(file.name);
-      setIsPlayingFile(true);
-      setSourceType('file');
+      setActiveTab('file');
     }
   };
 
-  const handleToggleFilePlay = () => {
-    if (isPlayingFile) {
+  // Toggle audio file play / pause
+  const handleToggleFilePlay = async () => {
+    if (isToneActive) {
+      audioEngine.stopTone();
+      setIsToneActive(false);
+      onToneStateChange(false, frequency);
+    }
+
+    await audioEngine.resumeContext();
+    if (fileProgress.isPlaying) {
       audioEngine.pauseAudioFile();
-      setIsPlayingFile(false);
     } else {
       audioEngine.playAudioFile();
-      setIsPlayingFile(true);
     }
   };
 
-  const handleToggleMute = () => {
-    const next = !isMuted;
-    setIsMuted(next);
-    audioEngine.setMuted(next);
-  };
-
-  const handleGainSlider = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const val = parseFloat(e.target.value);
-    onGainChange(val);
-    audioEngine.gain = val;
-  };
-
-  const handleFreqSlider = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const val = parseFloat(e.target.value);
-    setFreq1(val);
-    audioEngine.setGeneratorFrequency(val);
-    if (onFrequencyChange) onFrequencyChange(val);
-  };
-
-  // Oscilloscope render loop
-  useEffect(() => {
-    let animId: number;
-    const canvas = oscCanvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    const renderOscilloscope = () => {
-      const buffer = audioEngine.getDiagnosticWaveform();
-      ctx.fillStyle = '#090d16';
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-      ctx.strokeStyle = '#38bdf8'; // sky-400
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-
-      const sliceWidth = canvas.width / buffer.length;
-      let x = 0;
-
-      for (let i = 0; i < buffer.length; i++) {
-        const v = buffer[i];
-        const y = (v + 1) * 0.5 * canvas.height;
-        if (i === 0) {
-          ctx.moveTo(x, y);
-        } else {
-          ctx.lineTo(x, y);
-        }
-        x += sliceWidth;
-      }
-
-      ctx.lineTo(canvas.width, canvas.height / 2);
-      ctx.stroke();
-
-      animId = requestAnimationFrame(renderOscilloscope);
-    };
-
-    animId = requestAnimationFrame(renderOscilloscope);
-    return () => cancelAnimationFrame(animId);
-  }, [audioEngine]);
+  const sliderVal = freqToSlider(frequency);
 
   return (
-    <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-4 shadow-xl flex flex-col gap-4">
-      {/* Top Header & Mute */}
-      <div className="flex items-center justify-between border-b border-slate-800 pb-2">
-        <div className="flex items-center gap-2">
-          <Activity className="w-5 h-5 text-sky-400" />
-          <h2 className="text-sm font-semibold uppercase tracking-wider text-slate-200">
-            Audio &amp; Excitation Source
-          </h2>
-        </div>
+    <div className="w-full max-w-xl mx-auto flex flex-col gap-3 p-4 rounded-xl bg-slate-900/80 border border-slate-800 backdrop-blur-sm text-slate-200">
+      {/* Mode Selector Tabs */}
+      <div className="grid grid-cols-2 p-1 bg-slate-950 rounded-lg border border-slate-800 text-xs font-medium">
         <button
-          onClick={handleToggleMute}
-          className={`flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-lg border transition ${
-            isMuted
-              ? 'bg-rose-950/40 border-rose-700/60 text-rose-300'
-              : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'
+          onClick={() => {
+            setActiveTab('tone');
+            if (fileProgress.isPlaying) audioEngine.pauseAudioFile();
+          }}
+          className={`flex items-center justify-center gap-2 py-2 rounded-md transition-colors ${
+            activeTab === 'tone'
+              ? 'bg-slate-800 text-white shadow-sm font-semibold'
+              : 'text-slate-400 hover:text-slate-200'
           }`}
-          title={isMuted ? 'Audible monitor muted' : 'Mute audible monitor'}
         >
-          {isMuted ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
-          <span>{isMuted ? 'Monitor Muted' : 'Monitor Audio'}</span>
+          <Volume2 className="w-3.5 h-3.5" />
+          <span>Sine Test Tone (20 Hz – 20 kHz)</span>
+        </button>
+        <button
+          onClick={() => {
+            setActiveTab('file');
+            if (isToneActive) {
+              audioEngine.stopTone();
+              setIsToneActive(false);
+              onToneStateChange(false, frequency);
+            }
+          }}
+          className={`flex items-center justify-center gap-2 py-2 rounded-md transition-colors ${
+            activeTab === 'file'
+              ? 'bg-slate-800 text-white shadow-sm font-semibold'
+              : 'text-slate-400 hover:text-slate-200'
+          }`}
+        >
+          <Music className="w-3.5 h-3.5" />
+          <span>Audio File Playback</span>
         </button>
       </div>
 
-      {/* Excitation Coupling Model Selector */}
-      <div className="bg-slate-950/60 p-2.5 rounded-lg border border-slate-800/80 flex items-center justify-between">
-        <div>
-          <span className="text-xs text-slate-400 block font-medium">Coupling Mechanism:</span>
-          <span className="text-xs text-slate-200 font-semibold">
-            {isPointForce ? 'Point Force (Shaker Probe)' : 'Uniform Acoustic Pressure Field'}
-          </span>
-        </div>
-        <div className="flex bg-slate-900 p-0.5 rounded-lg border border-slate-700">
-          <button
-            onClick={() => onTogglePointForce(true)}
-            className={`px-2.5 py-1 text-xs font-medium rounded-md transition ${
-              isPointForce ? 'bg-sky-600 text-white shadow' : 'text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            Point Force
-          </button>
-          <button
-            onClick={() => onTogglePointForce(false)}
-            className={`px-2.5 py-1 text-xs font-medium rounded-md transition ${
-              !isPointForce ? 'bg-sky-600 text-white shadow' : 'text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            Uniform Pressure
-          </button>
-        </div>
-      </div>
-      {!isPointForce && (
-        <p className="text-[11px] text-amber-400/90 bg-amber-950/30 p-2 rounded border border-amber-900/40">
-          Analytical Notice: Uniform acoustic pressure excites ONLY odd-odd modes due to spatial symmetry cancellation.
-        </p>
-      )}
+      {/* SECTION A: SINGLE-TONE SINE GENERATOR */}
+      {activeTab === 'tone' && (
+        <div className="flex flex-col gap-3 py-1">
+          {/* Readout and Start/Stop Button */}
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <span className="text-[11px] text-slate-400 uppercase tracking-wider block">Excitation Frequency</span>
+              <span className="text-xl sm:text-2xl font-mono font-semibold text-sky-400 tracking-tight">
+                {formatFrequency(frequency)}
+              </span>
+            </div>
 
-      {/* Waveform Generator Presets */}
-      <div className="flex flex-col gap-2">
-        <label className="text-xs font-medium text-slate-400 flex items-center gap-1.5">
-          <Radio className="w-3.5 h-3.5 text-sky-400" />
-          <span>Internal Signal Generator</span>
-        </label>
-        <div className="grid grid-cols-3 gap-2">
-          {presets.map((p) => (
             <button
-              key={p.f}
-              onClick={() => handleSelectPreset(p.f)}
-              className={`px-2 py-2 text-xs rounded-lg font-mono font-medium border text-center transition ${
-                sourceType === 'generator' && generatorType === 'sine' && Math.abs(freq1 - p.f) < 0.1
-                  ? 'bg-sky-600 border-sky-400 text-white shadow-md'
-                  : 'bg-slate-800/80 border-slate-700 text-slate-300 hover:bg-slate-700'
+              onClick={handleToggleTone}
+              className={`flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-semibold transition-all shadow-md active:scale-95 ${
+                isToneActive
+                  ? 'bg-rose-600 hover:bg-rose-500 text-white'
+                  : 'bg-sky-600 hover:bg-sky-500 text-white'
               }`}
             >
-              {p.label}
+              {isToneActive ? <Square className="w-4 h-4 fill-current" /> : <Play className="w-4 h-4 fill-current" />}
+              <span>{isToneActive ? 'Stop Tone' : 'Start Tone'}</span>
             </button>
-          ))}
-        </div>
-        <div className="grid grid-cols-3 gap-2 mt-1">
-          <button
-            onClick={handleSelectDual}
-            className={`px-2 py-1.5 text-xs rounded-lg border transition ${
-              sourceType === 'generator' && generatorType === 'dual'
-                ? 'bg-purple-600 border-purple-400 text-white shadow'
-                : 'bg-slate-800/80 border-slate-700 text-slate-300 hover:bg-slate-700'
-            }`}
-          >
-            Dual Tone (54+216Hz)
-          </button>
-          <button
-            onClick={handleSelectSweep}
-            className={`px-2 py-1.5 text-xs rounded-lg border transition ${
-              sourceType === 'generator' && generatorType === 'sweep'
-                ? 'bg-emerald-600 border-emerald-400 text-white shadow'
-                : 'bg-slate-800/80 border-slate-700 text-slate-300 hover:bg-slate-700'
-            }`}
-          >
-            Sweep (40-300Hz)
-          </button>
-          <button
-            onClick={handleSelectSilence}
-            className={`px-2 py-1.5 text-xs rounded-lg border transition ${
-              sourceType === 'generator' && generatorType === 'silence'
-                ? 'bg-slate-700 border-slate-500 text-white shadow'
-                : 'bg-slate-800/80 border-slate-700 text-slate-300 hover:bg-slate-700'
-            }`}
-          >
-            Silence (0 Input)
-          </button>
-        </div>
-      </div>
-
-      {/* Manual Frequency Slider */}
-      {sourceType === 'generator' && generatorType === 'sine' && (
-        <div className="flex flex-col gap-1.5 bg-slate-950/40 p-2.5 rounded-lg border border-slate-800">
-          <div className="flex justify-between text-xs">
-            <span className="text-slate-400">Continuous Tuning:</span>
-            <span className="font-mono text-sky-400 font-semibold">{freq1.toFixed(1)} Hz</span>
           </div>
-          <input
-            type="range"
-            min="20"
-            max="500"
-            step="0.5"
-            value={freq1}
-            onChange={handleFreqSlider}
-            className="w-full accent-sky-500 cursor-pointer"
-          />
+
+          {/* Logarithmic Frequency Slider */}
+          <div className="flex flex-col gap-1.5 pt-1">
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.001"
+              value={sliderVal}
+              onChange={handleSliderChange}
+              aria-label="Excitation Frequency (Logarithmic 20 Hz to 20,000 Hz)"
+              className="w-full h-2 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-sky-400 focus:outline-none"
+            />
+            <div className="flex justify-between text-[10px] font-mono text-slate-500">
+              <span>20 Hz</span>
+              <span>100 Hz</span>
+              <span>1 kHz</span>
+              <span>10 kHz</span>
+              <span>20 kHz</span>
+            </div>
+          </div>
         </div>
       )}
 
-      {/* Microphone & File Audio Row */}
-      <div className="grid grid-cols-2 gap-2 pt-1 border-t border-slate-800">
-        <button
-          onClick={handleToggleMic}
-          className={`flex items-center justify-center gap-2 px-3 py-2 text-xs font-medium rounded-lg border transition ${
-            isMicActive
-              ? 'bg-rose-600 border-rose-400 text-white shadow animate-pulse'
-              : 'bg-slate-800/80 border-slate-700 text-slate-300 hover:bg-slate-700'
-          }`}
-        >
-          {isMicActive ? <MicOff className="w-3.5 h-3.5" /> : <Mic className="w-3.5 h-3.5" />}
-          <span>{isMicActive ? 'Stop Mic (Safe)' : 'Use Microphone'}</span>
-        </button>
-
-        <div>
+      {/* SECTION B: UPLOADED AUDIO FILE PLAYBACK */}
+      {activeTab === 'file' && (
+        <div className="flex flex-col gap-3 py-1">
           <input
             ref={fileInputRef}
             type="file"
             accept="audio/*"
-            onChange={handleFileUpload}
+            onChange={handleFileSelect}
             className="hidden"
           />
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            className="w-full flex items-center justify-center gap-2 px-3 py-2 text-xs font-medium rounded-lg border bg-slate-800/80 border-slate-700 text-slate-300 hover:bg-slate-700 transition"
-          >
-            <Upload className="w-3.5 h-3.5" />
-            <span>Upload Audio File</span>
-          </button>
-        </div>
-      </div>
 
-      {/* Microphone Status Notice / Inline Alert */}
-      {micErrorMessage && (
-        <div className="bg-rose-950/70 border border-rose-800 p-2.5 rounded-lg text-xs text-rose-200 flex items-start justify-between gap-2 shadow-sm">
-          <div className="flex items-start gap-1.5">
-            <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-            <div className="space-y-0.5">
-              <span className="font-semibold block text-rose-300">Microphone Notice</span>
-              <p className="text-[11px] text-rose-200/90 leading-relaxed">{micErrorMessage}</p>
-            </div>
-          </div>
-          <button
-            onClick={() => setMicErrorMessage(null)}
-            className="text-rose-400 hover:text-white text-xs px-1.5 py-0.5 rounded hover:bg-rose-900/50 transition font-bold"
-            title="Dismiss notice"
-          >
-            ✕
-          </button>
-        </div>
-      )}
+          <div className="flex items-center justify-between gap-3">
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              className="flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors shadow-sm"
+            >
+              <Upload className="w-3.5 h-3.5" />
+              <span>{fileProgress.fileName ? 'Change Audio File' : 'Choose Audio File'}</span>
+            </button>
 
-      {/* Mic Monitor Opt-In Warning (Feedback Prevention) */}
-      {isMicActive && (
-        <div className="bg-amber-950/30 p-2 rounded border border-amber-800/60 flex items-center justify-between text-xs">
-          <span className="text-amber-300 text-[11px]">
-            Mic Speaker Monitor: {isMicMonitoring ? 'AUDIBLE (Caution: Feedback)' : 'MUTED (Feedback Isolated)'}
-          </span>
-          <button
-            onClick={() => {
-              const next = !isMicMonitoring;
-              setIsMicMonitoring(next);
-              audioEngine.setMicMonitoring(next);
-            }}
-            className={`px-2 py-0.5 rounded text-[10px] font-bold border transition ${
-              isMicMonitoring
-                ? 'bg-rose-900 border-rose-600 text-rose-200'
-                : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'
-            }`}
-          >
-            {isMicMonitoring ? 'Mute Monitor' : 'Enable Monitor'}
-          </button>
-        </div>
-      )}
+            {fileProgress.fileName ? (
+              <span className="text-xs text-slate-300 truncate max-w-[220px] font-medium" title={fileProgress.fileName}>
+                {fileProgress.fileName}
+              </span>
+            ) : (
+              <span className="text-xs text-slate-500 italic">No audio file loaded</span>
+            )}
 
-      {/* File playback controls if loaded */}
-      {isFileLoaded && sourceType === 'file' && (
-        <div className="bg-slate-950/70 p-2 rounded border border-slate-700 flex flex-col gap-1.5 text-xs">
-          <div className="flex items-center justify-between">
-            <span className="truncate max-w-[150px] font-mono text-slate-300">{fileName}</span>
-            <div className="flex items-center gap-1.5">
-              <button
-                onClick={() => {
-                  const next = !isFileLooping;
-                  setIsFileLooping(next);
-                  audioEngine.setFileLooping(next);
-                }}
-                className={`px-2 py-0.5 rounded text-[10px] font-medium border transition ${
-                  isFileLooping
-                    ? 'bg-indigo-900 border-indigo-600 text-indigo-200'
-                    : 'bg-slate-800 border-slate-700 text-slate-400'
-                }`}
-              >
-                {isFileLooping ? 'Loop: ON' : 'Loop: OFF'}
-              </button>
+            {fileProgress.fileName && (
               <button
                 onClick={handleToggleFilePlay}
-                className="flex items-center gap-1 px-2.5 py-1 bg-sky-600 hover:bg-sky-500 rounded text-white"
+                className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white transition-all shadow-sm active:scale-95 ml-auto"
               >
-                {isPlayingFile ? <Pause className="w-3 h-3" /> : <Play className="w-3 h-3" />}
-                <span>{isPlayingFile ? 'Pause' : 'Play'}</span>
+                {fileProgress.isPlaying ? (
+                  <>
+                    <Pause className="w-3.5 h-3.5 fill-current" />
+                    <span>Pause</span>
+                  </>
+                ) : (
+                  <>
+                    <Play className="w-3.5 h-3.5 fill-current" />
+                    <span>Play</span>
+                  </>
+                )}
               </button>
-            </div>
+            )}
           </div>
+
+          {/* Audio progress bar */}
+          {fileProgress.fileName && (
+            <div className="flex flex-col gap-1.5 pt-1">
+              <div className="flex justify-between text-[11px] font-mono text-slate-400">
+                <span>{formatTime(fileProgress.currentTime)}</span>
+                <span>{formatTime(fileProgress.duration)}</span>
+              </div>
+              <div
+                className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden cursor-pointer relative"
+                onClick={(e) => {
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  const pct = (e.clientX - rect.left) / rect.width;
+                  audioEngine.seekAudioFile(pct * fileProgress.duration);
+                }}
+              >
+                <div
+                  className="h-full bg-emerald-500 transition-all duration-100"
+                  style={{
+                    width: `${fileProgress.duration > 0 ? (fileProgress.currentTime / fileProgress.duration) * 100 : 0}%`,
+                  }}
+                />
+              </div>
+            </div>
+          )}
         </div>
       )}
-
-      {/* Excitation Amplitude / Gain Slider */}
-      <div className="flex flex-col gap-1.5 pt-1">
-        <div className="flex justify-between text-xs">
-          <span className="text-slate-400">
-            Excitation Digital Gain <span className="text-[10px] text-slate-500">(Uncalibrated Demo Setting)</span>:
-          </span>
-          <span className="font-mono text-slate-200 font-semibold">{gain.toFixed(2)}x</span>
-        </div>
-        <input
-          type="range"
-          min="0.1"
-          max="5.0"
-          step="0.05"
-          value={gain}
-          onChange={handleGainSlider}
-          className="w-full accent-sky-500 cursor-pointer"
-        />
-        <div className="flex justify-between text-[10px] text-slate-500 font-mono">
-          <span>0.1x (Fine grain)</span>
-          <span>Mode: {isPointForce ? 'Effective Shaker Force' : 'Acoustic Field'}</span>
-          <span>5.0x (High energy)</span>
-        </div>
-      </div>
-
-      {/* Live Oscilloscope */}
-      <div className="flex flex-col gap-1">
-        <div className="flex justify-between items-center text-[11px] text-slate-400">
-          <span>Real-time Waveform Stream (Time-Domain s(t))</span>
-          <span className="text-slate-500 font-mono">Sampled Integration</span>
-        </div>
-        <div className="w-full h-14 rounded-lg overflow-hidden border border-slate-800 bg-slate-950">
-          <canvas ref={oscCanvasRef} width={320} height={56} className="w-full h-full block" />
-        </div>
-      </div>
     </div>
   );
 };

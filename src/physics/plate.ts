@@ -106,3 +106,114 @@ export function uniformPressureModalCoupling(m: number, n: number, L: number = D
   }
   return (4 * L * L) / (m * n * Math.PI * Math.PI);
 }
+
+export interface ModeCatalogueItem {
+  m: number;
+  n: number;
+  frequency: number;     // Natural frequency in Hz
+  omega: number;         // Angular frequency in rad/s
+  modalMass: number;     // M_mn in kg
+  centerCoupling: number;// phi_mn(L/2, L/2) = sin(m*pi/2)*sin(n*pi/2)
+  isOddOdd: boolean;     // Whether both m and n are odd (coupled to center probe)
+}
+
+/**
+ * Generates the full Kirchhoff-Love modal catalogue up to maxFrequency (default 20,000 Hz).
+ * For the standard 0.30 m aluminum plate (f11 ~ 53.963 Hz), this produces 557 modes,
+ * of which 146 are odd-odd modes actively coupled to center excitation.
+ */
+export function generateModalCatalogue(
+  maxFrequency: number = 20000,
+  material: PlateMaterial = DEFAULT_ALUMINUM,
+  geometry: PlateGeometry = DEFAULT_GEOMETRY
+): ModeCatalogueItem[] {
+  const catalogue: ModeCatalogueItem[] = [];
+  const M = calculateModalMass(material, geometry);
+  const L = geometry.sideLength;
+
+  const f11 = calculateAnalyticalFrequency(1, 1, material, geometry);
+  const maxM = Math.ceil(Math.sqrt((2 * maxFrequency) / f11));
+
+  for (let m = 1; m <= maxM; m++) {
+    for (let n = 1; n <= maxM; n++) {
+      const f = calculateAnalyticalFrequency(m, n, material, geometry);
+      if (f <= maxFrequency) {
+        const isOddOdd = m % 2 !== 0 && n % 2 !== 0;
+        const phiCenter = modeShape(m, n, L / 2, L / 2, L);
+        catalogue.push({
+          m,
+          n,
+          frequency: f,
+          omega: 2 * Math.PI * f,
+          modalMass: M,
+          centerCoupling: phiCenter,
+          isOddOdd,
+        });
+      }
+    }
+  }
+
+  // Sort ascending by natural frequency
+  catalogue.sort((a, b) => a.frequency - b.frequency);
+  return catalogue;
+}
+
+export interface ModalPhasorComponent {
+  m: number;
+  n: number;
+  aReal: number;
+  aImag: number;
+  coupling: number;
+}
+
+/**
+ * Evaluates the coherent harmonic acceleration frequency response for a single test tone:
+ * Omega = 2 * pi * fExcitation
+ * Transfer function: H_mn(Omega) = 1 / [M * (omega_mn^2 - Omega^2 + i * 2 * zeta * omega_mn * Omega)]
+ * Modal acceleration phasor: a_hat_mn = -Omega^2 * Q_mn * H_mn(Omega)
+ * Total complex acceleration field: A_hat(x, y) = sum_mn [a_hat_mn * phi_mn(x, y)]
+ * RMS acceleration: a_rms(x, y) = |A_hat(x, y)| / sqrt(2)
+ */
+export function computeHarmonicModalAccelerations(
+  fExcitation: number,
+  modes: ModeCatalogueItem[],
+  F0: number = 2.0,
+  zeta: number = 0.01
+): ModalPhasorComponent[] {
+  const Omega = 2 * Math.PI * Math.max(1.0, fExcitation);
+  const Omega2 = Omega * Omega;
+  const results: ModalPhasorComponent[] = [];
+
+  for (let i = 0; i < modes.length; i++) {
+    const mode = modes[i];
+    if (Math.abs(mode.centerCoupling) < 1e-6) continue;
+
+    const omega = mode.omega;
+    const M = mode.modalMass;
+    const Q = F0 * mode.centerCoupling;
+
+    const DReal = omega * omega - Omega2;
+    const DImag = 2 * zeta * omega * Omega;
+    const denomMag2 = DReal * DReal + DImag * DImag;
+    if (denomMag2 < 1e-18) continue;
+
+    const qPrefactor = Q / (M * denomMag2);
+    const qReal = qPrefactor * DReal;
+    const qImag = -qPrefactor * DImag;
+
+    // aHat = -Omega^2 * qHat
+    const aReal = -Omega2 * qReal;
+    const aImag = -Omega2 * qImag;
+
+    results.push({
+      m: mode.m,
+      n: mode.n,
+      aReal,
+      aImag,
+      coupling: mode.centerCoupling,
+    });
+  }
+
+  return results;
+}
+
