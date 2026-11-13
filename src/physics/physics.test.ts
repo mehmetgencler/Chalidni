@@ -43,10 +43,12 @@ interface WorkletInstance {
   modes: { m: number; n: number; frequency: number; omega: number; zeta: number; modalMass: number }[];
   sampleRate: number;
   sampleFramesProcessed: number;
+  quantumCount?: number;
   displacements: Float64Array;
   velocities: Float64Array;
   accelerations: Float64Array;
   covarianceMatrix: Float64Array;
+  covLastQ?: Int32Array;
   port: {
     onmessage: ((event: { data: unknown }) => void) | null;
     postMessage: (msg: unknown) => void;
@@ -1009,6 +1011,42 @@ test('17. High-frequency spatial RMS field resolution vs dense independent analy
     assert.ok(l2Pct <= sc.maxL2Pct, `${sc.label}: L2 error ${l2Pct.toFixed(3)}% exceeded ${sc.maxL2Pct}%`);
     assert.ok(r > 0.999, `${sc.label}: Pearson correlation too low (${r})`);
     assert.ok(symErr < 1e-11, `${sc.label}: Symmetry error ${symErr}`);
+
+    // Stage 10 Task 4: High-order y-axis interior nodal check for mode (3,27) using non-grid-aligned probes
+    if (sc.singleMode && sc.singleMode.m === 3 && sc.singleMode.n === 27) {
+      const gridStep = L / (telemetry.effectivePlateResolution - 1);
+      const xAntinodeProbe = L / (2 * sc.singleMode.m) + 0.37 * gridStep; // non-grid-aligned near x = L/6 antinode
+      let maxYNodeErrMm = 0;
+      let sumYNodeErrMm = 0;
+      const numInteriorY = sc.singleMode.n - 1; // 26 interior nodal lines y_k = k*L/27
+
+      for (let nodeK = 1; nodeK <= numInteriorY; nodeK++) {
+        const targetY = (nodeK * L) / sc.singleMode.n;
+        let minY = targetY;
+        let minVal = Infinity;
+        for (let s = -40; s <= 40; s++) {
+          const yTest = targetY + (s + 0.31) * (L / 5000); // non-grid-aligned fine probe coordinates
+          if (yTest <= 0 || yTest >= L) continue;
+          const v = mb.sampleRmsFieldFast(xAntinodeProbe, yTest);
+          if (v < minVal) {
+            minVal = v;
+            minY = yTest;
+          }
+        }
+        const errMm = Math.abs(minY - targetY) * 1000;
+        sumYNodeErrMm += errMm;
+        if (errMm > maxYNodeErrMm) maxYNodeErrMm = errMm;
+      }
+
+      const meanYNodeErrMm = sumYNodeErrMm / numInteriorY;
+      console.log(
+        `    -> Mode (3,27) y-axis check @ non-grid x=${xAntinodeProbe.toFixed(6)}m: ${numInteriorY} interior nodes | MeanErr=${meanYNodeErrMm.toFixed(4)}mm | MaxErr=${maxYNodeErrMm.toFixed(4)}mm`
+      );
+      assert.ok(
+        maxYNodeErrMm <= gridStep * 1000 * 0.55,
+        `Mode (3,27) max y-nodal position error ${maxYNodeErrMm.toFixed(4)}mm exceeded half grid cell ${(gridStep * 500).toFixed(4)}mm`
+      );
+    }
   }
 });
 
@@ -1285,4 +1323,271 @@ test('20. AudioWorklet snapshot cadence maintains 60.00 Hz average without block
     );
   }
 });
+
+/* -------------------------------------------------------------------------- */
+/* STAGE 10 TESTS 21–22: PRODUCTION TRANSPORT & INTERMEDIATE SNAPSHOT AUDIT   */
+/* -------------------------------------------------------------------------- */
+
+test('21. Production stepFromRmsGrid() strictly enforces 8 mm RMS sub-step bound and plate confinement', () => {
+  const L = DEFAULT_GEOMETRY.sideLength;
+  const sr = 48000;
+  const dt = 0.016;
+  const maxAllowedVar = 0.008 * 0.008;
+
+  const verifyParticleState = (sys: ParticleTransportSystem, label: string) => {
+    const st = sys.lastStepStats;
+    assert.equal(st.boundViolated, false, `${label}: boundViolated must remain false`);
+    assert.ok(st.maxSubStepVar <= maxAllowedVar + 1e-15, `${label}: 2*D*subDt=${st.maxSubStepVar} exceeded 0.008^2`);
+    assert.ok(st.maxSubStepRms <= 0.008 + 1e-12, `${label}: maxSubStepRms=${st.maxSubStepRms} exceeded 8 mm`);
+    assert.ok(st.maxMicroSteps < 4096, `${label}: reached emergency 4096-step guard (${st.maxMicroSteps})`);
+    for (let i = 0; i < sys.particles.length; i++) {
+      const p = sys.particles[i];
+      assert.ok(Number.isFinite(p.x) && Number.isFinite(p.y), `${label}: non-finite coordinates`);
+      assert.ok(p.x >= 0 && p.x <= L && p.y >= 0 && p.y <= L, `${label}: coordinate escaped [0, L]`);
+    }
+  };
+
+  console.log('\n[Stage 10 Test 21] Production stepFromRmsGrid() Verification:');
+
+  // 1. 269.815 Hz resonant RMS field
+  {
+    const { processor } = createProductionWorklet(sr);
+    const mb = new ModalBank(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY, 0.01);
+    processor.handleMessage({ type: 'CONFIGURE_MODES', modes: mb.getWorkletModeConfig() });
+    feedWorkletSignal(processor, 0.25, (t) => Math.sin(2 * Math.PI * 269.815 * t), sr);
+    mb.applySnapshot(processor.buildSnapshot());
+    const grid = mb.getFastRmsGridData();
+    assert.equal(grid.hasEnergy, true);
+
+    const sys = new ParticleTransportSystem({ particleCount: 3000, dRef: 2.0e-6, dt, seed: 42 }, L);
+    sys.stepFromRmsGrid(dt, grid.quadrant, grid.halfN, false);
+    verifyParticleState(sys, '269.815 Hz resonant RMS grid');
+    assert.ok(sys.lastStepStats.maxMicroSteps > 12, '269.815 Hz must adaptively exceed 12 micro-steps');
+    console.log(
+      `  269.815 Hz resonant (${grid.halfN * 2 - 1}x${grid.halfN * 2 - 1}) | maxSub=${sys.lastStepStats.maxMicroSteps} | maxStepRMS=${(sys.lastStepStats.maxSubStepRms * 1000).toFixed(3)}mm | violated=${sys.lastStepStats.boundViolated}`
+    );
+  }
+
+  // 2. High-order RMS field near 19.912 kHz
+  {
+    const { processor } = createProductionWorklet(sr);
+    const mb = new ModalBank(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY, 0.01);
+    processor.handleMessage({ type: 'CONFIGURE_MODES', modes: mb.getWorkletModeConfig() });
+    feedWorkletSignal(processor, 0.25, (t) => Math.sin(2 * Math.PI * 19912.35 * t), sr);
+    mb.applySnapshot(processor.buildSnapshot());
+    const grid = mb.getFastRmsGridData();
+    assert.equal(grid.halfN, 193, '19.912 kHz field must select 385x385 tier');
+
+    const sys = new ParticleTransportSystem({ particleCount: 3000, dRef: 2.0e-6, dt, seed: 42 }, L);
+    sys.stepFromRmsGrid(dt, grid.quadrant, grid.halfN, false);
+    verifyParticleState(sys, '19.912 kHz high-order RMS grid');
+    console.log(
+      `  19.912 kHz high-order (${grid.halfN * 2 - 1}x${grid.halfN * 2 - 1}) | maxSub=${sys.lastStepStats.maxMicroSteps} | maxStepRMS=${(sys.lastStepStats.maxSubStepRms * 1000).toFixed(3)}mm | violated=${sys.lastStepStats.boundViolated}`
+    );
+  }
+
+  // 3. High-diffusivity stress case (uniform D_g = 1.5 m^2/s across interior)
+  {
+    const halfN = 33;
+    const sys = new ParticleTransportSystem({ particleCount: 500, dRef: 1.0e-4, dt, seed: 99 }, L);
+    const { g, gammaC, dRef } = sys.config;
+    const aRmsStress = g * (gammaC + Math.sqrt(1.5 / dRef));
+    const quad = new Float64Array(halfN * halfN).fill(aRmsStress);
+
+    sys.stepFromRmsGrid(dt, quad, halfN, false);
+    verifyParticleState(sys, 'High-diffusivity stress (D=1.5)');
+    assert.ok(sys.lastStepStats.maxMicroSteps >= 750 && sys.lastStepStats.maxMicroSteps < 4096);
+    console.log(
+      `  High-diffusivity D=1.5 m^2/s     | maxSub=${sys.lastStepStats.maxMicroSteps} | maxStepRMS=${(sys.lastStepStats.maxSubStepRms * 1000).toFixed(3)}mm | violated=${sys.lastStepStats.boundViolated}`
+    );
+  }
+
+  // 4. Steep diffusivity gradient across nodal line x = 0.15 m
+  {
+    const halfN = 65;
+    const sys = new ParticleTransportSystem({ particleCount: 1000, dRef: 1.0e-4, dt, seed: 11 }, L);
+    const { g, gammaC, dRef } = sys.config;
+    const quad = new Float64Array(halfN * halfN);
+    for (let gy = 0; gy < halfN; gy++) {
+      for (let gx = 0; gx < halfN; gx++) {
+        const x = (gx / (halfN - 1)) * (L * 0.5);
+        const dTarget = 0.08 * ((x - 0.15) / 0.15) ** 2;
+        quad[gy * halfN + gx] = dTarget > 0 ? g * (gammaC + Math.sqrt(dTarget / dRef)) : 0;
+      }
+    }
+
+    let maxSubSeen = 0;
+    for (let stepIdx = 0; stepIdx < 120; stepIdx++) {
+      sys.stepFromRmsGrid(dt, quad, halfN, false);
+      verifyParticleState(sys, `Nodal gradient step ${stepIdx}`);
+      if (sys.lastStepStats.maxMicroSteps > maxSubSeen) maxSubSeen = sys.lastStepStats.maxMicroSteps;
+    }
+    const nearNodeCount = sys.particles.filter((p) => Math.abs(p.x - 0.15) < 0.025).length;
+    assert.ok(nearNodeCount > 450, `Expected nodal accumulation >450/1000 near x=0.15, got ${nearNodeCount}`);
+    console.log(
+      `  Steep nodal gradient (x=0.15m)   | maxSub=${maxSubSeen} | maxStepRMS=${(sys.lastStepStats.maxSubStepRms * 1000).toFixed(3)}mm | nearNode=${nearNodeCount}/1000 | violated=${sys.lastStepStats.boundViolated}`
+    );
+  }
+});
+
+test('22. Intermediate snapshot covariance accuracy & entry ages across abrupt transition and silence', () => {
+  const modes = getActiveCenterCoupledModes(20000, DEFAULT_ALUMINUM, DEFAULT_GEOMETRY);
+  const N = modes.length;
+  const sr = 48000;
+  const dt = 1 / sr;
+  const zeta = 0.01;
+  const tau = 0.08;
+  const sampleAlpha = 1 - Math.exp(-dt / tau);
+  const L = DEFAULT_GEOMETRY.sideLength;
+
+  // Independent exact ZOH + full N*N per-sample covariance reference
+  const A11 = new Float64Array(N), A12 = new Float64Array(N), A21 = new Float64Array(N), A22 = new Float64Array(N);
+  const w2 = new Float64Array(N), twoZW = new Float64Array(N), M = new Float64Array(N), C = new Float64Array(N);
+  for (let i = 0; i < N; i++) {
+    const m = modes[i], w = m.omega, wd = w * Math.sqrt(1 - zeta * zeta);
+    w2[i] = w * w;
+    twoZW[i] = 2 * zeta * w;
+    M[i] = m.modalMass;
+    C[i] = m.centerCoupling;
+    const e = Math.exp(-zeta * w * dt), c = Math.cos(wd * dt), sO = Math.sin(wd * dt) / wd;
+    A11[i] = e * (c + zeta * w * sO);
+    A12[i] = e * sO;
+    A21[i] = -e * w * w * sO;
+    A22[i] = e * (c - zeta * w * sO);
+  }
+
+  // Non-grid-aligned 16x16 interior evaluation mesh
+  const pts: { x: number; y: number; phis: Float64Array }[] = [];
+  for (let gy = 1; gy < 16; gy++) {
+    const y = ((gy + 0.27) / 16) * L;
+    for (let gx = 1; gx < 16; gx++) {
+      const x = ((gx + 0.31) / 16) * L;
+      pts.push({ x, y, phis: Float64Array.from(modes, (m) => modeShape(m.m, m.n, x, y, L)) });
+    }
+  }
+
+  const qRef = new Float64Array(N), vRef = new Float64Array(N), aRef = new Float64Array(N);
+  const R_ref = new Float64Array(N * N);
+  const mb = new ModalBank(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY, zeta);
+  const { processor } = createProductionWorklet(sr);
+
+  const records: {
+    phase: string;
+    tMs: number;
+    l2Pct: number;
+    maxAgeQuanta: number;
+    meanAgeQuanta: number;
+    activePairs: number;
+  }[] = [];
+
+  processor.port.postMessage = (msg: unknown) => {
+    const snap = msg as ModalSnapshot;
+    const qNow = processor.quantumCount ?? snap.quantumCount ?? 0;
+    const covLastQ = processor.covLastQ;
+    const cross = snap.covarianceCross ?? [];
+
+    let maxAgeQuanta = 0;
+    let sumAgeQuanta = 0;
+    let activePairs = 0;
+    for (let k = 0; k + 2 < cross.length; k += 3) {
+      const i = cross[k];
+      const j = cross[k + 1];
+      const age = covLastQ ? qNow - covLastQ[i * N + j] : 0;
+      if (age > maxAgeQuanta) maxAgeQuanta = age;
+      sumAgeQuanta += age;
+      activePairs++;
+    }
+
+    mb.applySnapshot(snap);
+    let sqDiff = 0;
+    let sqRef = 0;
+    for (const pt of pts) {
+      let sRef = 0;
+      for (let i = 0; i < N; i++) {
+        const pi = pt.phis[i];
+        sRef += R_ref[i * N + i] * pi * pi;
+        for (let j = i + 1; j < N; j++) {
+          sRef += 2.0 * R_ref[i * N + j] * pi * pt.phis[j];
+        }
+      }
+      const rRef = Math.sqrt(Math.max(0, sRef));
+      const rOpt = mb.evaluateRmsAcceleration(pt.x, pt.y);
+      sqDiff += (rOpt - rRef) ** 2;
+      sqRef += rRef ** 2;
+    }
+
+    const tMs = snap.elapsedSimTime * 1000;
+    const phase = tMs <= 150 ? 'Resonant 269.8Hz' : tMs <= 300 ? 'Jump 5kHz@0.3' : 'Silence decay';
+    records.push({
+      phase,
+      tMs,
+      l2Pct: sqRef > 0 ? Math.sqrt(sqDiff / sqRef) * 100 : 0,
+      maxAgeQuanta,
+      meanAgeQuanta: activePairs > 0 ? sumAgeQuanta / activePairs : 0,
+      activePairs,
+    });
+  };
+
+  const quantum = 128;
+  const inBuf = new Float32Array(quantum);
+  const outBuf = new Float32Array(quantum);
+  const totalQuanta = Math.floor((0.45 * sr) / quantum);
+
+  for (let q = 0; q < totalQuanta; q++) {
+    for (let s = 0; s < quantum; s++) {
+      const t = (q * quantum + s) * dt;
+      const sig =
+        t < 0.15
+          ? 0.8 * Math.sin(2 * Math.PI * 269.815 * t)
+          : t < 0.30
+            ? 0.3 * Math.sin(2 * Math.PI * 5000 * t)
+            : 0.0;
+      inBuf[s] = sig;
+      const exc = inBuf[s] * 3.0;
+
+      for (let i = 0; i < N; i++) {
+        const u = (exc * C[i]) / M[i];
+        const qEq = u / w2[i];
+        const qt = qRef[i] - qEq;
+        const qn = A11[i] * qt + A12[i] * vRef[i] + qEq;
+        const vn = A21[i] * qt + A22[i] * vRef[i];
+        qRef[i] = qn;
+        vRef[i] = vn;
+        aRef[i] = u - twoZW[i] * vn - w2[i] * qn;
+      }
+      for (let i = 0; i < N; i++) {
+        const ai = aRef[i];
+        const row = i * N;
+        for (let j = i; j < N; j++) {
+          R_ref[row + j] = R_ref[row + j] * (1 - sampleAlpha) + ai * aRef[j] * sampleAlpha;
+        }
+      }
+    }
+    processor.process([[inBuf]], [[outBuf]]);
+  }
+
+  assert.ok(records.length >= 24, `Expected >=24 consecutive snapshots across 0.45s, got ${records.length}`);
+  let worstL2 = 0;
+  let worstAge = 0;
+  for (const r of records) {
+    if (r.l2Pct > worstL2) worstL2 = r.l2Pct;
+    if (r.maxAgeQuanta > worstAge) worstAge = r.maxAgeQuanta;
+  }
+
+  console.log('\n[Stage 10 Test 22] Intermediate Snapshot Covariance Audit (26 consecutive snapshots @ 48 kHz):');
+  console.log(
+    `  Snapshots=${records.length} | WorstL2=${worstL2.toFixed(3)}% (limit 5.000%) | MaxEntryAge=${worstAge} quanta (${((worstAge * 128) / sr * 1000).toFixed(2)}ms)`
+  );
+  for (const idx of [0, 7, 8, 9, 17, 18, 19, 21, records.length - 1]) {
+    const r = records[idx];
+    if (!r) continue;
+    console.log(
+      `  snap#${String(idx).padStart(2)} (${r.phase.padEnd(16)} @ ${r.tMs.toFixed(1).padStart(5)}ms) | L2=${r.l2Pct.toFixed(3)}% | maxAge=${r.maxAgeQuanta}q | meanAge=${r.meanAgeQuanta.toFixed(2)}q | pairs=${r.activePairs}`
+    );
+  }
+
+  assert.ok(worstL2 <= 5.0, `Max transient snapshot L2 error ${worstL2.toFixed(3)}% exceeded 5.0% threshold`);
+  assert.ok(worstAge <= 7, `Staggered entry age ${worstAge} quanta exceeded 7 quanta bound (8-bucket stagger)`);
+});
+
 

@@ -8,3 +8,6 @@ coverage/
 !.env.example
 .playwright-cli/
 .aistudio/
+test-results/
+playwright-report/
+blob-report/
