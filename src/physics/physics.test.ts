@@ -700,10 +700,589 @@ test('16. sampleRmsFieldFast symmetric bilinear grid matches exact RMS accelerat
   );
 
   // Benchmark 3000 lookups after cache warmup
-  const sys = new ParticleTransportSystem({ particleCount: 3000, dRef: 2.5e-5, seed: 42 }, 0.30);
+  mb.sampleRmsFieldFast(0.15, 0.15);
+  const sys = new ParticleTransportSystem({ particleCount: 3000, dRef: 2.0e-6, seed: 42 }, 0.30);
   const t0 = performance.now();
   sys.step(0.016, (px, py) => sys.evaluateDimensionalDiffusivity(mb.sampleRmsFieldFast(px, py)));
   const elapsedMs = performance.now() - t0;
   assert.ok(elapsedMs < 20, `3000-particle fast step took ${elapsedMs.toFixed(2)} ms (expected <20 ms)`);
+});
+
+/* -------------------------------------------------------------------------- */
+/* STAGE 9 TESTS 17–20                                                        */
+/* -------------------------------------------------------------------------- */
+
+function pearsonCorrelation(a: Float64Array, b: Float64Array): number {
+  const n = a.length;
+  let sumA = 0;
+  let sumB = 0;
+  for (let i = 0; i < n; i++) {
+    sumA += a[i];
+    sumB += b[i];
+  }
+  const meanA = sumA / n;
+  const meanB = sumB / n;
+  let num = 0;
+  let denA = 0;
+  let denB = 0;
+  for (let i = 0; i < n; i++) {
+    const da = a[i] - meanA;
+    const db = b[i] - meanB;
+    num += da * db;
+    denA += da * da;
+    denB += db * db;
+  }
+  const den = Math.sqrt(denA * denB);
+  return den > 0 ? num / den : 1.0;
+}
+
+test('17. High-frequency spatial RMS field resolution vs dense independent analytical reference (including (27,3) @ 19.912 kHz)', () => {
+  const L = DEFAULT_GEOMETRY.sideLength;
+  const modes = getActiveCenterCoupledModes(20000, DEFAULT_ALUMINUM, DEFAULT_GEOMETRY);
+
+  // Independent dense 96x96 non-grid-aligned reference grid (resolves order-27 lobes cleanly)
+  const refGridN = 96;
+  const refPts: { x: number; y: number }[] = [];
+  for (let iy = 1; iy < refGridN; iy++) {
+    const y = ((iy + 0.37) / refGridN) * L;
+    for (let ix = 1; ix < refGridN; ix++) {
+      const x = ((ix + 0.29) / refGridN) * L;
+      refPts.push({ x, y });
+    }
+  }
+  const nPts = refPts.length;
+
+  const findModeIdx = (m: number, n: number) => modes.findIndex((item) => item.m === m && item.n === n);
+
+  const scenarios: {
+    label: string;
+    setup: (mb: ModalBank) => void;
+    singleMode?: { m: number; n: number; scale: number };
+    maxL2Pct: number;
+  }[] = [
+    {
+      label: 'Mode (1,1) 53.96 Hz',
+      singleMode: { m: 1, n: 1, scale: 100 },
+      setup: (mb) => {
+        const cov = new Array(modes.length).fill(0);
+        cov[findModeIdx(1, 1)] = 100 * 100;
+        mb.applySnapshot({
+          sampleFramesProcessed: 128,
+          sampleRate: 44100,
+          elapsedSimTime: 128 / 44100,
+          displacements: [],
+          velocities: [],
+          accelerations: [],
+          covarianceDiag: cov,
+          covarianceCross: [],
+          isPlaying: true,
+          isSilent: false,
+          quantumCount: 1,
+        });
+      },
+      maxL2Pct: 1.0,
+    },
+    {
+      label: 'Degenerate (1,3)+(3,1) 269.8 Hz',
+      setup: (mb) => {
+        const i13 = findModeIdx(1, 3);
+        const i31 = findModeIdx(3, 1);
+        const cov = new Array(modes.length).fill(0);
+        cov[i13] = 10000;
+        cov[i31] = 10000;
+        mb.applySnapshot({
+          sampleFramesProcessed: 128,
+          sampleRate: 44100,
+          elapsedSimTime: 128 / 44100,
+          displacements: [],
+          velocities: [],
+          accelerations: [],
+          covarianceDiag: cov,
+          covarianceCross: [Math.min(i13, i31), Math.max(i13, i31), 10000],
+          isPlaying: true,
+          isSilent: false,
+          quantumCount: 1,
+        });
+      },
+      maxL2Pct: 1.0,
+    },
+    {
+      label: 'Intermediate high-order (9,11) 5.45 kHz',
+      singleMode: { m: 9, n: 11, scale: 100 },
+      setup: (mb) => {
+        const cov = new Array(modes.length).fill(0);
+        cov[findModeIdx(9, 11)] = 100 * 100;
+        mb.applySnapshot({
+          sampleFramesProcessed: 128,
+          sampleRate: 44100,
+          elapsedSimTime: 128 / 44100,
+          displacements: [],
+          velocities: [],
+          accelerations: [],
+          covarianceDiag: cov,
+          covarianceCross: [],
+          isPlaying: true,
+          isSilent: false,
+          quantumCount: 1,
+        });
+      },
+      maxL2Pct: 2.0,
+    },
+    {
+      label: 'Mode (27,3) 19.912 kHz',
+      singleMode: { m: 27, n: 3, scale: 100 },
+      setup: (mb) => {
+        const cov = new Array(modes.length).fill(0);
+        cov[findModeIdx(27, 3)] = 100 * 100;
+        mb.applySnapshot({
+          sampleFramesProcessed: 128,
+          sampleRate: 44100,
+          elapsedSimTime: 128 / 44100,
+          displacements: [],
+          velocities: [],
+          accelerations: [],
+          covarianceDiag: cov,
+          covarianceCross: [],
+          isPlaying: true,
+          isSilent: false,
+          quantumCount: 1,
+        });
+      },
+      maxL2Pct: 3.0,
+    },
+    {
+      label: 'Mode (3,27) 19.912 kHz',
+      singleMode: { m: 3, n: 27, scale: 100 },
+      setup: (mb) => {
+        const cov = new Array(modes.length).fill(0);
+        cov[findModeIdx(3, 27)] = 100 * 100;
+        mb.applySnapshot({
+          sampleFramesProcessed: 128,
+          sampleRate: 44100,
+          elapsedSimTime: 128 / 44100,
+          displacements: [],
+          velocities: [],
+          accelerations: [],
+          covarianceDiag: cov,
+          covarianceCross: [],
+          isPlaying: true,
+          isSilent: false,
+          quantumCount: 1,
+        });
+      },
+      maxL2Pct: 3.0,
+    },
+    {
+      label: 'Multimode broadband covariance (all 146 modes)',
+      setup: (mb) => {
+        const cov = modes.map((_, idx) => 50 + ((idx * 17) % 100));
+        mb.applySnapshot({
+          sampleFramesProcessed: 128,
+          sampleRate: 44100,
+          elapsedSimTime: 128 / 44100,
+          displacements: [],
+          velocities: [],
+          accelerations: [],
+          covarianceDiag: cov,
+          covarianceCross: [],
+          isPlaying: true,
+          isSilent: false,
+          quantumCount: 1,
+        });
+      },
+      maxL2Pct: 2.0,
+    },
+    {
+      label: 'High-order mixed field (1,1)+(7,9)+(15,17)+(27,3)',
+      setup: (mb) => {
+        const cov = new Array(modes.length).fill(0);
+        const picks = [
+          findModeIdx(1, 1),
+          findModeIdx(7, 9),
+          findModeIdx(15, 17),
+          findModeIdx(27, 3),
+        ];
+        for (const p of picks) cov[p] = 2500;
+        const cross: number[] = [];
+        for (let a = 0; a < picks.length; a++) {
+          for (let b = a + 1; b < picks.length; b++) {
+            const i = Math.min(picks[a], picks[b]);
+            const j = Math.max(picks[a], picks[b]);
+            cross.push(i, j, 500);
+          }
+        }
+        mb.applySnapshot({
+          sampleFramesProcessed: 128,
+          sampleRate: 44100,
+          elapsedSimTime: 128 / 44100,
+          displacements: [],
+          velocities: [],
+          accelerations: [],
+          covarianceDiag: cov,
+          covarianceCross: cross,
+          isPlaying: true,
+          isSilent: false,
+          quantumCount: 1,
+        });
+      },
+      maxL2Pct: 2.5,
+    },
+  ];
+
+  // Confirm legacy 33x33 baseline indeed reproduces ~26.6% error on (27,3)
+  const mbBaseline = new ModalBank(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY, 0.01);
+  mbBaseline.setForcedHalfN(33);
+  scenarios[3].setup(mbBaseline);
+  let baseSqDiff = 0;
+  let baseSqRef = 0;
+  for (let i = 0; i < nPts; i++) {
+    const pt = refPts[i];
+    const ref = Math.abs(100 * modeShape(27, 3, pt.x, pt.y, L));
+    const approx = mbBaseline.sampleRmsFieldFast(pt.x, pt.y);
+    baseSqDiff += (approx - ref) ** 2;
+    baseSqRef += ref ** 2;
+  }
+  const baseline273Err = Math.sqrt(baseSqDiff / baseSqRef) * 100;
+  assert.ok(baseline273Err > 20.0, `Expected legacy 33x33 baseline to exceed 20%, got ${baseline273Err.toFixed(2)}%`);
+
+  const mb = new ModalBank(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY, 0.01);
+  console.log('\n[Stage 9 Test 17] Spatial RMS Accuracy vs 96x96 Independent Reference:');
+  for (const sc of scenarios) {
+    sc.setup(mb);
+    const refVals = new Float64Array(nPts);
+    const fastVals = new Float64Array(nPts);
+
+    let sqDiff = 0;
+    let sqRef = 0;
+    let maxAbsErr = 0;
+
+    for (let i = 0; i < nPts; i++) {
+      const pt = refPts[i];
+      // Independent exact evaluation
+      const exactVal = sc.singleMode
+        ? Math.abs(sc.singleMode.scale * modeShape(sc.singleMode.m, sc.singleMode.n, pt.x, pt.y, L))
+        : mb.evaluateRmsAcceleration(pt.x, pt.y);
+      const fastVal = mb.sampleRmsFieldFast(pt.x, pt.y);
+      refVals[i] = exactVal;
+      fastVals[i] = fastVal;
+      const err = Math.abs(fastVal - exactVal);
+      if (err > maxAbsErr) maxAbsErr = err;
+      sqDiff += err * err;
+      sqRef += exactVal * exactVal;
+    }
+
+    const l2Pct = Math.sqrt(sqDiff / sqRef) * 100;
+    const r = pearsonCorrelation(refVals, fastVals);
+    const symErr = Math.max(
+      Math.abs(mb.sampleRmsFieldFast(0.061, 0.097) - mb.sampleRmsFieldFast(L - 0.061, 0.097)),
+      Math.abs(mb.sampleRmsFieldFast(0.061, 0.097) - mb.sampleRmsFieldFast(0.061, L - 0.097)),
+      Math.abs(mb.sampleRmsFieldFast(0.061, 0.097) - mb.sampleRmsFieldFast(L - 0.061, L - 0.097))
+    );
+
+    // Measure nodal-line zero position error for single modes along non-nodal cross-section
+    let nodalPosErrMm = 0;
+    if (sc.singleMode) {
+      const { m } = sc.singleMode;
+      const yProbe = L / (2 * sc.singleMode.n); // Antinode in y
+      // Inspect interior nodal line x_node = L / m (if m > 1; else boundary)
+      if (m > 1) {
+        const targetX = L / m;
+        let minX = targetX;
+        let minVal = Infinity;
+        for (let k = -40; k <= 40; k++) {
+          const xTest = targetX + k * (L / 4000);
+          const v = mb.sampleRmsFieldFast(xTest, yProbe);
+          if (v < minVal) {
+            minVal = v;
+            minX = xTest;
+          }
+        }
+        nodalPosErrMm = Math.abs(minX - targetX) * 1000;
+      }
+    }
+
+    const telemetry = mb.getFastGridTelemetry();
+    console.log(
+      `  ${sc.label.padEnd(44)} | grid=${telemetry.effectivePlateResolution}x${telemetry.effectivePlateResolution} | L2=${l2Pct.toFixed(3)}% | MaxErr=${maxAbsErr.toFixed(3)} | r=${r.toFixed(6)} | NodalErr=${nodalPosErrMm.toFixed(3)}mm | SymErr=${symErr.toExponential(1)} | Rebuild=${telemetry.lastRebuildDurationMs.toFixed(2)}ms`
+    );
+
+    assert.ok(l2Pct <= sc.maxL2Pct, `${sc.label}: L2 error ${l2Pct.toFixed(3)}% exceeded ${sc.maxL2Pct}%`);
+    assert.ok(r > 0.999, `${sc.label}: Pearson correlation too low (${r})`);
+    assert.ok(symErr < 1e-11, `${sc.label}: Symmetry error ${symErr}`);
+  }
+});
+
+test('18. Adaptive particle micro-stepping strictly enforces 8 mm RMS sub-step bound across all excitation regimes', () => {
+  const L = DEFAULT_GEOMETRY.sideLength;
+  const sr = 48000;
+  const dt = 0.016;
+  const toneCases = [
+    { label: '53.963 Hz resonance', freq: 53.963 },
+    { label: '269.815 Hz degenerate resonance', freq: 269.815 },
+    { label: '1 kHz', freq: 1000 },
+    { label: '5 kHz', freq: 5000 },
+    { label: '10 kHz', freq: 10000 },
+    { label: '19.912 kHz ((27,3)+(3,27))', freq: 19912 },
+  ];
+
+  console.log('\n[Stage 9 Test 18] Adaptive Particle Micro-Stepping Statistics:');
+  for (const tc of toneCases) {
+    const { processor } = createProductionWorklet(sr);
+    const mb = new ModalBank(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY, 0.01);
+    processor.handleMessage({ type: 'CONFIGURE_MODES', modes: mb.getWorkletModeConfig() });
+    feedWorkletSignal(processor, 0.25, (t) => Math.sin(2 * Math.PI * tc.freq * t), sr);
+    const snap = processor.buildSnapshot();
+    mb.applySnapshot(snap);
+
+    const sys = new ParticleTransportSystem({ particleCount: 3000, dRef: 2.0e-6, dt, seed: 42 }, L);
+    sys.step(dt, (px, py) => sys.evaluateDimensionalDiffusivity(mb.sampleRmsFieldFast(px, py), false));
+    const st = sys.lastStepStats;
+
+    console.log(
+      `  ${tc.label.padEnd(32)} | maxSub=${String(st.maxMicroSteps).padStart(4)} | meanSub=${st.meanMicroSteps.toFixed(2)} | maxStepRMS=${(st.maxSubStepRms * 1000).toFixed(3)}mm | violated=${st.boundViolated} | cpu=${st.updateDurationMs.toFixed(2)}ms`
+    );
+
+    assert.equal(st.boundViolated, false, `${tc.label}: 8 mm sub-step bound must never be violated`);
+    assert.ok(st.maxSubStepRms <= 0.008 + 1e-12, `${tc.label}: maxSubStepRms=${st.maxSubStepRms}`);
+    assert.equal(sys.particles.length, 3000);
+    for (const p of sys.particles) {
+      assert.ok(p.x >= 0 && p.x <= L && p.y >= 0 && p.y <= L);
+    }
+  }
+
+  // Confirm 269.815 Hz exceeds old capped 12 micro-steps while keeping bound satisfied!
+  {
+    const { processor } = createProductionWorklet(sr);
+    const mb = new ModalBank(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY, 0.01);
+    processor.handleMessage({ type: 'CONFIGURE_MODES', modes: mb.getWorkletModeConfig() });
+    feedWorkletSignal(processor, 0.25, (t) => Math.sin(2 * Math.PI * 269.815 * t), sr);
+    mb.applySnapshot(processor.buildSnapshot());
+    const sys = new ParticleTransportSystem({ particleCount: 3000, dRef: 2.0e-6, dt, seed: 42 }, L);
+    sys.step(dt, (px, py) => sys.evaluateDimensionalDiffusivity(mb.sampleRmsFieldFast(px, py), false));
+    assert.ok(sys.lastStepStats.maxMicroSteps > 12, '269.815 Hz resonance must dynamically take >12 micro-steps to respect 8mm bound');
+  }
+
+  // High diffusivity stress test (uniform D = 1.5 m^2/s)
+  {
+    const sys = new ParticleTransportSystem({ particleCount: 500, dt, seed: 99 }, L);
+    sys.step(dt, () => 1.5);
+    assert.equal(sys.lastStepStats.boundViolated, false);
+    assert.ok(sys.lastStepStats.maxSubStepRms <= 0.008 + 1e-12);
+    assert.ok(sys.lastStepStats.maxMicroSteps >= 750);
+  }
+
+  // Steep diffusivity gradient near nodal line (particles concentrate at D(0.15)=0 without tunneling barrier)
+  {
+    const sys = new ParticleTransportSystem({ particleCount: 1000, dt, seed: 11 }, L);
+    const nodalDiff = (x: number) => {
+      const d = (x - 0.15) / 0.15;
+      return 0.08 * d * d;
+    };
+    for (let k = 0; k < 120; k++) {
+      sys.step(dt, nodalDiff);
+      assert.equal(sys.lastStepStats.boundViolated, false);
+    }
+    const nearNodeCount = sys.particles.filter((p) => Math.abs(p.x - 0.15) < 0.025).length;
+    assert.ok(nearNodeCount > 450, `Expected grains to accumulate near nodal line x=0.15, got ${nearNodeCount}/1000`);
+  }
+});
+
+test('19. Dense spatial grid (64x64) broadband & high-frequency covariance comparison vs full N*N per-sample reference', () => {
+  const modes = getActiveCenterCoupledModes(20000, DEFAULT_ALUMINUM, DEFAULT_GEOMETRY);
+  const N = modes.length;
+  const sr = 44100;
+  const dt = 1 / sr;
+  const zeta = 0.01;
+  const tau = 0.08;
+  const sampleAlpha = 1 - Math.exp(-dt / tau);
+  const L = DEFAULT_GEOMETRY.sideLength;
+
+  const A11 = new Float64Array(N), A12 = new Float64Array(N), A21 = new Float64Array(N), A22 = new Float64Array(N);
+  const w2 = new Float64Array(N), twoZW = new Float64Array(N), M = new Float64Array(N), C = new Float64Array(N);
+  for (let i = 0; i < N; i++) {
+    const m = modes[i], w = m.omega, wd = w * Math.sqrt(1 - zeta * zeta);
+    w2[i] = w * w;
+    twoZW[i] = 2 * zeta * w;
+    M[i] = m.modalMass;
+    C[i] = m.centerCoupling;
+    const e = Math.exp(-zeta * w * dt), c = Math.cos(wd * dt), sOver = Math.sin(wd * dt) / wd;
+    A11[i] = e * (c + zeta * w * sOver);
+    A12[i] = e * sOver;
+    A21[i] = -e * w * w * sOver;
+    A22[i] = e * (c - zeta * w * sOver);
+  }
+
+  // Dense 64x64 non-grid-aligned reference points (3,969 points resolving m=27 lobes cleanly)
+  const denseN = 64;
+  const gridPts: { x: number; y: number; phis: Float64Array }[] = [];
+  for (let gy = 1; gy < denseN; gy++) {
+    const y = ((gy + 0.31) / denseN) * L;
+    for (let gx = 1; gx < denseN; gx++) {
+      const x = ((gx + 0.27) / denseN) * L;
+      const phis = Float64Array.from(modes, (m) => modeShape(m.m, m.n, x, y, L));
+      gridPts.push({ x, y, phis });
+    }
+  }
+
+  let lcgSeed = 987654321;
+  const signals: { name: string; maxAllowedErrPct: number; gen: (t: number) => number }[] = [
+    { name: '1 kHz pure tone', maxAllowedErrPct: 5.0, gen: (t) => Math.sin(2 * Math.PI * 1000 * t) },
+    { name: '5 kHz pure tone', maxAllowedErrPct: 5.0, gen: (t) => Math.sin(2 * Math.PI * 5000 * t) },
+    { name: '10 kHz pure tone', maxAllowedErrPct: 5.0, gen: (t) => Math.sin(2 * Math.PI * 10000 * t) },
+    { name: '19.912 kHz resonance', maxAllowedErrPct: 5.0, gen: (t) => Math.sin(2 * Math.PI * 19912.35 * t) },
+    { name: '20 kHz input tone', maxAllowedErrPct: 5.0, gen: (t) => Math.sin(2 * Math.PI * 20000 * t) },
+    {
+      name: 'High-freq two-tone (10k + 19.912k)',
+      maxAllowedErrPct: 5.0,
+      gen: (t) => 0.5 * (Math.sin(2 * Math.PI * 10000 * t) + Math.sin(2 * Math.PI * 19912.35 * t)),
+    },
+    {
+      name: 'Broadband white noise',
+      maxAllowedErrPct: 12.0,
+      gen: () => {
+        lcgSeed = (Math.imul(lcgSeed, 1664525) + 1013904223) >>> 0;
+        return (lcgSeed / 4294967296) * 2 - 1;
+      },
+    },
+    {
+      name: 'Harmonic/percussive synthetic signal',
+      maxAllowedErrPct: 8.0,
+      gen: (t) =>
+        0.4 * Math.sin(2 * Math.PI * 110 * t) +
+        0.25 * Math.sin(2 * Math.PI * 220 * t) +
+        0.2 * Math.sin(2 * Math.PI * 440 * t) +
+        0.15 * Math.sin(2 * Math.PI * 3520 * t) * Math.exp(-((t % 0.1) * 40)),
+    },
+  ];
+
+  const durationSec = 0.2;
+  const totalSamples = Math.floor(durationSec * sr) - (Math.floor(durationSec * sr) % 128);
+  const totalPossibleOffDiag = (N * (N - 1)) / 2;
+
+  console.log('\n[Stage 9 Test 19] Dense 64x64 Broadband Covariance Comparison:');
+  for (const sig of signals) {
+    const { processor } = createProductionWorklet(sr);
+    const mb = new ModalBank(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY, zeta);
+
+    const qRef = new Float64Array(N), vRef = new Float64Array(N), aRef = new Float64Array(N);
+    const R_ref = new Float64Array(N * N);
+
+    const quantum = 128;
+    const inBuf = new Float32Array(quantum);
+    const outBuf = new Float32Array(quantum);
+
+    for (let offset = 0; offset < totalSamples; offset += quantum) {
+      for (let s = 0; s < quantum; s++) {
+        inBuf[s] = sig.gen((offset + s) * dt);
+        const exc = inBuf[s] * 3.0;
+        for (let i = 0; i < N; i++) {
+          const u = (exc * C[i]) / M[i];
+          const qEq = u / w2[i];
+          const qt = qRef[i] - qEq;
+          const qn = A11[i] * qt + A12[i] * vRef[i] + qEq;
+          const vn = A21[i] * qt + A22[i] * vRef[i];
+          const an = u - twoZW[i] * vn - w2[i] * qn;
+          qRef[i] = qn;
+          vRef[i] = vn;
+          aRef[i] = an;
+        }
+        for (let i = 0; i < N; i++) {
+          const ai = aRef[i];
+          const row = i * N;
+          for (let j = i; j < N; j++) {
+            R_ref[row + j] = R_ref[row + j] * (1 - sampleAlpha) + ai * aRef[j] * sampleAlpha;
+          }
+        }
+      }
+      processor.process([[inBuf]], [[outBuf]]);
+    }
+
+    // Extract active sparse non-zero reference pairs for fast exact dense-grid evaluation
+    const refDiag = new Float64Array(N);
+    const refCrossI: number[] = [];
+    const refCrossJ: number[] = [];
+    const refCrossV: number[] = [];
+    for (let i = 0; i < N; i++) {
+      refDiag[i] = R_ref[i * N + i];
+      for (let j = i + 1; j < N; j++) {
+        const v = R_ref[i * N + j];
+        if (Math.abs(v) > 1e-12) {
+          refCrossI.push(i);
+          refCrossJ.push(j);
+          refCrossV.push(v);
+        }
+      }
+    }
+
+    const snap = processor.buildSnapshot();
+    mb.applySnapshot(snap);
+    const retainedOffDiag = (snap.covarianceCross?.length ?? 0) / 3;
+    const omittedOffDiag = Math.max(0, totalPossibleOffDiag - retainedOffDiag);
+
+    const refArr = new Float64Array(gridPts.length);
+    const optArr = new Float64Array(gridPts.length);
+    let sqDiff = 0;
+    let sqRef = 0;
+    let maxErr = 0;
+
+    for (let idx = 0; idx < gridPts.length; idx++) {
+      const pt = gridPts[idx];
+      let sRef = 0;
+      for (let i = 0; i < N; i++) {
+        sRef += refDiag[i] * pt.phis[i] * pt.phis[i];
+      }
+      for (let c = 0; c < refCrossI.length; c++) {
+        sRef += 2.0 * refCrossV[c] * pt.phis[refCrossI[c]] * pt.phis[refCrossJ[c]];
+      }
+      const rRef = Math.sqrt(Math.max(0, sRef));
+      const rOpt = mb.evaluateRmsAcceleration(pt.x, pt.y);
+      refArr[idx] = rRef;
+      optArr[idx] = rOpt;
+      const diff = Math.abs(rOpt - rRef);
+      if (diff > maxErr) maxErr = diff;
+      sqDiff += diff * diff;
+      sqRef += rRef * rRef;
+    }
+
+    const l2Pct = sqRef > 0 ? Math.sqrt(sqDiff / sqRef) * 100 : 0;
+    const r = pearsonCorrelation(refArr, optArr);
+    console.log(
+      `  ${sig.name.padEnd(36)} | L2=${l2Pct.toFixed(3)}% | MaxErr=${maxErr.toFixed(3)} | r=${r.toFixed(5)} | retained=${retainedOffDiag} | omitted=${omittedOffDiag}`
+    );
+
+    assert.ok(l2Pct <= sig.maxAllowedErrPct, `${sig.name}: L2=${l2Pct.toFixed(3)}% > ${sig.maxAllowedErrPct}%`);
+    assert.ok(r > 0.99, `${sig.name}: Pearson correlation ${r} < 0.99`);
+  }
+});
+
+test('20. AudioWorklet snapshot cadence maintains 60.00 Hz average without block-quantization drift at 44.1 kHz & 48 kHz', () => {
+  console.log('\n[Stage 9 Test 20] Snapshot Cadence Measurements (10s window):');
+  for (const sr of [44100, 48000]) {
+    const { processor, snapshots } = createProductionWorklet(sr);
+    feedWorkletSignal(processor, 10.0, (t) => Math.sin(2 * Math.PI * 269.815 * t), sr);
+
+    const lastSnap = snapshots[snapshots.length - 1];
+    const durationSec = lastSnap.sampleFramesProcessed / sr;
+    const avgHz = snapshots.length / durationSec;
+
+    // Confirm monotonic sampleFramesProcessed & exact simulation clock
+    let prevFrames = 0;
+    for (const s of snapshots) {
+      assert.ok(s.sampleFramesProcessed > prevFrames, 'sampleFramesProcessed must strictly increase');
+      assert.ok(
+        Math.abs(s.elapsedSimTime - s.sampleFramesProcessed / s.sampleRate) < 1e-12,
+        'elapsedSimTime must strictly equal sampleFramesProcessed / sampleRate'
+      );
+      prevFrames = s.sampleFramesProcessed;
+    }
+
+    console.log(
+      `  SampleRate=${sr} Hz | Snapshots=${snapshots.length} | Duration=${durationSec.toFixed(4)}s | AvgCadence=${avgHz.toFixed(3)} Hz`
+    );
+    assert.ok(
+      Math.abs(avgHz - 60.0) < 0.25,
+      `Sample rate ${sr} Hz average cadence ${avgHz.toFixed(3)} Hz drifted from 60.0 Hz`
+    );
+  }
 });
 

@@ -54,6 +54,7 @@ export class AudioEngine {
   private fileGain: GainNode | null = null;
   private audioFileUrl: string | null = null;
   private currentFileName: string = '';
+  private isFileAudibleToDestination = false;
   private progressListeners: Set<(progress: PlaybackProgress) => void> = new Set();
 
   // Latest snapshot received from AudioWorklet
@@ -88,7 +89,15 @@ export class AudioEngine {
       const AudioContextClass =
         window.AudioContext ||
         (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      this.ctx = new AudioContextClass();
+      let sampleRateOpt: number | undefined;
+      if (typeof window !== 'undefined' && typeof window.location?.search === 'string') {
+        const match = window.location.search.match(/[?&]sr=(\d+)/);
+        if (match) {
+          const parsed = Number(match[1]);
+          if (parsed === 44100 || parsed === 48000) sampleRateOpt = parsed;
+        }
+      }
+      this.ctx = sampleRateOpt ? new AudioContextClass({ sampleRate: sampleRateOpt }) : new AudioContextClass();
     }
 
     if (this.ctx.state === 'suspended') {
@@ -196,6 +205,30 @@ export class AudioEngine {
 
   getPendingMessageCount(): number {
     return this.pendingWorkletMessages.length;
+  }
+
+  getBrowserAudioTelemetry(): {
+    hasRealAudioContext: boolean;
+    hasRealAudioWorkletNode: boolean;
+    sampleRate: number;
+    isToneConnected: boolean;
+    isFileDownmixConnected: boolean;
+    isFileAudibleToDestination: boolean;
+  } {
+    const hasAudioCtx =
+      typeof AudioContext !== 'undefined' && this.ctx instanceof AudioContext;
+    const hasWorklet =
+      this.isWorkletReady &&
+      typeof AudioWorkletNode !== 'undefined' &&
+      this.workletNode instanceof AudioWorkletNode;
+    return {
+      hasRealAudioContext: hasAudioCtx,
+      hasRealAudioWorkletNode: hasWorklet,
+      sampleRate: this.sampleRate,
+      isToneConnected: Boolean(this.toneGain && this.workletNode),
+      isFileDownmixConnected: Boolean(this.fileGain && this.workletNode),
+      isFileAudibleToDestination: this.isFileAudibleToDestination,
+    };
   }
 
   /**
@@ -333,6 +366,7 @@ export class AudioEngine {
 
         // Audible system output in full stereo
         this.mediaElementSource.connect(this.ctx.destination);
+        this.isFileAudibleToDestination = true;
 
         this.audioElement.ontimeupdate = () => this.notifyProgress();
         this.audioElement.onended = () => {

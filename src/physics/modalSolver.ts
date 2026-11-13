@@ -84,11 +84,25 @@ export class ModalBank {
   private activeCrossJ: Int32Array;
   private activeCrossValues: Float64Array;
 
-  // 4-fold symmetric 33x33 quadrant (65x65 plate resolution) RMS field cache for 3000-particle stepping
-  private readonly fastHalfN: number = 33; // indices 0..32 cover [0, L/2]
-  private fastSinTable: Float64Array;
+  // Adaptive 4-fold symmetric quadrant RMS field cache (tiers: [33 baseline], 65, 129, 193 => 65x65, 129x129, 257x257, 385x385 plate)
+  private static readonly TIER_HALF_NS = [33, 65, 129, 193] as const;
+  private tierSinCols: Float64Array[][];
+  private tierCosCols: Float64Array[][];
+  private cosStride: number = 28;
+  private activeFastHalfN: number = 65;
+  private forcedHalfN: number | null = null;
   private fastRmsQuadrant: Float64Array;
   private fastGridDirty: boolean = true;
+  private lastRebuildDurationMs: number = 0;
+
+  // Exact 2D cosine contraction scratch buffers (zero GC per rebuild)
+  private cos2D: Float64Array;
+  private activeKxList: Int32Array;
+  private nzStart: Int32Array;
+  private nzKy: Int32Array;
+  private nzVal: Float64Array;
+  private rowCosWeights: Float64Array;
+  private rowRmsSq: Float64Array;
 
   constructor(
     material: PlateMaterial = DEFAULT_ALUMINUM,
@@ -150,19 +164,51 @@ export class ModalBank {
     this.sinXCache = new Float64Array(this.maxOddHalfIdx);
     this.sinYCache = new Float64Array(this.maxOddHalfIdx);
 
-    // Precompute 1D odd-harmonic sine table over [0, L/2] for 4-fold symmetric fast RMS grid
-    const halfN = this.fastHalfN;
+    // Precompute 1D odd-harmonic sine tables (for isolated single-mode fast path) and cosine tables
+    // for exact product-to-sum 2D cosine matrix contraction:
+    // sin((2a+1)t)*sin((2b+1)t) = 0.5 * [cos(2|a-b|t) - cos(2(a+b+1)t)]
     const stride = this.maxOddHalfIdx;
-    this.fastSinTable = new Float64Array(halfN * stride);
-    this.fastRmsQuadrant = new Float64Array(halfN * halfN);
+    const cosStride = 2 * stride;
+    this.cosStride = cosStride;
     const L = geometry.sideLength;
-    for (let g = 0; g < halfN; g++) {
-      const coord = (g / (halfN - 1)) * (L * 0.5);
+
+    this.tierSinCols = ModalBank.TIER_HALF_NS.map((halfN) => {
+      const cols: Float64Array[] = new Array(stride);
       for (let k = 0; k < stride; k++) {
+        const col = new Float64Array(halfN);
         const harmonic = 2 * k + 1;
-        this.fastSinTable[g * stride + k] = Math.sin((harmonic * Math.PI * coord) / L);
+        for (let g = 0; g < halfN; g++) {
+          const coord = (g / (halfN - 1)) * (L * 0.5);
+          col[g] = Math.sin((harmonic * Math.PI * coord) / L);
+        }
+        cols[k] = col;
       }
-    }
+      return cols;
+    });
+
+    this.tierCosCols = ModalBank.TIER_HALF_NS.map((halfN) => {
+      const cols: Float64Array[] = new Array(cosStride);
+      for (let k = 0; k < cosStride; k++) {
+        const col = new Float64Array(halfN);
+        const twoK = 2 * k;
+        for (let g = 0; g < halfN; g++) {
+          const coord = (g / (halfN - 1)) * (L * 0.5);
+          col[g] = Math.cos((twoK * Math.PI * coord) / L);
+        }
+        cols[k] = col;
+      }
+      return cols;
+    });
+
+    const maxHalfN = ModalBank.TIER_HALF_NS[ModalBank.TIER_HALF_NS.length - 1];
+    this.fastRmsQuadrant = new Float64Array(maxHalfN * maxHalfN);
+    this.cos2D = new Float64Array(cosStride * cosStride);
+    this.activeKxList = new Int32Array(cosStride);
+    this.nzStart = new Int32Array(cosStride + 1);
+    this.nzKy = new Int32Array(cosStride * cosStride);
+    this.nzVal = new Float64Array(cosStride * cosStride);
+    this.rowCosWeights = new Float64Array(cosStride);
+    this.rowRmsSq = new Float64Array(maxHalfN);
 
     const M = calculateModalMass(material, geometry);
     this.modes = initialModes.map((m) => {
@@ -373,75 +419,308 @@ export class ModalBank {
   }
 
   /**
-   * Rebuilds the 33x33 quadrant (65x65 full-plate) symmetric RMS acceleration field cache.
+   * Selects the optimal adaptive quadrant resolution tier based on active modal order & energy sparsity.
+   */
+  private chooseAdaptiveTierIndex(): number {
+    if (this.forcedHalfN !== null) {
+      const idx = ModalBank.TIER_HALF_NS.indexOf(this.forcedHalfN as 33 | 65 | 129 | 193);
+      return idx >= 0 ? idx : 1;
+    }
+
+    let maxDiag = 0;
+    let totalDiag = 0;
+    const dCount = this.activeDiagCount;
+    for (let k = 0; k < dCount; k++) {
+      const v = this.activeDiagValues[k];
+      totalDiag += v;
+      if (v > maxDiag) maxDiag = v;
+    }
+
+    // Ignore negligible <1% RMS modes (variance < 1e-4 * maxDiag) when selecting adaptive grid resolution
+    const threshold = maxDiag * 1e-4;
+    let maxOrder = 1;
+    let highOrderEnergy = 0;
+
+    for (let k = 0; k < dCount; k++) {
+      const v = this.activeDiagValues[k];
+      if (v < threshold) continue;
+      const mode = this.modes[this.activeDiagIndices[k]];
+      const order = Math.max(mode.m, mode.n);
+      if (order > maxOrder) maxOrder = order;
+      if (order > 13) highOrderEnergy += v;
+    }
+
+    for (let k = 0; k < this.activeCrossCount; k++) {
+      if (Math.abs(this.activeCrossValues[k]) < threshold) continue;
+      const mi = this.modes[this.activeCrossI[k]];
+      const mj = this.modes[this.activeCrossJ[k]];
+      const order = Math.max(mi.m, mi.n, mj.m, mj.n);
+      if (order > maxOrder) maxOrder = order;
+    }
+
+    if (maxOrder <= 5) return 1; // 65x65 quadrant (129x129 full plate)
+    if (maxOrder <= 13) return 2; // 129x129 quadrant (257x257 full plate)
+
+    const highOrderShare = totalDiag > 0 ? highOrderEnergy / totalDiag : 0;
+    if (dCount <= 48 || this.activeCrossCount <= 48 || highOrderShare >= 0.12) {
+      return 3; // 193x193 quadrant (385x385 full plate -> <=1.52% L2 error at (27,3))
+    }
+    return 2; // Dense low-dominated broadband noise uses 257x257 plate
+  }
+
+  /**
+   * Optional override used strictly for benchmark comparisons (null = adaptive mode-order tiering).
+   */
+  setForcedHalfN(halfN: number | null): void {
+    this.forcedHalfN = halfN;
+    this.fastGridDirty = true;
+  }
+
+  getFastGridTelemetry(): {
+    quadrantHalfN: number;
+    effectivePlateResolution: number;
+    lastRebuildDurationMs: number;
+    activeDiagCount: number;
+    activeCrossCount: number;
+  } {
+    return {
+      quadrantHalfN: this.activeFastHalfN,
+      effectivePlateResolution: this.activeFastHalfN * 2 - 1,
+      lastRebuildDurationMs: this.lastRebuildDurationMs,
+      activeDiagCount: this.activeDiagCount,
+      activeCrossCount: this.activeCrossCount,
+    };
+  }
+
+  /**
+   * Returns maximum RMS acceleration among modes above cutoffHz (used to verify >2.7 kHz excitation).
+   */
+  getMaxModeRmsAboveFrequency(cutoffHz: number): number {
+    let maxVar = 0;
+    const n = this.modes.length;
+    for (let i = 0; i < n; i++) {
+      if (this.modes[i].frequency > cutoffHz) {
+        const d = this.covarianceMatrix[i * n + i];
+        if (d > maxVar) maxVar = d;
+      }
+    }
+    return Math.sqrt(Math.max(0, maxVar));
+  }
+
+  /**
+   * Rebuilds the adaptive 4-fold symmetric quadrant RMS acceleration field cache
+   * using exact product-to-sum 2D cosine folding (folds all 146 diagonals + up to 10,585 cross-terms
+   * once into a 28x28 cosine matrix, reducing grid evaluation from ~6M scattered ops to <=1M linear ops).
    */
   private rebuildFastRmsGrid(): void {
+    const t0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
     this.fastGridDirty = false;
-    if (this.activeDiagCount === 0 && this.activeCrossCount === 0) {
-      this.fastRmsQuadrant.fill(0);
+
+    const tierIdx = this.chooseAdaptiveTierIndex();
+    const halfN = ModalBank.TIER_HALF_NS[tierIdx];
+    this.activeFastHalfN = halfN;
+
+    const dCount = this.activeDiagCount;
+    const cCount = this.activeCrossCount;
+    const out = this.fastRmsQuadrant;
+
+    if (dCount === 0 && cCount === 0) {
+      out.fill(0, 0, halfN * halfN);
+      this.lastRebuildDurationMs = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0;
       return;
     }
 
     if (!this.allOddOdd) {
-      const halfN = this.fastHalfN;
       const halfL = this.geometry.sideLength * 0.5;
       for (let gy = 0; gy < halfN; gy++) {
         const y = (gy / (halfN - 1)) * halfL;
         for (let gx = 0; gx < halfN; gx++) {
           const x = (gx / (halfN - 1)) * halfL;
-          this.fastRmsQuadrant[gy * halfN + gx] = this.evaluateRmsAcceleration(x, y);
+          out[gy * halfN + gx] = this.evaluateRmsAcceleration(x, y);
         }
       }
+      this.lastRebuildDurationMs = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0;
       return;
     }
 
-    const halfN = this.fastHalfN;
-    const stride = this.maxOddHalfIdx;
-    const sinTab = this.fastSinTable;
-    const phis = this.phisCache;
     const mHalf = this.mHalfIdx;
     const nHalf = this.nHalfIdx;
-    const dCount = this.activeDiagCount;
-    const cCount = this.activeCrossCount;
 
-    for (let gy = 0; gy < halfN; gy++) {
-      const yOff = gy * stride;
-      for (let gx = 0; gx < halfN; gx++) {
-        const xOff = gx * stride;
-        let sumRmsSq = 0;
-
-        if (cCount > 0) {
-          for (let i = 0; i < this.modes.length; i++) {
-            phis[i] = sinTab[xOff + mHalf[i]] * sinTab[yOff + nHalf[i]];
-          }
-          for (let k = 0; k < dCount; k++) {
-            const idx = this.activeDiagIndices[k];
-            const phi = phis[idx];
-            sumRmsSq += this.activeDiagValues[k] * phi * phi;
-          }
-          for (let k = 0; k < cCount; k++) {
-            sumRmsSq += 2.0 * this.activeCrossValues[k] * phis[this.activeCrossI[k]] * phis[this.activeCrossJ[k]];
-          }
-        } else {
-          for (let k = 0; k < dCount; k++) {
-            const idx = this.activeDiagIndices[k];
-            const phi = sinTab[xOff + mHalf[idx]] * sinTab[yOff + nHalf[idx]];
-            sumRmsSq += this.activeDiagValues[k] * phi * phi;
+    // Ultra-fast zero-subtraction path when a single isolated mode is active
+    if (dCount === 1 && cCount === 0) {
+      const d0 = this.activeDiagValues[0];
+      if (d0 <= 0) {
+        out.fill(0, 0, halfN * halfN);
+      } else {
+        const idx0 = this.activeDiagIndices[0];
+        const sinCols = this.tierSinCols[tierIdx];
+        const sx = sinCols[mHalf[idx0]];
+        const sy = sinCols[nHalf[idx0]];
+        const amp = Math.sqrt(d0);
+        for (let gy = 0; gy < halfN; gy++) {
+          const ay = amp * Math.abs(sy[gy]);
+          const outRow = gy * halfN;
+          for (let gx = 0; gx < halfN; gx++) {
+            out[outRow + gx] = ay * Math.abs(sx[gx]);
           }
         }
+      }
+      this.lastRebuildDurationMs = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0;
+      return;
+    }
 
-        this.fastRmsQuadrant[gy * halfN + gx] = Math.sqrt(Math.max(0, sumRmsSq));
+    // Fold all active diagonals & cross-terms once into 28x28 cos2D[kx, ky]
+    const cosStride = this.cosStride;
+    const cos2D = this.cos2D;
+    cos2D.fill(0);
+
+    let maxDiag = 0;
+    const diagIdx = this.activeDiagIndices;
+    const diagVal = this.activeDiagValues;
+    for (let k = 0; k < dCount; k++) {
+      const v = diagVal[k];
+      if (v > maxDiag) maxDiag = v;
+      const w = 0.25 * v;
+      const idx = diagIdx[k];
+      const kx2 = mHalf[idx] * 2 + 1; // kx1 = 0
+      const ky2 = nHalf[idx] * 2 + 1; // ky1 = 0
+      cos2D[0] += w;
+      cos2D[ky2] -= w;
+      cos2D[kx2 * cosStride] -= w;
+      cos2D[kx2 * cosStride + ky2] += w;
+    }
+
+    const crossI = this.activeCrossI;
+    const crossJ = this.activeCrossJ;
+    const crossVal = this.activeCrossValues;
+    for (let k = 0; k < cCount; k++) {
+      const cv = crossVal[k];
+      if (cv === 0) continue;
+      // W = 2 * cv => 0.25 * W = 0.5 * cv
+      const w = 0.5 * cv;
+      const ci = crossI[k];
+      const cj = crossJ[k];
+      const ax = mHalf[ci];
+      const bx = mHalf[cj];
+      const ay = nHalf[ci];
+      const by = nHalf[cj];
+      const kx1 = ax >= bx ? ax - bx : bx - ax;
+      const kx2 = ax + bx + 1;
+      const ky1 = ay >= by ? ay - by : by - ay;
+      const ky2 = ay + by + 1;
+      const r1 = kx1 * cosStride;
+      const r2 = kx2 * cosStride;
+      cos2D[r1 + ky1] += w;
+      cos2D[r1 + ky2] -= w;
+      cos2D[r2 + ky1] -= w;
+      cos2D[r2 + ky2] += w;
+    }
+
+    // Compress non-zero entries of cos2D by row kx
+    const cosCols = this.tierCosCols[tierIdx];
+    const activeKx = this.activeKxList;
+    const nzStart = this.nzStart;
+    const nzKy = this.nzKy;
+    const nzVal = this.nzVal;
+    const entryTol = Math.max(1e-22, maxDiag * 1e-13);
+
+    let numActiveKx = 0;
+    let nzPtr = 0;
+    for (let kx = 0; kx < cosStride; kx++) {
+      const rOff = kx * cosStride;
+      const startPtr = nzPtr;
+      for (let ky = 0; ky < cosStride; ky++) {
+        const v = cos2D[rOff + ky];
+        if (v > entryTol || v < -entryTol) {
+          nzKy[nzPtr] = ky;
+          nzVal[nzPtr] = v;
+          nzPtr++;
+        }
+      }
+      if (nzPtr > startPtr) {
+        activeKx[numActiveKx] = kx;
+        nzStart[numActiveKx] = startPtr;
+        numActiveKx++;
       }
     }
+    nzStart[numActiveKx] = nzPtr;
+
+    if (numActiveKx === 0) {
+      out.fill(0, 0, halfN * halfN);
+      this.lastRebuildDurationMs = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0;
+      return;
+    }
+
+    // Separable evaluation: for each row gy, contract along ky into rowCosWeights[aKx], then sum along gx
+    const rowWeights = this.rowCosWeights;
+    const rowSq = this.rowRmsSq;
+    const rowTol = Math.max(1e-22, maxDiag * 1e-12);
+    const hasKx0 = activeKx[0] === 0;
+
+    for (let gy = 0; gy < halfN; gy++) {
+      for (let a = 0; a < numActiveKx; a++) {
+        const pStart = nzStart[a];
+        const pEnd = nzStart[a + 1];
+        let acc = 0;
+        for (let p = pStart; p < pEnd; p++) {
+          acc += nzVal[p] * cosCols[nzKy[p]][gy];
+        }
+        rowWeights[a] = acc;
+      }
+
+      if (hasKx0) {
+        rowSq.fill(rowWeights[0], 0, halfN);
+      } else {
+        rowSq.fill(0, 0, halfN);
+      }
+
+      const startA = hasKx0 ? 1 : 0;
+      for (let a = startA; a < numActiveKx; a++) {
+        const c = rowWeights[a];
+        if (c > rowTol || c < -rowTol) {
+          const col = cosCols[activeKx[a]];
+          for (let gx = 0; gx < halfN; gx++) {
+            rowSq[gx] += c * col[gx];
+          }
+        }
+      }
+
+      const outRow = gy * halfN;
+      for (let gx = 0; gx < halfN; gx++) {
+        const sq = rowSq[gx];
+        out[outRow + gx] = sq > 0 ? Math.sqrt(sq) : 0;
+      }
+    }
+
+    this.lastRebuildDurationMs = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0;
+  }
+
+  /**
+   * Ensures the adaptive quadrant RMS grid is up-to-date and returns raw buffer access
+   * for zero-overhead inline particle micro-stepping.
+   */
+  getFastRmsGridData(): { quadrant: Float64Array; halfN: number; hasEnergy: boolean } {
+    const hasEnergy = this.activeDiagCount > 0 || this.activeCrossCount > 0;
+    if (hasEnergy && this.allOddOdd && this.fastGridDirty) {
+      this.rebuildFastRmsGrid();
+    }
+    return {
+      quadrant: this.fastRmsQuadrant,
+      halfN: this.activeFastHalfN,
+      hasEnergy,
+    };
   }
 
   /**
    * High-speed bilinear lookup of the spatial RMS acceleration field a_rms(x, y) [m/s^2]
-   * using 4-fold odd-mode plate symmetry. Runs in O(1) (~15 ns) per particle micro-step.
+   * over the adaptive mode-order quadrant grid. Falls back to exact evaluation if non-odd modes exist.
    */
   sampleRmsFieldFast(x: number, y: number): number {
     if (this.activeDiagCount === 0 && this.activeCrossCount === 0) {
       return 0.0;
+    }
+    if (!this.allOddOdd) {
+      return this.evaluateRmsAcceleration(x, y);
     }
     if (this.fastGridDirty) {
       this.rebuildFastRmsGrid();
@@ -456,7 +735,7 @@ export class ModalBank {
     const fxCoord = x > halfL ? L - x : x;
     const fyCoord = y > halfL ? L - y : y;
 
-    const halfN = this.fastHalfN;
+    const halfN = this.activeFastHalfN;
     const maxIdx = halfN - 1;
     const u = (fxCoord / halfL) * maxIdx;
     const v = (fyCoord / halfL) * maxIdx;

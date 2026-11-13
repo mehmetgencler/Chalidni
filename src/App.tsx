@@ -64,6 +64,9 @@ export function App() {
   // Send complete 146-mode catalogue to AudioWorklet initialization queue
   useEffect(() => {
     audioEngine.configureModes(modalBank.getWorkletModeConfig());
+    if (typeof window !== 'undefined' && window.location.search.includes('grid=65')) {
+      modalBank.setForcedHalfN(33);
+    }
   }, [audioEngine, modalBank]);
 
   // Single unified physics & particle transport subscription driven strictly by AudioWorklet clock
@@ -74,21 +77,39 @@ export function App() {
 
       // Advance particle transport strictly once per elapsed sample-frame interval
       simClock.advanceFromSnapshot(snapshot, DT_PARTICLE, MAX_SUBSTEPS_PER_SNAPSHOT, (dt) => {
-        particleSystem.step(dt, (px, py) => {
-          const aRms = modalBank.sampleRmsFieldFast(px, py);
-          return particleSystem.evaluateDimensionalDiffusivity(aRms, snapshot.isSilent);
-        });
+        const gridData = modalBank.getFastRmsGridData();
+        particleSystem.stepFromRmsGrid(
+          dt,
+          gridData.quadrant,
+          gridData.halfN,
+          snapshot.isSilent || !gridData.hasEnergy
+        );
       });
 
-      // Expose non-reactive observability attributes on canvas element for verification
+      // Expose non-reactive observability attributes on canvas element for automated E2E verification
       const canvasEl = canvasRef.current;
       if (canvasEl) {
+        const gridStats = modalBank.getFastGridTelemetry();
+        const stepStats = particleSystem.lastStepStats;
+        const audioStats = audioEngine.getBrowserAudioTelemetry();
+
         canvasEl.dataset.simFrames = String(snapshot.sampleFramesProcessed);
         canvasEl.dataset.simTime = snapshot.elapsedSimTime.toFixed(4);
+        canvasEl.dataset.sampleRate = String(snapshot.sampleRate);
         canvasEl.dataset.modeCount = String(snapshot.modeCount ?? modalBank.modes.length);
         canvasEl.dataset.particleSteps = String(simClock.stepsExecuted);
         canvasEl.dataset.isSilent = String(snapshot.isSilent);
         canvasEl.dataset.sourceType = audioEngine.activeSourceType;
+        canvasEl.dataset.highFreqRms = modalBank.getMaxModeRmsAboveFrequency(2700).toFixed(3);
+        canvasEl.dataset.gridRes = String(gridStats.effectivePlateResolution);
+        canvasEl.dataset.gridRebuildMs = gridStats.lastRebuildDurationMs.toFixed(3);
+        canvasEl.dataset.particleUpdateMs = stepStats.updateDurationMs.toFixed(3);
+        canvasEl.dataset.maxMicroSteps = String(stepStats.maxMicroSteps);
+        canvasEl.dataset.maxSubstepRms = stepStats.maxSubStepRms.toFixed(6);
+        canvasEl.dataset.boundViolated = String(stepStats.boundViolated);
+        canvasEl.dataset.realWorklet = String(audioStats.hasRealAudioWorkletNode);
+        canvasEl.dataset.sharedWorklet = String(audioStats.isToneConnected && audioStats.isFileDownmixConnected);
+        canvasEl.dataset.audibleFile = String(audioStats.isFileAudibleToDestination);
       }
     });
 

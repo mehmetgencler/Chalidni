@@ -50,12 +50,13 @@ class ModalWorkletProcessor extends _BaseWorkletProcessor {
 
     this.rmsWindowTimeConstant = 0.08; // tau = 80 ms
     this.dt = 1.0 / this.sampleRate;
-    this.covAlpha = 1.0 - Math.exp(-(128.0 * this.dt) / this.rmsWindowTimeConstant);
+    this.staggerBuckets = 8;
+    this.recomputeCovarianceLut(this.lastQuantumLen);
 
     this.recomputeCoefficients();
 
-    // Snapshot publication at ~60 Hz
-    this.snapshotIntervalSamples = Math.max(128, Math.round(this.sampleRate / 60));
+    // Exact sample-count snapshot accumulator at 60 Hz (preserves excess quantum samples)
+    this.exactSnapshotInterval = this.sampleRate / 60.0;
     this.samplesSinceLastSnapshot = 0;
 
     this.port.onmessage = (event) => {
@@ -120,8 +121,11 @@ class ModalWorkletProcessor extends _BaseWorkletProcessor {
     this.twoZetaOmega = new Float64Array(n);
     this.modalMasses = new Float64Array(n);
     this.couplings = new Float64Array(n);
+    this.forceGain = new Float64Array(n);
+    this.forceToEq = new Float64Array(n);
 
     // Pre-allocated quantum work buffers (zero GC per quantum)
+    this.excBuf = new Float64Array(this.lastQuantumLen);
     this.accBlock = new Float64Array(n * this.lastQuantumLen);
     this.accSqSums = new Float64Array(n);
     this.rankIndices = new Int32Array(n);
@@ -129,18 +133,45 @@ class ModalWorkletProcessor extends _BaseWorkletProcessor {
       this.rankIndices[i] = i;
     }
 
-    // Track degenerate pairs and avoid duplicate dot-product work
+    // Track last-updated quantum index per covariance cell (for exact exponential decay)
+    this.covLastQ = new Int32Array(n * n);
+
+    // Track degenerate pairs and partition all remaining non-degenerate pairs into P=8 staggered groups
     this.degeneratePairs = [];
     this.degenMask = new Uint8Array(n * n);
+    const P = this.staggerBuckets || 8;
+    const groupLists = Array.from({ length: P }, () => []);
+    let nonDegenIdx = 0;
+
     for (let i = 0; i < n; i++) {
       for (let j = i + 1; j < n; j++) {
+        const idx = i * n + j;
         if (Math.abs(this.modes[i].omega - this.modes[j].omega) < 0.1) {
-          this.degeneratePairs.push({ i, j, rowI: i * n + j, rowJ: j * n + i });
-          this.degenMask[i * n + j] = 1;
+          this.degeneratePairs.push({ i, j, idx, symIdx: j * n + i });
+          this.degenMask[idx] = 1;
           this.degenMask[j * n + i] = 1;
+        } else {
+          const g = nonDegenIdx % P;
+          groupLists[g].push(i, j, idx, j * n + i);
+          nonDegenIdx++;
         }
       }
     }
+
+    this.staggerGroups = groupLists.map((arr) => new Int32Array(arr));
+  }
+
+  recomputeCovarianceLut(quantumLen) {
+    const stepAlpha = (quantumLen * this.dt) / this.rmsWindowTimeConstant;
+    const maxLag = 64;
+    this.decayLut = new Float64Array(maxLag);
+    this.alphaLut = new Float64Array(maxLag);
+    for (let d = 0; d < maxLag; d++) {
+      const dec = Math.exp(-d * stepAlpha);
+      this.decayLut[d] = dec;
+      this.alphaLut[d] = 1.0 - dec;
+    }
+    this.covAlpha = this.alphaLut[1];
   }
 
   recomputeCoefficients() {
@@ -161,7 +192,10 @@ class ModalWorkletProcessor extends _BaseWorkletProcessor {
       this.modalMasses[i] = M;
 
       // Exact center shaker coupling: phi_mn(L/2, L/2) = sin(m*pi/2)*sin(n*pi/2)
-      this.couplings[i] = Math.sin((mode.m * Math.PI) / 2.0) * Math.sin((mode.n * Math.PI) / 2.0);
+      const coupling = Math.sin((mode.m * Math.PI) / 2.0) * Math.sin((mode.n * Math.PI) / 2.0);
+      this.couplings[i] = coupling;
+      this.forceGain[i] = coupling / M;
+      this.forceToEq[i] = this.forceGain[i] / (omega * omega);
 
       const expDecay = Math.exp(-zeta * omega * dt);
       const cosTerm = Math.cos(omegaD * dt);
@@ -199,6 +233,7 @@ class ModalWorkletProcessor extends _BaseWorkletProcessor {
         this.velocities.fill(0);
         this.accelerations.fill(0);
         this.covarianceMatrix.fill(0);
+        this.covLastQ.fill(0);
         this.sampleFramesProcessed = 0;
         break;
     }
@@ -208,6 +243,8 @@ class ModalWorkletProcessor extends _BaseWorkletProcessor {
     const n = this.modes.length;
     const covarianceDiag = new Array(n);
     const covarianceCross = [];
+    const qNow = this.quantumCount;
+    const decayLut = this.decayLut;
 
     let maxVar = 0;
     let maxAcc = 0;
@@ -218,12 +255,27 @@ class ModalWorkletProcessor extends _BaseWorkletProcessor {
       if (diag > maxVar) maxVar = diag;
       const a = Math.abs(this.accelerations[i]);
       if (a > maxAcc) maxAcc = a;
+    }
 
+    const crossFloor = Math.max(1e-8, maxVar * 1e-7);
+    const staggerPeriod = this.staggerBuckets || 8;
+    for (let i = 0; i < n; i++) {
       const rowOffset = i * n;
       for (let j = i + 1; j < n; j++) {
-        const val = this.covarianceMatrix[rowOffset + j];
-        if (Math.abs(val) > 1e-8) {
-          covarianceCross.push(i, j, val);
+        const idx = rowOffset + j;
+        let val = this.covarianceMatrix[idx];
+        if (Math.abs(val) > crossFloor) {
+          const lag = qNow - this.covLastQ[idx];
+          if (lag > staggerPeriod) {
+            const excessLag = lag - staggerPeriod;
+            val *=
+              excessLag < 64
+                ? decayLut[excessLag]
+                : Math.exp(-(excessLag * this.lastQuantumLen * this.dt) / this.rmsWindowTimeConstant);
+          }
+          if (Math.abs(val) > crossFloor) {
+            covarianceCross.push(i, j, val);
+          }
         }
       }
     }
@@ -265,93 +317,152 @@ class ModalWorkletProcessor extends _BaseWorkletProcessor {
 
     if (quantumLen !== this.lastQuantumLen) {
       this.lastQuantumLen = quantumLen;
+      this.excBuf = new Float64Array(quantumLen);
       this.accBlock = new Float64Array(n * quantumLen);
-      this.covAlpha = 1.0 - Math.exp(-(quantumLen * this.dt) / this.rmsWindowTimeConstant);
+      this.recomputeCovarianceLut(quantumLen);
     }
 
+    const excBuf = this.excBuf;
     const accBlock = this.accBlock;
     const accSqSums = this.accSqSums;
-    accSqSums.fill(0);
     let localEnergy = 0;
 
-    for (let s = 0; s < quantumLen; s++) {
-      this.sampleFramesProcessed++;
+    if (inputChannel) {
+      for (let s = 0; s < quantumLen; s++) {
+        const rawSample = inputChannel[s];
+        localEnergy += rawSample * rawSample;
+        excBuf[s] = rawSample * 3.0;
+      }
+    } else {
+      excBuf.fill(0);
+    }
+    this.sampleFramesProcessed += quantumLen;
 
-      const rawSample = inputChannel ? inputChannel[s] : 0.0;
-      localEnergy += rawSample * rawSample;
-      const excValue = rawSample * 3.0; // Center shaker excitation force in Newtons
+    const hasInput = localEnergy > 1e-20;
+    let maxAccSq = 0;
 
-      if (Math.abs(excValue) > 1e-12) {
-        // Forced exact discrete-time ZOH modal transition
-        for (let i = 0; i < n; i++) {
-          const u = (excValue * this.couplings[i]) / this.modalMasses[i];
-          const w2 = this.omegaSq[i];
-          const qEq = u / w2;
-          const qTilde = this.displacements[i] - qEq;
-          const v0 = this.velocities[i];
+    if (hasInput) {
+      // Forced exact discrete-time ZOH transition (outer mode i, inner contiguous sample s)
+      for (let i = 0; i < n; i++) {
+        const cOverM = this.forceGain[i];
+        const fToEq = this.forceToEq[i];
+        const wSq = this.omegaSq[i];
+        const twoZW = this.twoZetaOmega[i];
+        const a11 = this.A11[i];
+        const a12 = this.A12[i];
+        const a21 = this.A21[i];
+        const a22 = this.A22[i];
 
-          const qNew = this.A11[i] * qTilde + this.A12[i] * v0 + qEq;
-          const vNew = this.A21[i] * qTilde + this.A22[i] * v0;
-          const aNew = u - this.twoZetaOmega[i] * vNew - w2 * qNew;
+        let q = this.displacements[i];
+        let v = this.velocities[i];
+        let aLast = this.accelerations[i];
+        let sqSum = 0;
+        const off = i * quantumLen;
 
-          this.displacements[i] = qNew;
-          this.velocities[i] = vNew;
-          this.accelerations[i] = aNew;
-
-          accBlock[i * quantumLen + s] = aNew;
-          accSqSums[i] += aNew * aNew;
+        for (let s = 0; s < quantumLen; s++) {
+          const exc = excBuf[s];
+          const qEq = exc * fToEq;
+          const qTilde = q - qEq;
+          const qNew = a11 * qTilde + a12 * v + qEq;
+          const vNew = a21 * qTilde + a22 * v;
+          aLast = exc * cOverM - twoZW * vNew - wSq * qNew;
+          q = qNew;
+          v = vNew;
+          accBlock[off + s] = aLast;
+          sqSum += aLast * aLast;
         }
-      } else {
-        // Exact unforced free modal decay (q_ddot + 2*zeta*omega*q_dot + omega^2*q = 0)
-        for (let i = 0; i < n; i++) {
-          const q0 = this.displacements[i];
-          const v0 = this.velocities[i];
 
-          const qNew = this.A11[i] * q0 + this.A12[i] * v0;
-          const vNew = this.A21[i] * q0 + this.A22[i] * v0;
-          const aNew = -this.twoZetaOmega[i] * vNew - this.omegaSq[i] * qNew;
+        this.displacements[i] = q;
+        this.velocities[i] = v;
+        this.accelerations[i] = aLast;
+        accSqSums[i] = sqSum;
+        if (sqSum > maxAccSq) maxAccSq = sqSum;
+      }
+    } else {
+      // Exact unforced free modal decay (outer mode i, inner contiguous sample s)
+      for (let i = 0; i < n; i++) {
+        const wSq = this.omegaSq[i];
+        const twoZW = this.twoZetaOmega[i];
+        const a11 = this.A11[i];
+        const a12 = this.A12[i];
+        const a21 = this.A21[i];
+        const a22 = this.A22[i];
 
-          this.displacements[i] = qNew;
-          this.velocities[i] = vNew;
-          this.accelerations[i] = aNew;
+        let q = this.displacements[i];
+        let v = this.velocities[i];
+        let aLast = this.accelerations[i];
+        let sqSum = 0;
+        const off = i * quantumLen;
 
-          accBlock[i * quantumLen + s] = aNew;
-          accSqSums[i] += aNew * aNew;
+        if (q === 0 && v === 0) {
+          accSqSums[i] = 0;
+          continue;
         }
+
+        for (let s = 0; s < quantumLen; s++) {
+          const qNew = a11 * q + a12 * v;
+          const vNew = a21 * q + a22 * v;
+          aLast = -twoZW * vNew - wSq * qNew;
+          q = qNew;
+          v = vNew;
+          accBlock[off + s] = aLast;
+          sqSum += aLast * aLast;
+        }
+
+        this.displacements[i] = q;
+        this.velocities[i] = v;
+        this.accelerations[i] = aLast;
+        accSqSums[i] = sqSum;
+        if (sqSum > maxAccSq) maxAccSq = sqSum;
       }
     }
 
-    // Exponentially smooth full covariance matrix over the quantum
-    const alpha = this.covAlpha;
-    const oneMinusAlpha = 1.0 - alpha;
+    // Exact exponentially smoothed covariance update across all 146x146 modes:
+    // Diagonals, Degenerate pairs, and Top-20 active modes update EVERY quantum (0 ms lag).
+    // Remaining non-degenerate pairs cycle across P=10 staggered groups with exact timestamp decay LUT.
+    const alpha1 = this.alphaLut[1];
+    const decay1 = this.decayLut[1];
     const invQ = 1.0 / quantumLen;
-    const covLen = this.covarianceMatrix.length;
-    for (let k = 0; k < covLen; k++) {
-      this.covarianceMatrix[k] *= oneMinusAlpha;
-    }
+    const qNow = this.quantumCount;
+    const cov = this.covarianceMatrix;
+    const lastQ = this.covLastQ;
+    const alphaLut = this.alphaLut;
+    const decayLut = this.decayLut;
 
     // 1. All 146 diagonal auto-variances
     for (let i = 0; i < n; i++) {
-      this.covarianceMatrix[i * n + i] += accSqSums[i] * invQ * alpha;
+      const ii = i * n + i;
+      cov[ii] = cov[ii] * decay1 + accSqSums[i] * invQ * alpha1;
     }
 
-    // 2. All degenerate equal-frequency mode cross-terms (sample-averaged over entire quantum)
+    // 2. All degenerate equal-frequency mode cross-terms (every quantum)
     const numDegen = this.degeneratePairs.length;
     for (let p = 0; p < numDegen; p++) {
       const pair = this.degeneratePairs[p];
       const offI = pair.i * quantumLen;
       const offJ = pair.j * quantumLen;
       let sum = 0;
-      for (let s = 0; s < quantumLen; s++) {
-        sum += accBlock[offI + s] * accBlock[offJ + s];
+      if (quantumLen === 128) {
+        for (let s = 0; s < 128; s += 4) {
+          sum +=
+            accBlock[offI + s] * accBlock[offJ + s] +
+            accBlock[offI + s + 1] * accBlock[offJ + s + 1] +
+            accBlock[offI + s + 2] * accBlock[offJ + s + 2] +
+            accBlock[offI + s + 3] * accBlock[offJ + s + 3];
+        }
+      } else {
+        for (let s = 0; s < quantumLen; s++) {
+          sum += accBlock[offI + s] * accBlock[offJ + s];
+        }
       }
-      const deltaCov = sum * invQ * alpha;
-      this.covarianceMatrix[pair.rowI] += deltaCov;
-      this.covarianceMatrix[pair.rowJ] += deltaCov;
+      const val = cov[pair.idx] * decay1 + sum * invQ * alpha1;
+      cov[pair.idx] = val;
+      cov[pair.symIdx] = val;
+      lastQ[pair.idx] = qNow;
     }
 
-    // 3. Top-K (K=24) highest-energy active non-degenerate modal cross-terms
-    const K = Math.min(24, n);
+    // 3. Top-20 highest-energy active non-degenerate modal cross-terms (instantaneous transient tracking)
+    const K = Math.min(20, n);
     const rankIndices = this.rankIndices;
     for (let a = 0; a < K; a++) {
       let bestPos = a;
@@ -377,24 +488,95 @@ class ModalWorkletProcessor extends _BaseWorkletProcessor {
       for (let b = a + 1; b < K; b++) {
         const j = rankIndices[b];
         if (accSqSums[j] <= 1e-12) break;
-        if (this.degenMask[i * n + j]) continue; // Already updated in step 2
+        const ii = i < j ? i : j;
+        const jj = i < j ? j : i;
+        const idx = ii * n + jj;
+        if (this.degenMask[idx]) continue;
 
         const offJ = j * quantumLen;
         let sum = 0;
-        for (let s = 0; s < quantumLen; s++) {
-          sum += accBlock[offI + s] * accBlock[offJ + s];
+        if (quantumLen === 128) {
+          for (let s = 0; s < 128; s += 4) {
+            sum +=
+              accBlock[offI + s] * accBlock[offJ + s] +
+              accBlock[offI + s + 1] * accBlock[offJ + s + 1] +
+              accBlock[offI + s + 2] * accBlock[offJ + s + 2] +
+              accBlock[offI + s + 3] * accBlock[offJ + s + 3];
+          }
+        } else {
+          for (let s = 0; s < quantumLen; s++) {
+            sum += accBlock[offI + s] * accBlock[offJ + s];
+          }
         }
-        const deltaCov = sum * invQ * alpha;
-        this.covarianceMatrix[i * n + j] += deltaCov;
-        this.covarianceMatrix[j * n + i] += deltaCov;
+
+        const lag = qNow - lastQ[idx];
+        const aW = lag < 64 ? alphaLut[lag] : 1.0 - Math.exp(-(lag * quantumLen * this.dt) / this.rmsWindowTimeConstant);
+        const dW = 1.0 - aW;
+        const val = cov[idx] * dW + sum * invQ * aW;
+        cov[idx] = val;
+        cov[jj * n + ii] = val;
+        lastQ[idx] = qNow;
       }
+    }
+
+    // 4. Staggered full-matrix sweep (1/8 of non-degenerate pairs per quantum -> full exact steady-state coherence)
+    const grp = this.staggerGroups[qNow % this.staggerGroups.length];
+    const sqFloor = Math.max(1e-14, maxAccSq * 1e-6);
+    for (let p = 0; p < grp.length; p += 4) {
+      const i = grp[p];
+      const j = grp[p + 1];
+      const idx = grp[p + 2];
+      const symIdx = grp[p + 3];
+
+      if (lastQ[idx] === qNow) continue; // Already updated in Top-20 this quantum
+      const sqI = accSqSums[i];
+      const sqJ = accSqSums[j];
+      const existing = cov[idx];
+      if (existing === 0 && (sqI <= sqFloor || sqJ <= sqFloor)) {
+        lastQ[idx] = qNow;
+        continue;
+      }
+
+      const lag = qNow - lastQ[idx];
+      const aW = lag < 64 ? alphaLut[lag] : 1.0 - Math.exp(-(lag * quantumLen * this.dt) / this.rmsWindowTimeConstant);
+      const dW = 1.0 - aW;
+
+      let dot = 0;
+      if (sqI > sqFloor && sqJ > sqFloor) {
+        const offI = i * quantumLen;
+        const offJ = j * quantumLen;
+        let sum = 0;
+        if (quantumLen === 128) {
+          for (let s = 0; s < 128; s += 4) {
+            sum +=
+              accBlock[offI + s] * accBlock[offJ + s] +
+              accBlock[offI + s + 1] * accBlock[offJ + s + 1] +
+              accBlock[offI + s + 2] * accBlock[offJ + s + 2] +
+              accBlock[offI + s + 3] * accBlock[offJ + s + 3];
+          }
+        } else {
+          for (let s = 0; s < quantumLen; s++) {
+            sum += accBlock[offI + s] * accBlock[offJ + s];
+          }
+        }
+        dot = sum * invQ;
+      }
+
+      const val = existing * dW + dot * aW;
+      cov[idx] = val;
+      cov[symIdx] = val;
+      lastQ[idx] = qNow;
     }
 
     this.isSilent = localEnergy < 1e-10;
     this.samplesSinceLastSnapshot += quantumLen;
 
-    if (this.samplesSinceLastSnapshot >= this.snapshotIntervalSamples) {
-      this.samplesSinceLastSnapshot = 0;
+    if (this.samplesSinceLastSnapshot >= this.exactSnapshotInterval) {
+      this.samplesSinceLastSnapshot -= this.exactSnapshotInterval;
+      // Guard against runaway multi-fire if quantumLen > exactSnapshotInterval
+      if (this.samplesSinceLastSnapshot >= this.exactSnapshotInterval) {
+        this.samplesSinceLastSnapshot %= this.exactSnapshotInterval;
+      }
       this.port.postMessage(this.buildSnapshot());
     }
 

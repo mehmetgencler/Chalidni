@@ -35,6 +35,8 @@ export const DEFAULT_DIMENSIONAL_CONFIG: DimensionalTransportConfig = {
  */
 export class Mulberry32PRNG {
   private state: number;
+  private hasSpare: boolean = false;
+  private spareGaussian: number = 0;
 
   constructor(seed: number = 12345) {
     this.state = seed >>> 0;
@@ -48,14 +50,22 @@ export class Mulberry32PRNG {
   }
 
   /**
-   * Box-Muller transform for standard normal random variables N(0, 1)
+   * Paired Box-Muller transform for standard normal random variables N(0, 1)
    */
   nextGaussian(): number {
+    if (this.hasSpare) {
+      this.hasSpare = false;
+      return this.spareGaussian;
+    }
     let u = 0;
     let v = 0;
     while (u === 0) u = this.next();
     while (v === 0) v = this.next();
-    return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+    const mag = Math.sqrt(-2.0 * Math.log(u));
+    const angle = 2.0 * Math.PI * v;
+    this.spareGaussian = mag * Math.sin(angle);
+    this.hasSpare = true;
+    return mag * Math.cos(angle);
   }
 }
 
@@ -65,6 +75,9 @@ export class Mulberry32PRNG {
  * and finite input validation with zero iteration loops and zero clamping artifacts.
  */
 export function reflectCoordinate(val: number, L: number): number {
+  if (val >= 0 && val <= L) {
+    return val;
+  }
   if (!Number.isFinite(val) || L <= 0) {
     return L > 0 ? L * 0.5 : 0;
   }
@@ -78,11 +91,33 @@ export function reflectCoordinate(val: number, L: number): number {
   return rem > L ? period - rem : rem;
 }
 
+export interface ParticleStepStats {
+  maxMicroSteps: number;
+  meanMicroSteps: number;
+  totalMicroSteps: number;
+  maxSubStepVar: number;
+  maxSubStepRms: number;
+  declaredLimitRms: number;
+  boundViolated: boolean;
+  updateDurationMs: number;
+}
+
 export class ParticleTransportSystem {
   particles: Particle[] = [];
   config: DimensionalTransportConfig;
   sideLength: number; // L (m)
   private prng: Mulberry32PRNG;
+
+  lastStepStats: ParticleStepStats = {
+    maxMicroSteps: 0,
+    meanMicroSteps: 0,
+    totalMicroSteps: 0,
+    maxSubStepVar: 0,
+    maxSubStepRms: 0,
+    declaredLimitRms: 0.008,
+    boundViolated: false,
+    updateDurationMs: 0,
+  };
 
   constructor(config: Partial<DimensionalTransportConfig> = {}, sideLength: number = 0.30) {
     this.config = { ...DEFAULT_DIMENSIONAL_CONFIG, ...config };
@@ -142,6 +177,9 @@ export class ParticleTransportSystem {
       return subThresholdCreepFloor;
     }
 
+    if (power === 2.0) {
+      return dRef * excessGamma * excessGamma;
+    }
     return dRef * Math.pow(excessGamma, power);
   }
 
@@ -150,64 +188,292 @@ export class ParticleTransportSystem {
    * dX = sqrt(2 * D_g) * dW_x
    * dY = sqrt(2 * D_g) * dW_y
    *
-   * Subdivides dt into non-anticipative micro-steps when sqrt(2 * D_g * dt) > 0.008 m
-   * so particles do not leap across narrow nodal lines under high-amplitude excitation.
+   * Enforces the declared 8 mm per-axis RMS sub-step variance bound (2 * D_g(x,y) * subDt <= 0.008^2)
+   * using strictly non-anticipative (F_t-adapted) local step sizing evaluated before each increment.
+   * Never silently caps below the required step count for physical fields.
    */
   step(
     dt: number = this.config.dt,
     diffusivityEvaluator?: (x: number, y: number) => number
   ): void {
+    const t0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
     if (dt <= 0) return;
 
     const L = this.sideLength;
-    const sqrtDt = Math.sqrt(dt);
-    const maxStepVar = 0.008 * 0.008; // 8 mm RMS step bound per micro-step
-    const maxMicroSteps = 12;
+    const maxStepRms = 0.008;
+    const maxStepVar = maxStepRms * maxStepRms; // 6.4e-5 m^2
+    const safetyCap = 4096; // Emergency non-physical divergence guard; tracked explicitly in boundViolated
+
+    let maxMicro = 0;
+    let totalMicro = 0;
+    let activeCount = 0;
+    let maxSubVar = 0;
+    let boundViolated = false;
 
     for (let i = 0; i < this.particles.length; i++) {
       const p = this.particles[i];
       if (!p.active) continue;
+      activeCount++;
 
       const D0 = diffusivityEvaluator ? diffusivityEvaluator(p.x, p.y) : 0;
-
       if (D0 <= 1e-15) {
         p.vx = 0;
         p.vy = 0;
         continue;
       }
 
-      const stepVar = 2.0 * D0 * dt;
-      if (stepVar <= maxStepVar || !diffusivityEvaluator) {
-        // Fast single step for moderate/low diffusivities
-        const sigma = Math.sqrt(2.0 * D0);
-        const dx = sigma * sqrtDt * this.prng.nextGaussian();
-        const dy = sigma * sqrtDt * this.prng.nextGaussian();
+      const fullVar = 2.0 * D0 * dt;
+      if (fullVar <= maxStepVar || !diffusivityEvaluator) {
+        // Fast single step strictly within 8 mm RMS bound
+        const sigmaSqrtDt = Math.sqrt(fullVar);
+        const dx = sigmaSqrtDt * this.prng.nextGaussian();
+        const dy = sigmaSqrtDt * this.prng.nextGaussian();
         p.vx = dx / dt;
         p.vy = dy / dt;
         p.x = reflectCoordinate(p.x + dx, L);
         p.y = reflectCoordinate(p.y + dy, L);
+        totalMicro += 1;
+        if (1 > maxMicro) maxMicro = 1;
+        if (fullVar > maxSubVar) maxSubVar = fullVar;
       } else {
-        // Non-anticipative adaptive micro-stepping for high-amplitude antinodes
-        const nSub = Math.min(maxMicroSteps, Math.max(2, Math.ceil(stepVar / maxStepVar)));
-        const subDt = dt / nSub;
-        const sqrtSubDt = Math.sqrt(subDt);
+        // Non-anticipative local-diffusivity adaptive micro-stepping guaranteeing 2*D*subDt <= maxStepVar
         const startX = p.x;
         const startY = p.y;
+        let remDt = dt;
+        let k = 0;
+        let Dk = D0;
 
-        for (let k = 0; k < nSub; k++) {
-          const D_k = k === 0 ? D0 : diffusivityEvaluator(p.x, p.y);
-          if (D_k <= 1e-15) break;
-          const sigma = Math.sqrt(2.0 * D_k);
-          const dx = sigma * sqrtSubDt * this.prng.nextGaussian();
-          const dy = sigma * sqrtSubDt * this.prng.nextGaussian();
+        while (remDt > 1e-12) {
+          if (k > 0) {
+            Dk = diffusivityEvaluator(p.x, p.y);
+          }
+          if (Dk <= 1e-15) break;
+
+          const twoD = 2.0 * Dk;
+          const maxAllowedDt = maxStepVar / twoD;
+          let subDt: number;
+          if (remDt <= maxAllowedDt) {
+            subDt = remDt;
+          } else if (k + 1 >= safetyCap) {
+            subDt = remDt;
+            boundViolated = true;
+          } else {
+            subDt = maxAllowedDt;
+          }
+
+          const subVar = twoD * subDt;
+          if (subVar > maxSubVar) maxSubVar = subVar;
+          if (subVar > maxStepVar * (1 + 1e-9)) boundViolated = true;
+
+          const sigmaSqrtSubDt = Math.sqrt(subVar);
+          const dx = sigmaSqrtSubDt * this.prng.nextGaussian();
+          const dy = sigmaSqrtSubDt * this.prng.nextGaussian();
           p.x = reflectCoordinate(p.x + dx, L);
           p.y = reflectCoordinate(p.y + dy, L);
+
+          remDt -= subDt;
+          k++;
         }
 
+        totalMicro += k;
+        if (k > maxMicro) maxMicro = k;
         p.vx = (p.x - startX) / dt;
         p.vy = (p.y - startY) / dt;
       }
     }
+
+    const elapsedMs = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0;
+    this.lastStepStats = {
+      maxMicroSteps: maxMicro,
+      meanMicroSteps: activeCount > 0 ? totalMicro / activeCount : 0,
+      totalMicroSteps: totalMicro,
+      maxSubStepVar: maxSubVar,
+      maxSubStepRms: Math.sqrt(maxSubVar),
+      declaredLimitRms: maxStepRms,
+      boundViolated,
+      updateDurationMs: elapsedMs,
+    };
+  }
+
+  /**
+   * Closure-free adaptive Itô micro-stepping directly against the 4-fold symmetric quadrant RMS grid.
+   * Identical physics and strict 8 mm per-axis RMS sub-step bound as step(), optimized for real-time 60 FPS browsers.
+   */
+  stepFromRmsGrid(
+    dt: number,
+    rmsQuadrant: Float64Array,
+    halfN: number,
+    isSilent: boolean
+  ): void {
+    const t0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    if (dt <= 0) return;
+
+    if (isSilent) {
+      for (let i = 0; i < this.particles.length; i++) {
+        this.particles[i].vx = 0;
+        this.particles[i].vy = 0;
+      }
+      this.lastStepStats = {
+        maxMicroSteps: 0,
+        meanMicroSteps: 0,
+        totalMicroSteps: 0,
+        maxSubStepVar: 0,
+        maxSubStepRms: 0,
+        declaredLimitRms: 0.008,
+        boundViolated: false,
+        updateDurationMs: (typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0,
+      };
+      return;
+    }
+
+    const L = this.sideLength;
+    const halfL = L * 0.5;
+    const maxIdx = halfN - 1;
+    const idxScale = maxIdx / halfL;
+    const period = 2.0 * L;
+
+    const { dRef, gammaC, power, g, subThresholdCreepFloor = 0.0 } = this.config;
+    const invG = 1.0 / g;
+    const isSq = power === 2.0;
+
+    const maxStepRms = 0.008;
+    const maxStepVar = maxStepRms * maxStepRms;
+    const safetyCap = 4096;
+
+    let maxMicro = 0;
+    let totalMicro = 0;
+    let activeCount = 0;
+    let maxSubVar = 0;
+    let boundViolated = false;
+
+    const lookupD = (x: number, y: number): number => {
+      if (x <= 0 || x >= L || y <= 0 || y >= L) return 0.0;
+      const fx = x > halfL ? L - x : x;
+      const fy = y > halfL ? L - y : y;
+      const u = fx * idxScale;
+      const v = fy * idxScale;
+      const gx0 = u >= maxIdx ? maxIdx - 1 : (u < 0 ? 0 : u | 0);
+      const gy0 = v >= maxIdx ? maxIdx - 1 : (v < 0 ? 0 : v | 0);
+      const tx = u - gx0;
+      const ty = v - gy0;
+      const row0 = gy0 * halfN;
+      const row1 = row0 + halfN;
+      const a00 = rmsQuadrant[row0 + gx0];
+      const a10 = rmsQuadrant[row0 + gx0 + 1];
+      const a01 = rmsQuadrant[row1 + gx0];
+      const a11 = rmsQuadrant[row1 + gx0 + 1];
+      const aRms = a00 + (a10 - a00) * tx + ((a01 - a00) + (a11 - a01 - a10 + a00) * tx) * ty;
+      if (aRms <= 1e-6) return 0.0;
+      const excess = aRms * invG - gammaC;
+      if (excess <= 0) return subThresholdCreepFloor;
+      return isSq ? dRef * excess * excess : dRef * Math.pow(excess, power);
+    };
+
+    for (let i = 0; i < this.particles.length; i++) {
+      const p = this.particles[i];
+      if (!p.active) continue;
+      activeCount++;
+
+      const D0 = lookupD(p.x, p.y);
+      if (D0 <= 1e-15) {
+        p.vx = 0;
+        p.vy = 0;
+        continue;
+      }
+
+      const fullVar = 2.0 * D0 * dt;
+      if (fullVar <= maxStepVar) {
+        const sigmaSqrtDt = Math.sqrt(fullVar);
+        const dx = sigmaSqrtDt * this.prng.nextGaussian();
+        const dy = sigmaSqrtDt * this.prng.nextGaussian();
+        p.vx = dx / dt;
+        p.vy = dy / dt;
+        let nx = p.x + dx;
+        if (nx < 0 || nx > L) {
+          let rem = nx % period;
+          if (rem < 0) rem += period;
+          nx = rem > L ? period - rem : rem;
+        }
+        let ny = p.y + dy;
+        if (ny < 0 || ny > L) {
+          let rem = ny % period;
+          if (rem < 0) rem += period;
+          ny = rem > L ? period - rem : rem;
+        }
+        p.x = nx;
+        p.y = ny;
+        totalMicro += 1;
+        if (1 > maxMicro) maxMicro = 1;
+        if (fullVar > maxSubVar) maxSubVar = fullVar;
+      } else {
+        const startX = p.x;
+        const startY = p.y;
+        let remDt = dt;
+        let k = 0;
+        let Dk = D0;
+
+        while (remDt > 1e-12) {
+          if (k > 0) {
+            Dk = lookupD(p.x, p.y);
+          }
+          if (Dk <= 1e-15) break;
+
+          const twoD = 2.0 * Dk;
+          const maxAllowedDt = maxStepVar / twoD;
+          let subDt: number;
+          if (remDt <= maxAllowedDt) {
+            subDt = remDt;
+          } else if (k + 1 >= safetyCap) {
+            subDt = remDt;
+            boundViolated = true;
+          } else {
+            subDt = maxAllowedDt;
+          }
+
+          const subVar = twoD * subDt;
+          if (subVar > maxSubVar) maxSubVar = subVar;
+          if (subVar > maxStepVar * (1 + 1e-9)) boundViolated = true;
+
+          const sigmaSqrtSubDt = Math.sqrt(subVar);
+          const dx = sigmaSqrtSubDt * this.prng.nextGaussian();
+          const dy = sigmaSqrtSubDt * this.prng.nextGaussian();
+          let nx = p.x + dx;
+          if (nx < 0 || nx > L) {
+            let rem = nx % period;
+            if (rem < 0) rem += period;
+            nx = rem > L ? period - rem : rem;
+          }
+          let ny = p.y + dy;
+          if (ny < 0 || ny > L) {
+            let rem = ny % period;
+            if (rem < 0) rem += period;
+            ny = rem > L ? period - rem : rem;
+          }
+          p.x = nx;
+          p.y = ny;
+
+          remDt -= subDt;
+          k++;
+        }
+
+        totalMicro += k;
+        if (k > maxMicro) maxMicro = k;
+        p.vx = (p.x - startX) / dt;
+        p.vy = (p.y - startY) / dt;
+      }
+    }
+
+    const elapsedMs = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0;
+    this.lastStepStats = {
+      maxMicroSteps: maxMicro,
+      meanMicroSteps: activeCount > 0 ? totalMicro / activeCount : 0,
+      totalMicroSteps: totalMicro,
+      maxSubStepVar: maxSubVar,
+      maxSubStepRms: Math.sqrt(maxSubVar),
+      declaredLimitRms: maxStepRms,
+      boundViolated,
+      updateDurationMs: elapsedMs,
+    };
   }
 
   /**
