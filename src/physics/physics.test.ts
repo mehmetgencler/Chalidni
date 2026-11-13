@@ -1753,6 +1753,127 @@ test('23. Controlled external powder feeding preserves existing particles, feeds
   assert.ok(sweepSys.particles.length <= 4500);
 });
 
+test('24. External powder feed & perimeter recycling are gated by actual interior RMS transport eligibility', () => {
+  const L = DEFAULT_GEOMETRY.sideLength;
+  const dt = 0.016;
+  const margin = 0.001;
+  const halfN = 33;
+
+  const makeSys = (count: number = 3000) =>
+    new ParticleTransportSystem(
+      {
+        particleCount: count,
+        dRef: 2.0e-6,
+        gammaC: 1.0,
+        power: 2.0,
+        g: 9.80665,
+        dt,
+        seed: 42,
+        enableExternalPowderFeed: true,
+        maxParticleCount: 4500,
+      },
+      L
+    );
+
+  // A. Sub-threshold RMS field (a_rms = 9.0 m/s^2 < g = 9.80665) & silent field: zero feed, zero recycle, zero motion
+  const subThresholdSys = makeSys(3000);
+  // Deplete interior below 2,100 by placing 1,200 grains on the 1 mm perimeter rim
+  for (let i = 0; i < 1200; i++) {
+    subThresholdSys.particles[i].x = 0.0004;
+  }
+  const subSnapBefore = subThresholdSys.particles.map((p) => ({ x: p.x, y: p.y }));
+  const subThresholdQuad = new Float64Array(halfN * halfN).fill(9.0);
+  const silentQuad = new Float64Array(halfN * halfN);
+
+  for (let s = 0; s < 150; s++) {
+    // Pass isSilent = false with sub-threshold grid to verify RMS transport gating itself blocks feeding
+    subThresholdSys.stepFromRmsGrid(dt, subThresholdQuad, halfN, false);
+    // Also check silent grid
+    subThresholdSys.stepFromRmsGrid(dt, silentQuad, halfN, true);
+  }
+  assert.equal(subThresholdSys.particles.length, 3000, 'Must not append particles on sub-threshold or silent RMS fields');
+  assert.equal(subThresholdSys.totalAddedCount, 0, 'Must not feed or recycle during sub-threshold RMS fields');
+  for (let i = 0; i < subSnapBefore.length; i++) {
+    assert.equal(subThresholdSys.particles[i].x, subSnapBefore[i].x, 'Existing particle x must remain unchanged');
+    assert.equal(subThresholdSys.particles[i].y, subSnapBefore[i].y, 'Existing particle y must remain unchanged');
+  }
+
+  // Perimeter-only high RMS (gx = 0, gy = 0 only; interior grid points strictly <= 1 mm remain 0) must also block feeding
+  const perimOnlyQuad = new Float64Array(halfN * halfN);
+  perimOnlyQuad[0] = 500.0;
+  for (let s = 0; s < 30; s++) {
+    assert.equal(subThresholdSys.feedInteriorParticlesIfNeeded(dt, false, perimOnlyQuad, halfN), 0);
+  }
+  assert.equal(subThresholdSys.particles.length, 3000);
+
+  // B. Transport-eligible RMS field (center antinode a_rms = 25 m/s^2 > g): feeding resumes with <= 60 batch & 0.20 s cooldown
+  const eligibleQuad = new Float64Array(halfN * halfN);
+  eligibleQuad[(halfN - 1) * halfN + (halfN - 1)] = 25.0; // plate center only
+
+  // After sustained eligible steps (past 0.20 s cooldown), feeding introduces a bounded batch <= 60 and caps <= 4,500
+  let firstBatch = 0;
+  for (let s = 0; s < 20; s++) {
+    const prevLen = subThresholdSys.particles.length;
+    subThresholdSys.stepFromRmsGrid(dt, eligibleQuad, halfN, false);
+    const delta = subThresholdSys.particles.length - prevLen;
+    if (delta > 0) {
+      assert.ok(delta <= 60, `Batch size ${delta} exceeded 60 limit`);
+      if (firstBatch === 0) firstBatch = delta;
+      // Next step inside 0.20 s cooldown must add 0
+      const nextPrev = subThresholdSys.particles.length;
+      subThresholdSys.stepFromRmsGrid(dt, eligibleQuad, halfN, false);
+      assert.equal(subThresholdSys.particles.length - nextPrev, 0, 'Cooldown must prevent consecutive-frame additions');
+      break;
+    }
+  }
+  assert.ok(firstBatch > 0, 'Expected feeding to activate on transport-eligible RMS field');
+
+  // C. Perimeter recycling at 4,500 cap: blocked when sub-threshold, active when eligible, interior nodal grains untouched
+  const recycleSys = makeSys(3000);
+  // Bring population up to exact 4,500 ceiling using eligible grid while depleting interior
+  for (let step = 0; step < 1200 && recycleSys.particles.length < 4500; step++) {
+    if (step % 25 === 0) {
+      for (let i = 0; i < Math.min(2400, recycleSys.particles.length); i++) {
+        recycleSys.particles[i].x = 0.0003;
+      }
+    }
+    recycleSys.stepFromRmsGrid(dt, eligibleQuad, halfN, false);
+  }
+  assert.equal(recycleSys.particles.length, 4500, 'Expected population to reach 4,500 ceiling');
+
+  // Deplete interior below 2,100, keep 600 known interior grains along a nodal line
+  for (let i = 0; i < 4500; i++) {
+    if (i < 600) {
+      recycleSys.particles[i].x = 0.10 + (i / 600) * 0.10;
+      recycleSys.particles[i].y = 0.05; // stationary interior nodal line
+    } else {
+      recycleSys.particles[i].x = 0.0004; // perimeter rim
+    }
+  }
+  const nodalSnapshot = recycleSys.particles.slice(0, 600).map((p) => ({ x: p.x, y: p.y }));
+
+  // Sub-threshold grid at 4,500 cap must perform 0 recycling
+  for (let s = 0; s < 40; s++) {
+    const recycledSub = recycleSys.feedInteriorParticlesIfNeeded(dt, false, subThresholdQuad, halfN);
+    assert.equal(recycledSub, 0, 'Must not recycle perimeter particles under sub-threshold RMS field');
+  }
+  assert.equal(recycleSys.countInteriorParticles(margin), 600);
+
+  // Eligible grid at 4,500 cap recycles rim grains (<= 300) without touching any interior nodal grain
+  let recycledEligible = 0;
+  for (let s = 0; s < 20; s++) {
+    recycledEligible = recycleSys.feedInteriorParticlesIfNeeded(dt, false, eligibleQuad, halfN);
+    if (recycledEligible > 0) break;
+  }
+  assert.ok(recycledEligible > 0 && recycledEligible <= 300, `Expected bounded recycle <= 300, got ${recycledEligible}`);
+  assert.equal(recycleSys.particles.length, 4500);
+  for (let i = 0; i < 600; i++) {
+    assert.equal(recycleSys.particles[i].x, nodalSnapshot[i].x, 'Interior nodal grain x must never be recycled');
+    assert.equal(recycleSys.particles[i].y, nodalSnapshot[i].y, 'Interior nodal grain y must never be recycled');
+  }
+});
+
+
 
 
 

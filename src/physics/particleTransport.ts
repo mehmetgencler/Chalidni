@@ -193,9 +193,49 @@ export class ParticleTransportSystem {
   }
 
   /**
+   * Checks whether at least one interior point (strictly outside perimeterBandM) on the
+   * 4-fold symmetric quadrant RMS grid satisfies the production particle-transport eligibility
+   * condition (D_g > 1e-15 evaluated via evaluateDimensionalDiffusivity).
+   */
+  hasTransportEligibleInteriorField(
+    rmsQuadrant: Float64Array,
+    halfN: number,
+    perimeterBandM: number = 0.001
+  ): boolean {
+    if (!rmsQuadrant || halfN < 2 || rmsQuadrant.length < halfN * halfN) {
+      return false;
+    }
+
+    const halfL = this.sideLength * 0.5;
+    if (halfL <= perimeterBandM) {
+      return false;
+    }
+
+    const maxIdx = halfN - 1;
+    const minInteriorIdx = Math.min(maxIdx, Math.floor((perimeterBandM / halfL) * maxIdx) + 1);
+
+    // Check plate center (maxIdx, maxIdx) first for O(1) fast path on active center-coupled modes
+    if (this.evaluateDimensionalDiffusivity(rmsQuadrant[maxIdx * halfN + maxIdx], false) > 1e-15) {
+      return true;
+    }
+
+    for (let gy = minInteriorIdx; gy < halfN; gy++) {
+      const rowOffset = gy * halfN;
+      for (let gx = minInteriorIdx; gx < halfN; gx++) {
+        if (this.evaluateDimensionalDiffusivity(rmsQuadrant[rowOffset + gx], false) > 1e-15) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  /**
    * Controlled external powder-feed visualization model:
    * - Preserves all active interior particles, coordinates, and velocities.
    * - Monitors interior count strictly outside the 1 mm perimeter band.
+   * - Gates both feeding and perimeter recycling by actual interior RMS transport eligibility (D_g > 1e-15).
    * - When interior count < 70% of initial count (2,100 for 3,000 initial), gradually introduces
    *   small batches into the interior with a 0.20 s cooldown (~12 snapshots) and a strict total ceiling
    *   of maxParticleCount (4,500).
@@ -203,14 +243,25 @@ export class ParticleTransportSystem {
    *   zero-diffusivity 1 mm perimeter rim (never interior nodal grains) back into the interior so sweeping
    *   back down from 20 kHz toward 20 Hz recovers clean Chladni patterns without breaking the 4,500 cap.
    */
-  feedInteriorParticlesIfNeeded(dt: number, isSilent: boolean): number {
+  feedInteriorParticlesIfNeeded(
+    dt: number,
+    isSilent: boolean,
+    rmsQuadrant?: Float64Array,
+    halfN?: number
+  ): number {
     const perimeterBandM = 0.001;
     const minCoord = perimeterBandM;
     const maxCoord = this.sideLength - perimeterBandM;
     const interiorCount = this.countInteriorParticles(perimeterBandM);
     this.lastInteriorCount = interiorCount;
 
-    if (isSilent || dt <= 0) {
+    if (
+      isSilent ||
+      dt <= 0 ||
+      (rmsQuadrant !== undefined &&
+        halfN !== undefined &&
+        !this.hasTransportEligibleInteriorField(rmsQuadrant, halfN, perimeterBandM))
+    ) {
       this.lastAddedCount = 0;
       return 0;
     }
@@ -605,7 +656,7 @@ export class ParticleTransportSystem {
     }
 
     if (this.config.enableExternalPowderFeed) {
-      this.feedInteriorParticlesIfNeeded(dt, false);
+      this.feedInteriorParticlesIfNeeded(dt, false, rmsQuadrant, halfN);
     }
 
     const elapsedMs = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0;
