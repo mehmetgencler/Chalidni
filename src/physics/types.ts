@@ -63,6 +63,8 @@ export interface DimensionalTransportConfig {
   dt: number;         // s
   seed: number;
   subThresholdCreepFloor?: number; // m^2/s, explicit optional floor (default 0.0)
+  enableExternalPowderFeed?: boolean; // external powder-feed visualization mode (default false)
+  maxParticleCount?: number;          // hard population ceiling when external feeding is enabled (default 4500)
 }
 
 /**

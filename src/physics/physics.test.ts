@@ -1590,4 +1590,169 @@ test('22. Intermediate snapshot covariance accuracy & entry ages across abrupt t
   assert.ok(worstAge <= 7, `Staggered entry age ${worstAge} quanta exceeded 7 quanta bound (8-bucket stagger)`);
 });
 
+test('23. Controlled external powder feeding preserves existing particles, feeds gradually outside 1 mm rim, and caps at 4,500', () => {
+  const L = DEFAULT_GEOMETRY.sideLength;
+  const dt = 0.016;
+  const margin = 0.001; // 1 mm perimeter band
+
+  const sys = new ParticleTransportSystem(
+    {
+      particleCount: 3000,
+      dRef: 2.0e-6,
+      gammaC: 1.0,
+      power: 2.0,
+      g: 9.80665,
+      dt,
+      seed: 42,
+      enableExternalPowderFeed: true,
+      maxParticleCount: 4500,
+    },
+    L
+  );
+
+  // Preserve original references and verify initial interior count is well above 70% (2,100)
+  const initialRefs = sys.particles.slice();
+  const initialInterior = sys.countInteriorParticles(margin);
+  assert.ok(initialInterior > 2800, `Expected >2800 interior particles initially, got ${initialInterior}`);
+
+  // When interior count >= 2,100, zero particles are added even over sustained steps
+  const silentQuad = new Float64Array(33 * 33);
+  for (let k = 0; k < 25; k++) {
+    const added = sys.feedInteriorParticlesIfNeeded(dt, false);
+    assert.equal(added, 0, 'Must not feed while interior particle count >= 2100');
+  }
+  assert.equal(sys.particles.length, 3000);
+
+  // Move 1,000 particles onto the 1 mm perimeter rim (simulating high-freq edge accumulation) -> interior = ~1960 < 2100
+  for (let i = 0; i < 1000; i++) {
+    sys.particles[i].x = 0.0004;
+    sys.particles[i].y = 0.10 + (i / 1000) * 0.10;
+  }
+  const snappedExisting = sys.particles.map((p) => ({ ref: p, x: p.x, y: p.y, vx: p.vx, vy: p.vy }));
+  const beforeFeedInterior = sys.countInteriorParticles(margin);
+  assert.ok(beforeFeedInterior < 2100);
+
+  // First eligible feed adds a small bounded batch (<= 60) and preserves all existing particles identically
+  const batch1 = sys.feedInteriorParticlesIfNeeded(dt, false);
+  assert.ok(batch1 > 0 && batch1 <= 60, `Expected small batch in [1, 60], got ${batch1}`);
+  for (let i = 0; i < snappedExisting.length; i++) {
+    assert.equal(sys.particles[i], snappedExisting[i].ref, 'Existing particle object references must be preserved');
+    assert.equal(sys.particles[i].x, snappedExisting[i].x, 'Existing particle x must not be repositioned');
+    assert.equal(sys.particles[i].y, snappedExisting[i].y, 'Existing particle y must not be repositioned');
+    assert.equal(sys.particles[i].vx, snappedExisting[i].vx);
+    assert.equal(sys.particles[i].vy, snappedExisting[i].vy);
+  }
+
+  // Consecutive snapshots immediately after batch1 must add 0 particles (no repeated additions on every snapshot)
+  for (let k = 0; k < 10; k++) {
+    const repeatAdd = sys.feedInteriorParticlesIfNeeded(dt, false);
+    assert.equal(repeatAdd, 0, 'Must not repeat particle feeding on consecutive snapshots within cooldown');
+  }
+
+  // Silent steps must also never feed
+  for (let k = 0; k < 30; k++) {
+    assert.equal(sys.feedInteriorParticlesIfNeeded(dt, true), 0, 'Must never feed when plate is silent');
+  }
+  // Suppress unused warning on silentQuad
+  assert.equal(silentQuad[0], 0);
+
+  // Validate newly fed particle coordinates & reused PRNG property bounds
+  for (let i = 3000; i < sys.particles.length; i++) {
+    const p = sys.particles[i];
+    assert.equal(p.active, true);
+    assert.ok(p.x > margin && p.x < L - margin, `Fed x=${p.x} violated 1 mm perimeter exclusion`);
+    assert.ok(p.y > margin && p.y < L - margin, `Fed y=${p.y} violated 1 mm perimeter exclusion`);
+    assert.ok((p.radius ?? 0) >= 0.9 && (p.radius ?? 0) <= 1.4);
+    assert.ok((p.brightness ?? 0) >= 0.82 && (p.brightness ?? 0) <= 1.18);
+  }
+
+  // Under continuous 19.912 kHz excitation over 25 simulated seconds, population stays strictly <= 4,500
+  const { processor } = createProductionWorklet(48000);
+  const mb = new ModalBank(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY, 0.01);
+  processor.handleMessage({ type: 'CONFIGURE_MODES', modes: mb.getWorkletModeConfig() });
+  feedWorkletSignal(processor, 0.2, (t) => 0.5 * Math.sin(2 * Math.PI * 19912.35 * t), 48000);
+  mb.applySnapshot(processor.buildSnapshot());
+  const grid = mb.getFastRmsGridData();
+
+  // Force depletion of interior below 70% repeatedly to stress-test the 4,500 hard ceiling
+  for (let step = 0; step < 1600; step++) {
+    if (step % 30 === 0) {
+      for (let i = 0; i < Math.min(2500, sys.particles.length); i++) {
+        sys.particles[i].x = 0.0003;
+      }
+    }
+    sys.stepFromRmsGrid(dt, grid.quadrant, grid.halfN, false);
+    assert.ok(sys.particles.length <= 4500, `Population ${sys.particles.length} exceeded 4,500 cap`);
+    assert.equal(sys.lastStepStats.boundViolated, false);
+  }
+  assert.equal(sys.particles.length, 4500, 'Population should stop exactly at 4,500 hard ceiling under sustained depletion');
+  // Original 3,000 references remain intact at indices 0..2999
+  for (let i = 0; i < 3000; i++) {
+    assert.equal(sys.particles[i], initialRefs[i]);
+  }
+
+  // At the 4,500 cap, recycling perimeter-trapped grains must NEVER modify interior grains
+  const interiorSnapshot = sys.particles
+    .map((p, idx) => ({ idx, x: p.x, y: p.y, isInterior: p.active && p.x > margin && p.x < L - margin && p.y > margin && p.y < L - margin }))
+    .filter((entry) => entry.isInterior);
+  const beforeRecycledCount = sys.countInteriorParticles(margin);
+  assert.ok(beforeRecycledCount < 2100);
+  let reclaimed = 0;
+  for (let k = 0; k < 20; k++) {
+    reclaimed += sys.feedInteriorParticlesIfNeeded(dt, false);
+    if (reclaimed > 0) break;
+  }
+  assert.ok(reclaimed > 0 && reclaimed <= 300, `Expected bounded perimeter reclamation batch <= 300, got ${reclaimed}`);
+  assert.equal(sys.particles.length, 4500, 'Total count must remain capped at 4,500');
+  for (const saved of interiorSnapshot) {
+    assert.equal(sys.particles[saved.idx].x, saved.x, 'Existing interior grain x must never be moved during rim reclamation');
+    assert.equal(sys.particles[saved.idx].y, saved.y, 'Existing interior grain y must never be moved during rim reclamation');
+  }
+
+  // Full up-and-down frequency sweep test: 269.8 Hz -> 5 kHz -> 19.912 kHz -> 269.8 Hz -> 53.96 Hz -> 20 Hz
+  const sweepSys = new ParticleTransportSystem(
+    {
+      particleCount: 3000,
+      dRef: 2.0e-6,
+      gammaC: 1.0,
+      power: 2.0,
+      g: 9.80665,
+      dt,
+      seed: 42,
+      enableExternalPowderFeed: true,
+      maxParticleCount: 4500,
+    },
+    L
+  );
+  const { processor: sweepProc } = createProductionWorklet(48000);
+  const sweepMb = new ModalBank(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY, 0.01);
+  sweepProc.handleMessage({ type: 'CONFIGURE_MODES', modes: sweepMb.getWorkletModeConfig() });
+
+  const runStage = (freqHz: number, durationSec: number) => {
+    const steps = Math.round(durationSec / dt);
+    feedWorkletSignal(sweepProc, 0.25, (t) => 0.5 * Math.sin(2 * Math.PI * freqHz * t), 48000);
+    sweepMb.applySnapshot(sweepProc.buildSnapshot());
+    const stageGrid = sweepMb.getFastRmsGridData();
+    for (let s = 0; s < steps; s++) {
+      sweepSys.stepFromRmsGrid(dt, stageGrid.quadrant, stageGrid.halfN, false);
+    }
+    return sweepSys.countInteriorParticles(margin);
+  };
+
+  runStage(269.815, 3);
+  runStage(5000, 3);
+  const highFreqInterior = runStage(19912.35, 10);
+  assert.ok(highFreqInterior < 2100, `Expected high-freq edge accumulation to deplete interior, got ${highFreqInterior}`);
+  runStage(269.815, 4);
+  runStage(53.963, 4);
+  const recoveredLowFreqInterior = runStage(20, 4);
+  assert.ok(
+    recoveredLowFreqInterior >= 1950,
+    `Downward sweep 20 kHz -> 20 Hz must recover interior particle density (>= 1950), got ${recoveredLowFreqInterior}`
+  );
+  assert.ok(sweepSys.particles.length <= 4500);
+});
+
+
+
 

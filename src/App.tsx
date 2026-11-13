@@ -51,6 +51,8 @@ export function App() {
         g: 9.80665,
         dt: 0.016,
         seed: 42,
+        enableExternalPowderFeed: true,
+        maxParticleCount: 4500,
       },
       sideLength
     );
@@ -104,6 +106,8 @@ export function App() {
         canvasEl.dataset.gridRes = String(gridStats.effectivePlateResolution);
         canvasEl.dataset.gridRebuildMs = gridStats.lastRebuildDurationMs.toFixed(3);
         canvasEl.dataset.particleUpdateMs = stepStats.updateDurationMs.toFixed(3);
+        canvasEl.dataset.particleCount = String(particleSystem.particles.length);
+        canvasEl.dataset.interiorParticles = String(particleSystem.lastInteriorCount);
         canvasEl.dataset.maxMicroSteps = String(stepStats.maxMicroSteps);
         canvasEl.dataset.maxSubstepRms = stepStats.maxSubStepRms.toFixed(6);
         canvasEl.dataset.boundViolated = String(stepStats.boundViolated);

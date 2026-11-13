@@ -107,6 +107,13 @@ export class ParticleTransportSystem {
   config: DimensionalTransportConfig;
   sideLength: number; // L (m)
   private prng: Mulberry32PRNG;
+  private initialParticleCount: number;
+  private feedCooldownElapsed: number = 0;
+  private edgeRecycleCursor: number = 0;
+
+  lastInteriorCount: number = 0;
+  lastAddedCount: number = 0;
+  totalAddedCount: number = 0;
 
   lastStepStats: ParticleStepStats = {
     maxMicroSteps: 0,
@@ -122,6 +129,7 @@ export class ParticleTransportSystem {
   constructor(config: Partial<DimensionalTransportConfig> = {}, sideLength: number = 0.30) {
     this.config = { ...DEFAULT_DIMENSIONAL_CONFIG, ...config };
     this.sideLength = sideLength;
+    this.initialParticleCount = this.config.particleCount;
     this.prng = new Mulberry32PRNG(this.config.seed);
     this.initParticles();
   }
@@ -139,6 +147,11 @@ export class ParticleTransportSystem {
 
   initParticles(): void {
     this.particles = [];
+    this.initialParticleCount = this.config.particleCount;
+    this.feedCooldownElapsed = 0;
+    this.edgeRecycleCursor = 0;
+    this.lastAddedCount = 0;
+    this.totalAddedCount = 0;
     const L = this.sideLength;
     for (let i = 0; i < this.config.particleCount; i++) {
       // Natural subtle powder variations
@@ -154,6 +167,134 @@ export class ParticleTransportSystem {
         brightness,
       });
     }
+    this.lastInteriorCount = this.countInteriorParticles(0.001);
+  }
+
+  /**
+   * Counts active particles strictly outside the specified perimeter band (default 1 mm).
+   */
+  countInteriorParticles(perimeterBandM: number = 0.001): number {
+    const minCoord = perimeterBandM;
+    const maxCoord = this.sideLength - perimeterBandM;
+    let count = 0;
+    for (let i = 0; i < this.particles.length; i++) {
+      const p = this.particles[i];
+      if (
+        p.active &&
+        p.x > minCoord &&
+        p.x < maxCoord &&
+        p.y > minCoord &&
+        p.y < maxCoord
+      ) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * Controlled external powder-feed visualization model:
+   * - Preserves all active interior particles, coordinates, and velocities.
+   * - Monitors interior count strictly outside the 1 mm perimeter band.
+   * - When interior count < 70% of initial count (2,100 for 3,000 initial), gradually introduces
+   *   small batches into the interior with a 0.20 s cooldown (~12 snapshots) and a strict total ceiling
+   *   of maxParticleCount (4,500).
+   * - Once total count reaches maxParticleCount (4,500), reclaims only grains dead-trapped inside the
+   *   zero-diffusivity 1 mm perimeter rim (never interior nodal grains) back into the interior so sweeping
+   *   back down from 20 kHz toward 20 Hz recovers clean Chladni patterns without breaking the 4,500 cap.
+   */
+  feedInteriorParticlesIfNeeded(dt: number, isSilent: boolean): number {
+    const perimeterBandM = 0.001;
+    const minCoord = perimeterBandM;
+    const maxCoord = this.sideLength - perimeterBandM;
+    const interiorCount = this.countInteriorParticles(perimeterBandM);
+    this.lastInteriorCount = interiorCount;
+
+    if (isSilent || dt <= 0) {
+      this.lastAddedCount = 0;
+      return 0;
+    }
+
+    const feedIntervalSec = 0.2;
+    this.feedCooldownElapsed += dt;
+    if (this.feedCooldownElapsed < feedIntervalSec) {
+      this.lastAddedCount = 0;
+      return 0;
+    }
+
+    const minInteriorTarget = Math.floor(0.7 * this.initialParticleCount);
+    const maxTotal = this.config.maxParticleCount ?? 4500;
+    if (interiorCount >= minInteriorTarget) {
+      this.lastAddedCount = 0;
+      return 0;
+    }
+
+    const maxBatchSize = 60;
+    const deficit = minInteriorTarget - interiorCount;
+    if (deficit <= 0) {
+      this.lastAddedCount = 0;
+      return 0;
+    }
+
+    const headroom = Math.max(0, maxTotal - this.particles.length);
+    const toAppend = Math.min(maxBatchSize, deficit, headroom);
+    const innerSpan = Math.max(0, this.sideLength - 2.0 * perimeterBandM);
+
+    let introduced = 0;
+    for (let i = 0; i < toAppend; i++) {
+      const radius = 0.9 + 0.5 * this.prng.next();
+      const brightness = 0.82 + 0.36 * this.prng.next();
+      this.particles.push({
+        x: minCoord + (1e-6 + this.prng.next() * (1.0 - 2e-6)) * innerSpan,
+        y: minCoord + (1e-6 + this.prng.next() * (1.0 - 2e-6)) * innerSpan,
+        vx: 0,
+        vy: 0,
+        active: true,
+        radius,
+        brightness,
+      });
+      introduced++;
+    }
+
+    // Once at maxTotal (or no append headroom left), reclaim perimeter-rim trapped grains proportionally
+    // to deficit (bounded <= 300 per 0.20s interval) so interior visibility recovers rapidly after 20 kHz sweeps.
+    const recycleBudget = headroom === 0 ? Math.min(300, Math.max(maxBatchSize, Math.ceil(deficit * 0.25)), deficit) : Math.max(0, Math.min(maxBatchSize, deficit) - toAppend);
+    const toRecycle = recycleBudget;
+    if (toRecycle > 0 && this.particles.length > 0) {
+      const n = this.particles.length;
+      let cursor = this.edgeRecycleCursor % n;
+      let scanned = 0;
+      let recycled = 0;
+      while (recycled < toRecycle && scanned < n) {
+        const p = this.particles[cursor];
+        const isPerimeterOrInactive =
+          !p.active ||
+          p.x <= minCoord ||
+          p.x >= maxCoord ||
+          p.y <= minCoord ||
+          p.y >= maxCoord;
+        if (isPerimeterOrInactive) {
+          p.x = minCoord + (1e-6 + this.prng.next() * (1.0 - 2e-6)) * innerSpan;
+          p.y = minCoord + (1e-6 + this.prng.next() * (1.0 - 2e-6)) * innerSpan;
+          p.vx = 0;
+          p.vy = 0;
+          p.active = true;
+          recycled++;
+          introduced++;
+        }
+        cursor = (cursor + 1) % n;
+        scanned++;
+      }
+      this.edgeRecycleCursor = cursor;
+    }
+
+    if (introduced > 0) {
+      this.feedCooldownElapsed = 0;
+    }
+    this.lastAddedCount = introduced;
+    this.totalAddedCount += introduced;
+    this.lastInteriorCount = interiorCount + introduced;
+    return introduced;
   }
 
   /**
@@ -461,6 +602,10 @@ export class ParticleTransportSystem {
         p.vx = (p.x - startX) / dt;
         p.vy = (p.y - startY) / dt;
       }
+    }
+
+    if (this.config.enableExternalPowderFeed) {
+      this.feedInteriorParticlesIfNeeded(dt, false);
     }
 
     const elapsedMs = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0;
