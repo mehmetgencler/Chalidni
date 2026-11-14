@@ -49,6 +49,11 @@ interface WorkletInstance {
   accelerations: Float64Array;
   covarianceMatrix: Float64Array;
   covLastQ?: Int32Array;
+  excitationProfile?: string;
+  musicSmoothedGain?: number;
+  musicInputMeanSqEnvelope?: number;
+  musicGateOpen?: boolean;
+  isSilent?: boolean;
   port: {
     onmessage: ((event: { data: unknown }) => void) | null;
     postMessage: (msg: unknown) => void;
@@ -2023,3 +2028,347 @@ test('25. AudioEngine decodeAudioData + AudioBufferSourceNode routes audio to bo
     (globalThis as Record<string, unknown>).AudioContext = prevAudioContext;
   }
 });
+
+test('26. Bounded music-input normalization: raw regression, -70 dBFS visibility, -78 dBFS gate/noise protection, silence decay & gain bounds', () => {
+  const sr = 44100;
+  const L = DEFAULT_GEOMETRY.sideLength;
+
+  // A. Raw-profile regression: default is 'raw', unmodified test-tone behavior
+  const { processor: rawProc } = createProductionWorklet(sr);
+  assert.equal(rawProc.excitationProfile, 'raw', 'Default worklet excitation profile must be raw');
+  const mode11 = rawProc.modes.find((m) => m.m === 1 && m.n === 1);
+  assert.ok(mode11, 'Catalogue must include fundamental (1,1) mode');
+  const f11 = mode11.frequency;
+
+  const rms70 = Math.pow(10, -70 / 20);
+  const amp70 = Math.SQRT2 * rms70;
+  feedWorkletSignal(rawProc, 2.0, (t) => amp70 * Math.sin(2 * Math.PI * f11 * t), sr);
+  const mbRaw = new ModalBank(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY, 0.01);
+  mbRaw.applySnapshot(rawProc.buildSnapshot());
+  const raw70CenterRms = mbRaw.evaluateRmsAcceleration(L / 2, L / 2);
+  assert.ok(
+    raw70CenterRms < 1.5,
+    `Under raw profile, -70 dBFS input must stay sub-threshold without AGC boost, got ${raw70CenterRms}`
+  );
+
+  // B. Quiet music (-70 dBFS RMS) becomes visible under 'music' profile and moves center particles
+  const { processor: musicProc } = createProductionWorklet(sr);
+  musicProc.handleMessage({ type: 'SET_EXCITATION_PROFILE', profile: 'music' });
+  assert.equal(musicProc.excitationProfile, 'music');
+
+  feedWorkletSignal(musicProc, 2.0, (t) => amp70 * Math.sin(2 * Math.PI * f11 * t), sr);
+  const snap70 = musicProc.buildSnapshot();
+  const mb70 = new ModalBank(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY, 0.01);
+  mb70.applySnapshot(snap70);
+  const music70CenterRms = mb70.evaluateRmsAcceleration(L / 2, L / 2);
+  assert.ok(
+    music70CenterRms > 9.80687,
+    `-70 dBFS music-profile RMS center acceleration must exceed 9.80687 m/s^2, got ${music70CenterRms}`
+  );
+
+  const moveSys = new ParticleTransportSystem(
+    {
+      particleCount: 3000,
+      dRef: 2.0e-6,
+      gammaC: 1.0,
+      power: 2.0,
+      g: 9.80665,
+      dt: 0.016,
+      seed: 42,
+      enableExternalPowderFeed: true,
+      maxParticleCount: 4500,
+    },
+    L
+  );
+  moveSys.particles[0].x = L / 2;
+  moveSys.particles[0].y = L / 2;
+  const grid70 = mb70.getFastRmsGridData();
+  for (let k = 0; k < 10; k++) {
+    moveSys.stepFromRmsGrid(0.016, grid70.quadrant, grid70.halfN, Boolean(snap70.isSilent) || !grid70.hasEnergy);
+  }
+  const disp70 = Math.hypot(moveSys.particles[0].x - L / 2, moveSys.particles[0].y - L / 2);
+  assert.ok(disp70 > 1e-6, `Expected center particle movement at -70 dBFS music excitation, got disp=${disp70}`);
+
+  // C. Low-level noise protection (-78 dBFS RMS): below transport threshold, zero movement, zero feed/recycle
+  const { processor: noiseProc } = createProductionWorklet(sr);
+  noiseProc.handleMessage({ type: 'SET_EXCITATION_PROFILE', profile: 'music' });
+  const rms78 = Math.pow(10, -78 / 20);
+  const amp78 = Math.SQRT2 * rms78;
+  feedWorkletSignal(noiseProc, 2.0, (t) => amp78 * Math.sin(2 * Math.PI * f11 * t), sr);
+  const snap78 = noiseProc.buildSnapshot();
+  const mb78 = new ModalBank(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY, 0.01);
+  mb78.applySnapshot(snap78);
+  const music78CenterRms = mb78.evaluateRmsAcceleration(L / 2, L / 2);
+  assert.ok(
+    music78CenterRms < 9.80687,
+    `-78 dBFS input must remain below particle transport threshold 9.80687 m/s^2, got ${music78CenterRms}`
+  );
+
+  const noiseSys = new ParticleTransportSystem(
+    {
+      particleCount: 3000,
+      dRef: 2.0e-6,
+      gammaC: 1.0,
+      power: 2.0,
+      g: 9.80665,
+      dt: 0.016,
+      seed: 42,
+      enableExternalPowderFeed: true,
+      maxParticleCount: 4500,
+    },
+    L
+  );
+  noiseSys.particles[0].x = L / 2;
+  noiseSys.particles[0].y = L / 2;
+  // Also deplete interior below 2,100 to verify feeding/recycling remain blocked under -78 dBFS noise
+  for (let i = 1; i < 1201; i++) {
+    noiseSys.particles[i].x = 0.0004;
+  }
+  const before78 = noiseSys.particles.map((p) => ({ x: p.x, y: p.y }));
+  const grid78 = mb78.getFastRmsGridData();
+  for (let k = 0; k < 30; k++) {
+    noiseSys.stepFromRmsGrid(0.016, grid78.quadrant, grid78.halfN, Boolean(snap78.isSilent) || !grid78.hasEnergy);
+  }
+  assert.equal(noiseSys.particles.length, 3000, 'Sub-threshold -78 dBFS noise must not trigger powder feeding');
+  assert.equal(noiseSys.totalAddedCount, 0, 'Sub-threshold -78 dBFS noise must not trigger feeding or recycling');
+  for (let i = 0; i < before78.length; i++) {
+    assert.equal(noiseSys.particles[i].x, before78[i].x, 'Zero particle x movement allowed under -78 dBFS noise');
+    assert.equal(noiseSys.particles[i].y, before78[i].y, 'Zero particle y movement allowed under -78 dBFS noise');
+  }
+
+  // D. Digital silence: never generates artificial excitation; preserves existing modal free decay
+  const { processor: silentProc } = createProductionWorklet(sr);
+  silentProc.handleMessage({ type: 'SET_EXCITATION_PROFILE', profile: 'music' });
+  feedWorkletSignal(silentProc, 1.0, () => 0.0, sr);
+  assert.equal(silentProc.musicGateOpen, false);
+  assert.equal(silentProc.musicSmoothedGain, 1.0);
+  assert.equal(silentProc.isSilent, true);
+  assert.equal(silentProc.displacements[0], 0);
+  assert.equal(silentProc.accelerations[0], 0);
+
+  // Also test transition from excited -70 dBFS music into digital silence -> exact unforced decay without gain runaway
+  const gainBeforeSilence = musicProc.musicSmoothedGain ?? 1.0;
+  const framesBeforeSilence = musicProc.sampleFramesProcessed;
+  const ampBeforeSilence = Math.hypot(musicProc.displacements[0], musicProc.velocities[0] / mode11.omega);
+  assert.ok(ampBeforeSilence > 0);
+  feedWorkletSignal(musicProc, 0.25, () => 0.0, sr);
+  const gainAfterSilence = musicProc.musicSmoothedGain ?? 0;
+  assert.ok(Number.isFinite(gainAfterSilence) && gainAfterSilence >= 1.0 && gainAfterSilence <= 16.0);
+  assert.ok(
+    gainAfterSilence <= gainBeforeSilence + 1e-9,
+    'Digital silence must never push AGC gain upward'
+  );
+  assert.ok(musicProc.sampleFramesProcessed > framesBeforeSilence, 'Clock must advance continuously into decay');
+  const ampAfterSilence = Math.hypot(musicProc.displacements[0], musicProc.velocities[0] / mode11.omega);
+  const expectedDecay = Math.exp(-mode11.zeta * mode11.omega * 0.25);
+  const relDecayErr = Math.abs(ampAfterSilence / ampBeforeSilence - expectedDecay) / expectedDecay;
+  assert.ok(relDecayErr < 0.02, `Expected natural modal free decay during music silence, relErr=${relDecayErr}`);
+
+  // E. Gain bounds [1.0, 16.0] & loud signal stays at unity (no boost above 1.0, no attenuation)
+  const { processor: boundsProc } = createProductionWorklet(sr);
+  boundsProc.handleMessage({ type: 'SET_EXCITATION_PROFILE', profile: 'music' });
+  const testRmsLevels = [1e-5, rms70, 0.002, 0.05, 0.5];
+  for (const level of testRmsLevels) {
+    const peak = Math.SQRT2 * level;
+    const total = Math.floor(0.6 * sr);
+    const inBuf = new Float32Array(128);
+    const outBuf = new Float32Array(128);
+    for (let off = 0; off < total; off += 128) {
+      for (let s = 0; s < 128; s++) {
+        inBuf[s] = peak * Math.sin(2 * Math.PI * f11 * ((off + s) / sr));
+      }
+      boundsProc.process([[inBuf]], [[outBuf]]);
+      const g = boundsProc.musicSmoothedGain;
+      assert.ok(
+        typeof g === 'number' && Number.isFinite(g) && g >= 1.0 && g <= 16.0,
+        `Gain out of bounds [1.0, 16.0]: ${g}`
+      );
+      assert.ok(Number.isFinite(boundsProc.musicInputMeanSqEnvelope));
+    }
+  }
+  // Last level was 0.5 RMS (loud): smoothed gain must converge to 1.0 unity (never > 1.0)
+  assert.ok(
+    Math.abs((boundsProc.musicSmoothedGain ?? 0) - 1.0) < 1e-4,
+    `Loud input must settle at unity gain 1.0, got ${boundsProc.musicSmoothedGain}`
+  );
+
+  // Switching back to raw resets music detector while preserving simulation clock & modal state
+  boundsProc.handleMessage({ type: 'SET_EXCITATION_PROFILE', profile: 'raw' });
+  assert.equal(boundsProc.excitationProfile, 'raw');
+  assert.equal(boundsProc.musicSmoothedGain, 1.0);
+  assert.equal(boundsProc.musicGateOpen, false);
+
+  console.log(
+    `[Music Normalization Metrics] -70 dBFS center aRms=${music70CenterRms.toFixed(3)} m/s^2 (raw=${raw70CenterRms.toFixed(3)}), -78 dBFS center aRms=${music78CenterRms.toFixed(3)} m/s^2, disp70=${(disp70 * 1000).toFixed(4)} mm`
+  );
+});
+
+test('27. AudioEngine sends SET_EXCITATION_PROFILE raw for generator and music before buffer/element playback', async () => {
+  const prevWindow = (globalThis as Record<string, unknown>).window;
+  const prevAudioWorkletNode = (globalThis as Record<string, unknown>).AudioWorkletNode;
+  const prevAudioContext = (globalThis as Record<string, unknown>).AudioContext;
+  const prevAudio = (globalThis as Record<string, unknown>).Audio;
+  const prevURL = globalThis.URL;
+
+  try {
+    const timeline: string[] = [];
+    let mockState: 'suspended' | 'running' = 'running';
+    let allowDecode = true;
+    let allowResume = true;
+
+    const makeGain = () => ({
+      channelCount: 2,
+      channelCountMode: 'max',
+      gain: { value: 1, setValueAtTime: () => {}, cancelScheduledValues: () => {}, setTargetAtTime: () => {} },
+      connect: () => {},
+    });
+
+    class MockWorkletNode {
+      port = {
+        onmessage: null,
+        postMessage: (msg: { type: string; profile?: string }) => {
+          timeline.push(
+            msg.type === 'SET_EXCITATION_PROFILE' ? `PROFILE:${msg.profile}` : `MSG:${msg.type}`
+          );
+        },
+      };
+      connect() {}
+    }
+
+    class MockAudioContext {
+      sampleRate = 44100;
+      currentTime = 0;
+      destination = {};
+      audioWorklet = { addModule: async () => {} };
+      get state() {
+        return mockState;
+      }
+      resume = () => {
+        if (!allowResume) return new Promise<void>(() => {});
+        mockState = 'running';
+        return Promise.resolve();
+      };
+      close = async () => {};
+      createGain = () => makeGain();
+      createChannelSplitter = () => ({ connect: () => {} });
+      createOscillator = () => ({
+        type: 'sine',
+        frequency: { setValueAtTime: () => {}, setTargetAtTime: () => {} },
+        connect: () => {},
+        start: () => {
+          timeline.push('OSC_START');
+        },
+        stop: () => {},
+        disconnect: () => {},
+      });
+      createBufferSource = () => ({
+        buffer: null as unknown,
+        loop: false,
+        onended: null as (() => void) | null,
+        connect: () => {},
+        start: () => {
+          timeline.push('BUFFER_START');
+        },
+        stop: () => {},
+        disconnect: () => {},
+      });
+      createMediaElementSource = () => ({ connect: () => {} });
+      decodeAudioData = async () => {
+        if (!allowDecode) throw new Error('decode failed');
+        return { duration: 3.0, numberOfChannels: 2, sampleRate: 44100 };
+      };
+    }
+
+    class MockHTMLAudio {
+      src = '';
+      loop = false;
+      paused = true;
+      ended = false;
+      currentTime = 0;
+      duration = 3.0;
+      ontimeupdate: (() => void) | null = null;
+      onended: (() => void) | null = null;
+      play = async () => {
+        this.paused = false;
+        timeline.push('ELEMENT_PLAY');
+      };
+      pause = () => {
+        this.paused = true;
+      };
+    }
+
+    (globalThis as Record<string, unknown>).AudioWorkletNode = MockWorkletNode;
+    (globalThis as Record<string, unknown>).AudioContext = MockAudioContext;
+    (globalThis as Record<string, unknown>).Audio = MockHTMLAudio;
+    (globalThis as Record<string, unknown>).window = {
+      AudioContext: MockAudioContext,
+      location: { search: '' },
+    };
+    (globalThis as Record<string, unknown>).URL = {
+      createObjectURL: () => 'blob:mock-audio',
+      revokeObjectURL: () => {},
+    };
+
+    const engine = new AudioEngine();
+    assert.equal(engine.getExcitationProfile(), 'raw');
+
+    // 1. Primary AudioBufferSourceNode path selects 'music' BEFORE BUFFER_START
+    const mp3File = new File([new Uint8Array(64)], 'quiet-song.mp3', { type: 'audio/mpeg' });
+    assert.equal(await engine.loadAudioFile(mp3File), true);
+    assert.equal(engine.getExcitationProfile(), 'music');
+    assert.ok(timeline.indexOf('PROFILE:music') >= 0);
+    assert.ok(timeline.indexOf('PROFILE:music') < timeline.indexOf('BUFFER_START'));
+
+    // 2. Pause, seek, play must NOT alter or reset selected 'music' profile
+    const msgCountBeforeOps = timeline.length;
+    engine.pauseAudioFile();
+    engine.seekAudioFile(1.2);
+    engine.playAudioFile();
+    const opsTimeline = timeline.slice(msgCountBeforeOps);
+    assert.equal(opsTimeline.includes('PROFILE:raw'), false);
+    assert.equal(opsTimeline.includes('PROFILE:music'), false);
+    assert.equal(engine.getExcitationProfile(), 'music');
+
+    // 3. Suspended AudioContext during file load retains 'music' when user later taps Play
+    timeline.length = 0;
+    mockState = 'suspended';
+    allowResume = false;
+    const suspendedEngine = new AudioEngine();
+    assert.equal(await suspendedEngine.loadAudioFile(mp3File), true);
+    assert.equal(suspendedEngine.getExcitationProfile(), 'music');
+    assert.equal(timeline.includes('BUFFER_START'), false, 'Buffer must wait for Play tap while suspended');
+    assert.equal(timeline[timeline.length - 1], 'PROFILE:music');
+
+    allowResume = true;
+    suspendedEngine.playAudioFile();
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(suspendedEngine.getExcitationProfile(), 'music');
+    assert.equal(timeline[timeline.length - 1], 'BUFFER_START');
+
+    // 4. HTMLAudioElement fallback path selects 'music' BEFORE ELEMENT_PLAY
+    timeline.length = 0;
+    mockState = 'running';
+    allowDecode = false;
+    assert.equal(await engine.loadAudioFile(mp3File), true);
+    assert.equal(engine.getExcitationProfile(), 'music');
+    assert.ok(timeline.indexOf('PROFILE:music') >= 0);
+    assert.ok(timeline.indexOf('PROFILE:music') < timeline.indexOf('ELEMENT_PLAY'));
+
+    // 5. Switching back to sine generator restores 'raw' BEFORE OSC_START
+    timeline.length = 0;
+    await engine.startTone(269.82);
+    assert.equal(engine.getExcitationProfile(), 'raw');
+    assert.ok(timeline.indexOf('PROFILE:raw') >= 0);
+    assert.ok(timeline.indexOf('PROFILE:raw') < timeline.indexOf('OSC_START'));
+
+    suspendedEngine.cleanup();
+    engine.cleanup();
+  } finally {
+    (globalThis as Record<string, unknown>).window = prevWindow;
+    (globalThis as Record<string, unknown>).AudioWorkletNode = prevAudioWorkletNode;
+    (globalThis as Record<string, unknown>).AudioContext = prevAudioContext;
+    (globalThis as Record<string, unknown>).Audio = prevAudio;
+    (globalThis as Record<string, unknown>).URL = prevURL;
+  }
+});
+

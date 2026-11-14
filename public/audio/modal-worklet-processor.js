@@ -43,6 +43,20 @@ class ModalWorkletProcessor extends _BaseWorkletProcessor {
     this.sideLength = 0.30;
     this.isSilent = true;
 
+    // Excitation profiles: 'raw' (default, unmodified sine/direct input) | 'music' (bounded RMS normalization)
+    this.excitationProfile = 'raw';
+    this.musicTargetInputRms = 0.006;
+    this.musicMinGain = 1.0;
+    this.musicMaxGain = 16.0;
+    this.musicGateOpenRms = Math.pow(10.0, -78.0 / 20.0);
+    this.musicGateCloseRms = Math.pow(10.0, -84.0 / 20.0);
+    this.musicEnvTimeConstant = 0.05;
+    this.musicGainAttackTimeConstant = 0.05;
+    this.musicGainReleaseTimeConstant = 0.02;
+    this.musicInputMeanSqEnvelope = 0.0;
+    this.musicGateOpen = false;
+    this.musicSmoothedGain = 1.0;
+
     // Build default 146 odd-odd active modes catalogue up to 20,000 Hz
     this.modes = this.generateDefaultActiveModes(20000);
     this.lastQuantumLen = 128;
@@ -209,6 +223,12 @@ class ModalWorkletProcessor extends _BaseWorkletProcessor {
     }
   }
 
+  resetMusicDetectorState() {
+    this.musicInputMeanSqEnvelope = 0.0;
+    this.musicGateOpen = false;
+    this.musicSmoothedGain = this.musicMinGain;
+  }
+
   handleMessage(msg) {
     if (!msg || !msg.type) return;
 
@@ -226,6 +246,11 @@ class ModalWorkletProcessor extends _BaseWorkletProcessor {
           this.initModeArrays();
           this.recomputeCoefficients();
         }
+        break;
+
+      case 'SET_EXCITATION_PROFILE':
+        this.excitationProfile = msg.profile === 'music' ? 'music' : 'raw';
+        this.resetMusicDetectorState();
         break;
 
       case 'RESET_MODES':
@@ -326,19 +351,84 @@ class ModalWorkletProcessor extends _BaseWorkletProcessor {
     const accBlock = this.accBlock;
     const accSqSums = this.accSqSums;
     let localEnergy = 0;
+    let effectiveEnergy = 0;
 
-    if (inputChannel) {
-      for (let s = 0; s < quantumLen; s++) {
-        const rawSample = inputChannel[s];
-        localEnergy += rawSample * rawSample;
-        excBuf[s] = rawSample * 3.0;
+    if (this.excitationProfile === 'music') {
+      const quantumDt = quantumLen > 0 ? quantumLen * this.dt : 0;
+      if (inputChannel && quantumLen > 0) {
+        for (let s = 0; s < quantumLen; s++) {
+          const rawSample = inputChannel[s];
+          if (Number.isFinite(rawSample)) {
+            localEnergy += rawSample * rawSample;
+          }
+        }
+      }
+
+      const blockMeanSq = quantumLen > 0 && Number.isFinite(localEnergy) ? localEnergy / quantumLen : 0;
+      const envAlpha = quantumDt > 0 ? 1.0 - Math.exp(-quantumDt / this.musicEnvTimeConstant) : 1.0;
+      this.musicInputMeanSqEnvelope += envAlpha * (blockMeanSq - this.musicInputMeanSqEnvelope);
+      if (!Number.isFinite(this.musicInputMeanSqEnvelope) || this.musicInputMeanSqEnvelope < 0) {
+        this.musicInputMeanSqEnvelope = 0.0;
+      }
+      const inputRmsEnvelope = Math.sqrt(this.musicInputMeanSqEnvelope);
+
+      if (!this.musicGateOpen && inputRmsEnvelope >= this.musicGateOpenRms) {
+        this.musicGateOpen = true;
+      } else if (this.musicGateOpen && inputRmsEnvelope < this.musicGateCloseRms) {
+        this.musicGateOpen = false;
+      }
+
+      let targetGain = this.musicMinGain;
+      if (this.musicGateOpen && Number.isFinite(inputRmsEnvelope) && inputRmsEnvelope > 0) {
+        const rawTarget = this.musicTargetInputRms / inputRmsEnvelope;
+        if (Number.isFinite(rawTarget)) {
+          targetGain = Math.max(this.musicMinGain, Math.min(this.musicMaxGain, rawTarget));
+        }
+      }
+
+      const gainTau =
+        targetGain > this.musicSmoothedGain
+          ? this.musicGainAttackTimeConstant
+          : this.musicGainReleaseTimeConstant;
+      const gainAlpha = quantumDt > 0 ? 1.0 - Math.exp(-quantumDt / gainTau) : 1.0;
+      this.musicSmoothedGain += gainAlpha * (targetGain - this.musicSmoothedGain);
+      if (!Number.isFinite(this.musicSmoothedGain)) {
+        this.musicSmoothedGain = this.musicMinGain;
+      } else {
+        this.musicSmoothedGain = Math.max(
+          this.musicMinGain,
+          Math.min(this.musicMaxGain, this.musicSmoothedGain)
+        );
+      }
+
+      if (this.musicGateOpen && inputChannel && quantumLen > 0) {
+        const scale = this.musicSmoothedGain * 3.0;
+        for (let s = 0; s < quantumLen; s++) {
+          const rawSample = inputChannel[s];
+          const safeSample = Number.isFinite(rawSample) ? rawSample : 0;
+          const postSample = safeSample * this.musicSmoothedGain;
+          effectiveEnergy += postSample * postSample;
+          excBuf[s] = safeSample * scale;
+        }
+      } else {
+        excBuf.fill(0);
+        effectiveEnergy = 0;
       }
     } else {
-      excBuf.fill(0);
+      if (inputChannel) {
+        for (let s = 0; s < quantumLen; s++) {
+          const rawSample = inputChannel[s];
+          localEnergy += rawSample * rawSample;
+          excBuf[s] = rawSample * 3.0;
+        }
+      } else {
+        excBuf.fill(0);
+      }
+      effectiveEnergy = localEnergy;
     }
     this.sampleFramesProcessed += quantumLen;
 
-    const hasInput = localEnergy > 1e-20;
+    const hasInput = effectiveEnergy > 1e-20;
     let maxAccSq = 0;
 
     if (hasInput) {
@@ -568,7 +658,7 @@ class ModalWorkletProcessor extends _BaseWorkletProcessor {
       lastQ[idx] = qNow;
     }
 
-    this.isSilent = localEnergy < 1e-10;
+    this.isSilent = effectiveEnergy < 1e-10;
     this.samplesSinceLastSnapshot += quantumLen;
 
     if (this.samplesSinceLastSnapshot >= this.exactSnapshotInterval) {

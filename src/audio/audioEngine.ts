@@ -24,6 +24,7 @@ export interface WorkletModeConfig {
 }
 
 export type AudioSourceType = 'generator' | 'file';
+export type ExcitationProfile = 'raw' | 'music';
 
 export interface PlaybackProgress {
   currentTime: number;
@@ -41,6 +42,7 @@ export class AudioEngine {
   private configuredModes: WorkletModeConfig[] | null = null;
 
   private sourceType: AudioSourceType = 'generator';
+  private excitationProfile: ExcitationProfile = 'raw';
 
   // Single sine test tone generator (20 Hz – 20,000 Hz)
   private osc: OscillatorNode | null = null;
@@ -233,6 +235,29 @@ export class AudioEngine {
     }
   }
 
+  /**
+   * Explicitly switches the AudioWorklet excitation profile between 'raw' (sine generator)
+   * and 'music' (bounded RMS normalization for uploaded audio files).
+   */
+  setExcitationProfile(profile: ExcitationProfile): void {
+    this.excitationProfile = profile;
+    const message = { type: 'SET_EXCITATION_PROFILE', profile };
+    if (this.workletNode && this.isWorkletReady) {
+      this.workletNode.port.postMessage(message);
+    } else {
+      const existingIdx = this.pendingWorkletMessages.findIndex((m) => m.type === 'SET_EXCITATION_PROFILE');
+      if (existingIdx >= 0) {
+        this.pendingWorkletMessages[existingIdx] = message;
+      } else {
+        this.pendingWorkletMessages.push(message);
+      }
+    }
+  }
+
+  getExcitationProfile(): ExcitationProfile {
+    return this.excitationProfile;
+  }
+
   getConfiguredModeCount(): number {
     return this.configuredModes ? this.configuredModes.length : 0;
   }
@@ -354,6 +379,7 @@ export class AudioEngine {
 
     this.stopAudioFile();
     this.sourceType = 'generator';
+    this.setExcitationProfile('raw');
     this.currentFrequency = Math.max(20, Math.min(20000, frequency));
 
     if (!this.osc) {
@@ -497,6 +523,7 @@ export class AudioEngine {
       this.stopAudioFile();
       this.audioBuffer = null;
       this.sourceType = 'file';
+      this.setExcitationProfile('music');
       this.currentFileName = file.name;
       this.ensureFileDownmixBus();
 
