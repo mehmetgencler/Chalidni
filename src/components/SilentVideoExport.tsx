@@ -226,6 +226,10 @@ export const SilentVideoExport: React.FC<SilentVideoExportProps> = ({
       data-export-audio-tracks={result ? String(result.audioTrackCount) : ''}
       data-export-bytes={String(progress.bytesWritten)}
       data-capture-fps={result?.captureMetrics ? String(result.captureMetrics.averageFps) : ''}
+      data-capture-target-fps={result?.captureMetrics ? String(result.captureMetrics.finalTargetFps) : ''}
+      data-capture-fallback={result?.captureMetrics ? String(result.captureMetrics.fallbackTriggered) : ''}
+      data-capture-fallback-at-sec={result?.captureMetrics?.fallbackAtSec != null ? String(result.captureMetrics.fallbackAtSec) : ''}
+      data-capture-post-fallback-fps={result?.captureMetrics?.postFallbackAverageFps != null ? String(result.captureMetrics.postFallbackAverageFps) : ''}
       data-capture-frames={result?.captureMetrics ? String(result.captureMetrics.capturedFrames) : ''}
       data-capture-min-rolling-fps={result?.captureMetrics?.minRollingFps != null ? String(result.captureMetrics.minRollingFps) : ''}
       data-capture-max-interval-ms={result?.captureMetrics ? String(result.captureMetrics.maxIntervalMs) : ''}
@@ -255,7 +259,7 @@ export const SilentVideoExport: React.FC<SilentVideoExportProps> = ({
           <div className="flex items-start gap-2 rounded-lg bg-amber-950/35 border border-amber-800/40 px-2.5 py-2 text-[11px] text-amber-200/90">
             <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
             <span>
-              Runs in real time at 480&times;480 (30 fps) directly to browser disk (OPFS) with zero speaker output. Keep this tab active and screen unlocked while exporting.
+              Runs in real time at 480&times;480 (up to 60 fps) directly to browser disk (OPFS) with zero speaker output. Keep this tab active and screen unlocked while exporting.
             </span>
           </div>
 

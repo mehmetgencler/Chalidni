@@ -2,7 +2,8 @@
  * silentVideoExport.ts: Memory-bounded Silent PCM WAV-to-Video Export Controller.
  *
  * - Reads long PCM WAV files via bounded slice streaming (AudioEngine.startSilentWavStream).
- * - Captures ONLY the rendered Chladni PlateCanvas (downscaled to 480x480 at 30 FPS, 0 audio tracks).
+ * - Captures ONLY the rendered Chladni PlateCanvas (downscaled to 480x480 targeting 60 FPS with automatic
+ *   one-way 30 FPS fallback on slower devices, 0 audio tracks).
  * - Selects H.264 MP4 when MediaRecorder.isTypeSupported allows, with matching container/extension fallback.
  * - Streams encoded MediaRecorder timeslice chunks sequentially straight into OPFS via Web Worker.
  * - Never accumulates recording Blobs in JS heap memory.
@@ -50,8 +51,13 @@ export interface SilentVideoExportProgress {
 }
 
 export interface CapturePerformanceMetrics {
+  initialTargetFps: number;
+  finalTargetFps: number;
+  fallbackTriggered: boolean;
+  fallbackAtSec: number | null;
   capturedFrames: number;
   averageFps: number;
+  postFallbackAverageFps: number | null;
   rollingFps: number;
   minRollingFps: number | null;
   lastIntervalMs: number | null;
@@ -84,14 +90,18 @@ export interface SilentVideoExportOptions {
 
 export const EXPORT_WIDTH = 480;
 export const EXPORT_HEIGHT = 480;
-export const EXPORT_FPS = 30;
+export const EXPORT_FPS = 60;
+export const EXPORT_FALLBACK_FPS = 30;
+export const FALLBACK_TRIGGER_FPS = 50;
+export const FALLBACK_WINDOW_MS = 2000;
+export const FALLBACK_CONSECUTIVE_WINDOWS = 2;
 export const MIN_HEALTHY_CAPTURE_FPS = 25;
 export const EXPORT_VIDEO_BITRATE_BPS = 350_000;
 export const EXPORT_TIMESLICE_MS = 2000;
 
 /**
- * Timestamp-paced capture scheduler aiming for targetFps without drift or double-capture
- * on 60 Hz / 120 Hz requestAnimationFrame displays.
+ * Timestamp-paced capture scheduler aiming for targetFps without drift, double-capture,
+ * or post-stall catch-up bursts on 60 Hz / 120 Hz requestAnimationFrame displays.
  */
 export function advanceCaptureDeadline(
   nowMs: number,
@@ -99,41 +109,67 @@ export function advanceCaptureDeadline(
   targetFps: number = EXPORT_FPS
 ): { shouldCapture: boolean; nextDeadlineMs: number } {
   const intervalMs = 1000 / Math.max(1, targetFps);
-  if (nowMs + 2.0 < nextDeadlineMs) {
+  // Up to 4 ms phase-jitter tolerance is safe on 60 Hz and strictly < 8.33 ms half-period of 120 Hz
+  const toleranceMs = Math.min(4.0, intervalMs * 0.25);
+  if (nowMs + toleranceMs < nextDeadlineMs) {
     return { shouldCapture: false, nextDeadlineMs };
   }
-  let next = nextDeadlineMs + intervalMs;
-  if (next < nowMs - intervalMs) {
-    next = nowMs + intervalMs;
+  const stepsAhead = Math.max(1, Math.floor((nowMs - nextDeadlineMs) / intervalMs) + 1);
+  let next = nextDeadlineMs + stepsAhead * intervalMs;
+  if (next < nowMs + intervalMs * 0.25) {
+    next += intervalMs;
   }
   return { shouldCapture: true, nextDeadlineMs: next };
 }
 
 export interface CapturePerformanceMonitorOptions {
+  initialTargetFps?: number;
+  fallbackFps?: number;
+  fallbackTriggerFps?: number;
+  fallbackWindowMs?: number;
+  requiredSlowWindows?: number;
   minHealthyFps?: number;
   windowSize?: number;
   minSamplesBeforeWindowWarn?: number;
   warningCooldownMs?: number;
   onWarning?: (message: string, metrics: CapturePerformanceMetrics) => void;
+  onFallback?: (newTargetFps: number, metrics: CapturePerformanceMetrics) => void;
 }
 
 /**
  * Tracks actual inter-frame capture intervals during silent video export in O(1) per frame
- * without per-frame heap allocations, logging a rate-limited warning if capture cadence drops
- * below MIN_HEALTHY_CAPTURE_FPS (25 FPS).
+ * without per-frame heap allocations:
+ * - Triggers automatic one-way fallback from 60 FPS to 30 FPS when sustained capture FPS falls
+ *   below 50 FPS across two consecutive 2-second measurement windows.
+ * - Logs a rate-limited warning if capture cadence drops below 25 FPS.
  */
 export class CapturePerformanceMonitor {
+  private readonly initialTargetFps: number;
+  private readonly fallbackFps: number;
+  private readonly fallbackTriggerFps: number;
+  private readonly fallbackWindowMs: number;
+  private readonly requiredSlowWindows: number;
   private readonly minHealthyFps: number;
   private readonly maxHealthyIntervalMs: number;
   private readonly windowBuffer: Float64Array;
   private readonly minSamplesBeforeWindowWarn: number;
   private readonly warningCooldownMs: number;
   private readonly onWarning: (message: string, metrics: CapturePerformanceMetrics) => void;
+  private readonly onFallback?: (newTargetFps: number, metrics: CapturePerformanceMetrics) => void;
 
+  private activeTargetFps: number;
+  private fallbackTriggered = false;
+  private fallbackAtSec: number | null = null;
+  private firstCaptureTimeMs: number | null = null;
   private lastCaptureTimeMs: number | null = null;
   private capturedFrames = 0;
   private totalIntervals = 0;
   private totalIntervalMs = 0;
+  private postFallbackIntervals = 0;
+  private postFallbackIntervalMs = 0;
+  private evalWindowStartMs: number | null = null;
+  private evalWindowFrames = 0;
+  private consecutiveSlowWindows = 0;
   private windowCount = 0;
   private windowIndex = 0;
   private windowSumMs = 0;
@@ -144,6 +180,12 @@ export class CapturePerformanceMonitor {
   private lastWarningTimeMs = -Infinity;
 
   constructor(options: CapturePerformanceMonitorOptions = {}) {
+    this.initialTargetFps = Math.max(1, options.initialTargetFps ?? EXPORT_FPS);
+    this.fallbackFps = Math.max(1, options.fallbackFps ?? EXPORT_FALLBACK_FPS);
+    this.activeTargetFps = this.initialTargetFps;
+    this.fallbackTriggerFps = Math.max(1, options.fallbackTriggerFps ?? FALLBACK_TRIGGER_FPS);
+    this.fallbackWindowMs = Math.max(200, options.fallbackWindowMs ?? FALLBACK_WINDOW_MS);
+    this.requiredSlowWindows = Math.max(1, Math.floor(options.requiredSlowWindows ?? FALLBACK_CONSECUTIVE_WINDOWS));
     this.minHealthyFps = Math.max(1, options.minHealthyFps ?? MIN_HEALTHY_CAPTURE_FPS);
     this.maxHealthyIntervalMs = 1000 / this.minHealthyFps;
     const windowSize = Math.max(2, Math.floor(options.windowSize ?? 15));
@@ -155,13 +197,21 @@ export class CapturePerformanceMonitor {
       ((msg) => {
         console.warn(msg);
       });
+    this.onFallback = options.onFallback;
+  }
+
+  getTargetFps(): number {
+    return this.activeTargetFps;
   }
 
   recordCapture(timestampMs: number): CapturePerformanceMetrics {
     this.capturedFrames++;
 
     if (this.lastCaptureTimeMs === null) {
+      this.firstCaptureTimeMs = timestampMs;
       this.lastCaptureTimeMs = timestampMs;
+      this.evalWindowStartMs = timestampMs;
+      this.evalWindowFrames = 0;
       return this.getMetrics();
     }
 
@@ -174,9 +224,46 @@ export class CapturePerformanceMonitor {
 
     this.totalIntervals++;
     this.totalIntervalMs += intervalMs;
+    if (this.fallbackTriggered) {
+      this.postFallbackIntervals++;
+      this.postFallbackIntervalMs += intervalMs;
+    }
     this.lastIntervalMs = intervalMs;
     if (intervalMs > this.maxIntervalMs) {
       this.maxIntervalMs = intervalMs;
+    }
+
+    // Track 2-second sustained capture windows for one-way 60 -> 30 FPS fallback
+    if (!this.fallbackTriggered && this.evalWindowStartMs !== null) {
+      this.evalWindowFrames++;
+      const elapsedEvalMs = timestampMs - this.evalWindowStartMs;
+      if (elapsedEvalMs >= this.fallbackWindowMs) {
+        const windowFps = (this.evalWindowFrames * 1000) / elapsedEvalMs;
+        if (windowFps < this.fallbackTriggerFps) {
+          this.consecutiveSlowWindows++;
+        } else {
+          this.consecutiveSlowWindows = 0;
+        }
+        this.evalWindowStartMs = timestampMs;
+        this.evalWindowFrames = 0;
+
+        if (this.consecutiveSlowWindows >= this.requiredSlowWindows && this.activeTargetFps > this.fallbackFps) {
+          this.fallbackTriggered = true;
+          this.activeTargetFps = this.fallbackFps;
+          this.fallbackAtSec =
+            this.firstCaptureTimeMs !== null
+              ? Number(((timestampMs - this.firstCaptureTimeMs) / 1000).toFixed(2))
+              : null;
+          const fbMetrics = this.getMetrics();
+          if (this.onFallback) {
+            this.onFallback(this.activeTargetFps, fbMetrics);
+          } else {
+            console.warn(
+              `[SilentVideoExport] Sustained capture below ${this.fallbackTriggerFps} FPS for ${this.requiredSlowWindows} consecutive ${(this.fallbackWindowMs / 1000).toFixed(0)}s windows (latest ${windowFps.toFixed(1)} FPS); switching one-way to ${this.fallbackFps} FPS fallback.`
+            );
+          }
+        }
+      }
     }
 
     const len = this.windowBuffer.length;
@@ -191,7 +278,7 @@ export class CapturePerformanceMonitor {
     }
     this.windowIndex = (this.windowIndex + 1) % len;
 
-    const rollingFps = this.windowSumMs > 0 ? (this.windowCount * 1000) / this.windowSumMs : EXPORT_FPS;
+    const rollingFps = this.windowSumMs > 0 ? (this.windowCount * 1000) / this.windowSumMs : this.activeTargetFps;
     if (this.windowCount >= this.minSamplesBeforeWindowWarn) {
       if (this.minRollingFps === null || rollingFps < this.minRollingFps) {
         this.minRollingFps = rollingFps;
@@ -222,12 +309,21 @@ export class CapturePerformanceMonitor {
       this.totalIntervals > 0 && this.totalIntervalMs > 0
         ? (this.totalIntervals * 1000) / this.totalIntervalMs
         : 0;
+    const postFallbackAverageFps =
+      this.postFallbackIntervals > 0 && this.postFallbackIntervalMs > 0
+        ? Number(((this.postFallbackIntervals * 1000) / this.postFallbackIntervalMs).toFixed(2))
+        : null;
     const rollingFps =
       this.windowCount > 0 && this.windowSumMs > 0 ? (this.windowCount * 1000) / this.windowSumMs : 0;
 
     return {
+      initialTargetFps: this.initialTargetFps,
+      finalTargetFps: this.activeTargetFps,
+      fallbackTriggered: this.fallbackTriggered,
+      fallbackAtSec: this.fallbackAtSec,
       capturedFrames: this.capturedFrames,
       averageFps: Number(averageFps.toFixed(2)),
+      postFallbackAverageFps,
       rollingFps: Number(rollingFps.toFixed(2)),
       minRollingFps: this.minRollingFps !== null ? Number(this.minRollingFps.toFixed(2)) : null,
       lastIntervalMs: this.lastIntervalMs !== null ? Number(this.lastIntervalMs.toFixed(2)) : null,
@@ -645,7 +741,7 @@ export function startSilentVideoExport(options: SilentVideoExportOptions): Activ
         document.addEventListener('visibilitychange', visibilityListener);
       }
 
-      // Prepare 480x480 offscreen canvas copying from PlateCanvas at 30 FPS
+      // Prepare 480x480 offscreen canvas copying from PlateCanvas (60 FPS initial target, one-way 30 FPS fallback)
       exportCanvas = document.createElement('canvas');
       exportCanvas.width = EXPORT_WIDTH;
       exportCanvas.height = EXPORT_HEIGHT;
@@ -653,6 +749,8 @@ export function startSilentVideoExport(options: SilentVideoExportOptions): Activ
       if (!exportCtx) {
         throw new Error('Could not acquire 2D context for 480x480 video export canvas.');
       }
+      exportCtx.imageSmoothingEnabled = true;
+      exportCtx.imageSmoothingQuality = 'low';
 
       // Prefer manual requestFrame() capture (captureStream(0)) when supported so every copied frame
       // is explicitly emitted to MediaRecorder; fall back to timed captureStream(EXPORT_FPS) otherwise.
@@ -680,6 +778,11 @@ export function startSilentVideoExport(options: SilentVideoExportOptions): Activ
       }
 
       const captureMonitor = new CapturePerformanceMonitor({
+        initialTargetFps: EXPORT_FPS,
+        fallbackFps: EXPORT_FALLBACK_FPS,
+        fallbackTriggerFps: FALLBACK_TRIGGER_FPS,
+        fallbackWindowMs: FALLBACK_WINDOW_MS,
+        requiredSlowWindows: FALLBACK_CONSECUTIVE_WINDOWS,
         minHealthyFps: MIN_HEALTHY_CAPTURE_FPS,
       });
 
@@ -772,16 +875,17 @@ export function startSilentVideoExport(options: SilentVideoExportOptions): Activ
             },
             onStreamStart: () => {
               if (cancelled || settled) return;
-              // Begin MediaRecorder, push initial reset frame, and run vsync-paced 30 FPS capture
+              // Begin MediaRecorder, push initial reset frame, and run vsync-paced capture (60 FPS -> 30 FPS fallback)
               localRecorder.start(EXPORT_TIMESLICE_MS);
               drawFrameFromPlateCanvas();
-              let nextDeadlineMs = performance.now() + 1000 / EXPORT_FPS;
+              let nextDeadlineMs = performance.now() + 1000 / captureMonitor.getTargetFps();
               const captureTick = (nowMs: number) => {
                 if (cancelled || settled) {
                   captureRafId = null;
                   return;
                 }
-                const step = advanceCaptureDeadline(nowMs, nextDeadlineMs, EXPORT_FPS);
+                const targetFps = captureMonitor.getTargetFps();
+                const step = advanceCaptureDeadline(nowMs, nextDeadlineMs, targetFps);
                 nextDeadlineMs = step.nextDeadlineMs;
                 if (step.shouldCapture) {
                   drawFrameFromPlateCanvas();

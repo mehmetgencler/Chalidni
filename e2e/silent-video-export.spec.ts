@@ -99,12 +99,12 @@ test.describe('Memory-Bounded Silent WAV-to-Video Export E2E', () => {
         durationSec: 15.0,
       })
     );
-    // 11 seconds at exact (1,3)+(3,1) resonance 269.815 Hz for deterministic particle migration & frame-diff proof
+    // 12 seconds at exact (1,3)+(3,1) resonance 269.815 Hz for deterministic particle migration, 60->30 fallback & >=5s post-fallback measurement
     fs.writeFileSync(
       wav11sResonancePath,
       buildResonanceStereoWav({
         sampleRate: 22050,
-        durationSec: 11.0,
+        durationSec: 12.0,
         frequencyHz: 269.815,
         amplitude: 0.85,
       })
@@ -536,7 +536,7 @@ test.describe('Memory-Bounded Silent WAV-to-Video Export E2E', () => {
       const uniqueMediaTimes: number[] = [];
       let rvfcCallbackCount = 0;
       let duplicateMediaTimeCallbacks = 0;
-      await seekTo(0.5);
+      await seekTo(4.5);
       vid.playbackRate = 1.0;
 
       let finishedSampling = false;
@@ -579,8 +579,11 @@ test.describe('Memory-Bounded Silent WAV-to-Video Export E2E', () => {
           : 0;
 
       const intervalsMs: number[] = [];
+      let burstIntervalsBelow10Ms = 0;
       for (let i = 1; i < uniqueMediaTimes.length; i++) {
-        intervalsMs.push((uniqueMediaTimes[i] - uniqueMediaTimes[i - 1]) * 1000);
+        const dtMs = (uniqueMediaTimes[i] - uniqueMediaTimes[i - 1]) * 1000;
+        intervalsMs.push(dtMs);
+        if (dtMs < 10) burstIntervalsBelow10Ms++;
       }
       const sortedIntervals = [...intervalsMs].sort((a, b) => a - b);
       const percentile = (sorted: number[], p: number): number => {
@@ -588,6 +591,7 @@ test.describe('Memory-Bounded Silent WAV-to-Video Export E2E', () => {
         const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil(p * sorted.length) - 1));
         return Number(sorted[idx].toFixed(2));
       };
+      const minIntervalMs = sortedIntervals.length > 0 ? Number(sortedIntervals[0].toFixed(2)) : 0;
       const medianIntervalMs =
         sortedIntervals.length === 0
           ? 0
@@ -606,6 +610,7 @@ test.describe('Memory-Bounded Silent WAV-to-Video Export E2E', () => {
 
       const width = vid.videoWidth;
       const height = vid.videoHeight;
+      const vidDurationSec = Number.isFinite(vid.duration) ? Number(vid.duration.toFixed(3)) : null;
       URL.revokeObjectURL(url);
 
       return {
@@ -613,13 +618,16 @@ test.describe('Memory-Bounded Silent WAV-to-Video Export E2E', () => {
         sizeBytes: target.file.size,
         width,
         height,
+        vidDurationSec,
         seekWorked,
         actualTimes,
         presentedFrames,
         rvfcCallbackCount,
         duplicateMediaTimeCallbacks,
+        burstIntervalsBelow10Ms,
         mediaTimeSpanSec,
         decodedFps,
+        minIntervalMs,
         medianIntervalMs,
         p95IntervalMs,
         maxIntervalMs,
@@ -631,10 +639,15 @@ test.describe('Memory-Bounded Silent WAV-to-Video Export E2E', () => {
 
     const captureLoopMetrics = {
       captureFps: Number((await exportDetails.getAttribute('data-capture-fps')) || '0'),
+      finalTargetFps: Number((await exportDetails.getAttribute('data-capture-target-fps')) || '0'),
+      fallbackTriggered: (await exportDetails.getAttribute('data-capture-fallback')) === 'true',
+      fallbackAtSec: await exportDetails.getAttribute('data-capture-fallback-at-sec'),
+      postFallbackFps: await exportDetails.getAttribute('data-capture-post-fallback-fps'),
       capturedFrames: Number((await exportDetails.getAttribute('data-capture-frames')) || '0'),
       minRollingFps: await exportDetails.getAttribute('data-capture-min-rolling-fps'),
       maxCaptureIntervalMs: Number((await exportDetails.getAttribute('data-capture-max-interval-ms')) || '0'),
       warningCount: Number((await exportDetails.getAttribute('data-capture-warnings')) || '0'),
+      audioTracks: await exportDetails.getAttribute('data-export-audio-tracks'),
     };
 
     console.log(
@@ -642,8 +655,14 @@ test.describe('Memory-Bounded Silent WAV-to-Video Export E2E', () => {
       JSON.stringify({ liveEarly, liveLate, liveCanvasDiff, captureLoopMetrics, decodedDiff })
     );
 
+    expect(captureLoopMetrics.audioTracks).toBe('0');
     expect(decodedDiff.width).toBe(480);
     expect(decodedDiff.height).toBe(480);
+    if (decodedDiff.vidDurationSec !== null) {
+      expect(Math.abs(decodedDiff.vidDurationSec - 12.0)).toBeLessThanOrEqual(1.2);
+    }
+    expect(decodedDiff.duplicateMediaTimeCallbacks).toBe(0);
+    expect(decodedDiff.burstIntervalsBelow10Ms).toBe(0);
     expect(decodedDiff.mediaTimeSpanSec).toBeGreaterThanOrEqual(5.0);
     expect(decodedDiff.decodedFps).toBeGreaterThanOrEqual(25);
     expect(decodedDiff.earlyVsMid.changedPixels).toBeGreaterThan(2000);

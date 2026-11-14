@@ -46,8 +46,12 @@ import {
   buildExportDownloadFileName,
   CapturePerformanceMonitor,
   estimateExportSizeBytes,
+  EXPORT_FALLBACK_FPS,
   EXPORT_FPS,
   EXPORT_VIDEO_BITRATE_BPS,
+  FALLBACK_CONSECUTIVE_WINDOWS,
+  FALLBACK_TRIGGER_FPS,
+  FALLBACK_WINDOW_MS,
   MIN_HEALTHY_CAPTURE_FPS,
   selectSupportedVideoCodec,
 } from '../video/silentVideoExport.ts';
@@ -3024,31 +3028,51 @@ test('34. Particle colors are randomly shuffled in exact 1/3 green, 1/3 blue, 1/
   assert.equal(totalAfter.red, 1020);
 });
 
-test('35. Silent video export targets 30 FPS and advanceCaptureDeadline locks 60 Hz & 120 Hz RAF ticks cleanly to 30 fps', () => {
-  assert.equal(EXPORT_FPS, 30);
-  assert.ok(EXPORT_VIDEO_BITRATE_BPS >= 300_000 && EXPORT_VIDEO_BITRATE_BPS <= 500_000);
+test('35. Silent video export targets 60 FPS, locks 60/120 Hz RAF cleanly without catch-up bursts, and paces 30 FPS fallback', () => {
+  assert.equal(EXPORT_FPS, 60);
+  assert.equal(EXPORT_FALLBACK_FPS, 30);
+  assert.equal(EXPORT_VIDEO_BITRATE_BPS, 350_000);
 
-  // Simulate 1.0 second of 60 Hz RAF ticks (every 16.6667 ms) -> exactly 30 captured frames
-  let captured60 = 0;
+  // 1. 60 Hz RAF ticks (even with +/-2.5 ms jitter) capture 60 frames/sec cleanly
+  let captured60Hz = 0;
   let deadline60 = 1000 / EXPORT_FPS;
   for (let tick = 1; tick <= 60; tick++) {
-    const nowMs = tick * (1000 / 60);
+    const jitter = tick % 2 === 0 ? 2.5 : -2.5;
+    const nowMs = tick * (1000 / 60) + jitter;
     const step = advanceCaptureDeadline(nowMs, deadline60, EXPORT_FPS);
     deadline60 = step.nextDeadlineMs;
-    if (step.shouldCapture) captured60++;
+    if (step.shouldCapture) captured60Hz++;
   }
-  assert.equal(captured60, 30);
+  assert.equal(captured60Hz, 60);
 
-  // Simulate 1.0 second of 120 Hz iPhone ProMotion RAF ticks (every 8.3333 ms) -> exactly 30 captured frames
-  let captured120 = 0;
+  // 2. 120 Hz ProMotion RAF ticks (8.333 ms) still lock cleanly to 60 FPS (not 120 FPS)
+  let captured120Hz = 0;
   let deadline120 = 1000 / EXPORT_FPS;
   for (let tick = 1; tick <= 120; tick++) {
     const nowMs = tick * (1000 / 120);
     const step = advanceCaptureDeadline(nowMs, deadline120, EXPORT_FPS);
     deadline120 = step.nextDeadlineMs;
-    if (step.shouldCapture) captured120++;
+    if (step.shouldCapture) captured120Hz++;
   }
-  assert.equal(captured120, 30);
+  assert.equal(captured120Hz, 60);
+
+  // 3. Fallback 30 FPS mode locks 60 Hz and 120 Hz cleanly to 30 frames/sec
+  let fallback60Hz = 0;
+  let deadlineFb = 1000 / EXPORT_FALLBACK_FPS;
+  for (let tick = 1; tick <= 60; tick++) {
+    const nowMs = tick * (1000 / 60);
+    const step = advanceCaptureDeadline(nowMs, deadlineFb, EXPORT_FALLBACK_FPS);
+    deadlineFb = step.nextDeadlineMs;
+    if (step.shouldCapture) fallback60Hz++;
+  }
+  assert.equal(fallback60Hz, 30);
+
+  // 4. After a 63 ms stall, next capture captures once and never triggers a back-to-back burst 8 ms later
+  const stallStep = advanceCaptureDeadline(63.0, 16.67, EXPORT_FPS);
+  assert.equal(stallStep.shouldCapture, true);
+  assert.ok(stallStep.nextDeadlineMs >= 63.0 + (1000 / 60) * 0.5);
+  const immediateNext = advanceCaptureDeadline(71.3, stallStep.nextDeadlineMs, EXPORT_FPS);
+  assert.equal(immediateNext.shouldCapture, false);
 });
 
 test('36. CapturePerformanceMonitor tracks capture intervals, tolerates steady 30 FPS jitter, and warns below 25 FPS', () => {
@@ -3056,6 +3080,7 @@ test('36. CapturePerformanceMonitor tracks capture intervals, tolerates steady 3
 
   const warnings: string[] = [];
   const monitor = new CapturePerformanceMonitor({
+    initialTargetFps: 30,
     minHealthyFps: 25,
     windowSize: 10,
     minSamplesBeforeWindowWarn: 5,
@@ -3094,5 +3119,68 @@ test('36. CapturePerformanceMonitor tracks capture intervals, tolerates steady 3
   const stalled = monitor.getMetrics();
   assert.equal(stalled.warningCount, 2);
   assert.equal(stalled.maxIntervalMs, 1200);
+});
+
+test('37. CapturePerformanceMonitor keeps 60 FPS across transient 2s dip and triggers one-way 30 FPS fallback after two consecutive <50 FPS 2s windows', () => {
+  assert.equal(FALLBACK_TRIGGER_FPS, 50);
+  assert.equal(FALLBACK_WINDOW_MS, 2000);
+  assert.equal(FALLBACK_CONSECUTIVE_WINDOWS, 2);
+
+  const fallbackEvents: number[] = [];
+  const monitor = new CapturePerformanceMonitor({
+    initialTargetFps: EXPORT_FPS,
+    fallbackFps: EXPORT_FALLBACK_FPS,
+    fallbackTriggerFps: FALLBACK_TRIGGER_FPS,
+    fallbackWindowMs: FALLBACK_WINDOW_MS,
+    requiredSlowWindows: FALLBACK_CONSECUTIVE_WINDOWS,
+    onWarning: () => {},
+    onFallback: (fps) => fallbackEvents.push(fps),
+  });
+
+  let t = 0;
+  monitor.recordCapture(t);
+
+  // Window 1 (2.1s @ ~40 FPS -> 25 ms intervals): only ONE slow window -> still 60 FPS
+  for (let i = 0; i < 84; i++) {
+    t += 25;
+    monitor.recordCapture(t);
+  }
+  assert.equal(monitor.getTargetFps(), 60);
+  assert.equal(fallbackEvents.length, 0);
+
+  // Window 2 recovers cleanly (2.0s @ 60 FPS -> 16.67 ms intervals): resets slow-window counter!
+  for (let i = 0; i < 121; i++) {
+    t += 1000 / 60;
+    monitor.recordCapture(t);
+  }
+  assert.equal(monitor.getTargetFps(), 60);
+  assert.equal(fallbackEvents.length, 0);
+
+  // Window 3 & Window 4: TWO consecutive 2s windows @ ~40 FPS (25 ms intervals) -> one-way fallback to 30 FPS!
+  for (let i = 0; i < 170; i++) {
+    t += 25;
+    monitor.recordCapture(t);
+  }
+  assert.equal(monitor.getTargetFps(), 30);
+  assert.equal(fallbackEvents.length, 1);
+  assert.equal(fallbackEvents[0], 30);
+
+  // Subsequent frames run at 30 FPS (and even fast 16.67 ms ticks must NEVER revert one-way fallback back to 60 FPS)
+  for (let i = 0; i < 90; i++) {
+    t += 1000 / 30;
+    monitor.recordCapture(t);
+  }
+  for (let i = 0; i < 130; i++) {
+    t += 1000 / 60;
+    monitor.recordCapture(t);
+  }
+  const metrics = monitor.getMetrics();
+  assert.equal(monitor.getTargetFps(), 30);
+  assert.equal(metrics.initialTargetFps, 60);
+  assert.equal(metrics.finalTargetFps, 30);
+  assert.equal(metrics.fallbackTriggered, true);
+  assert.ok(metrics.fallbackAtSec !== null && metrics.fallbackAtSec > 7.0);
+  assert.ok(metrics.postFallbackAverageFps !== null && metrics.postFallbackAverageFps > 35);
+  assert.equal(fallbackEvents.length, 1);
 });
 
