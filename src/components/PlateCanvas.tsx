@@ -20,6 +20,7 @@ interface PlateCanvasProps {
   particles: Particle[];
   sideLength: number; // m
   canvasRefExternal?: React.RefObject<HTMLCanvasElement | null>;
+  particlesRefExternal?: React.RefObject<Particle[]>;
 }
 
 const GRAIN_COLOR_TIERS: Record<ParticleColor, { body: string; spec: string }[]> = {
@@ -59,11 +60,13 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
   particles,
   sideLength,
   canvasRefExternal,
+  particlesRefExternal,
 }) => {
   const internalCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const canvasRef = canvasRefExternal ?? internalCanvasRef;
-  const particlesRef = useRef<Particle[]>(particles);
-  particlesRef.current = particles;
+  const internalParticlesRef = useRef<Particle[]>(particles);
+  internalParticlesRef.current = particles;
+  const particlesRef = particlesRefExternal ?? internalParticlesRef;
 
   // Pre-rendered grain sprite tiers grouped by color ('green' | 'blue' | 'red')
   const spritesRef = useRef<Record<ParticleColor, HTMLCanvasElement[]> | null>(null);
@@ -249,7 +252,7 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
 
     animId = requestAnimationFrame(render);
     return () => cancelAnimationFrame(animId);
-  }, [sideLength, canvasRef]);
+  }, [sideLength, canvasRef, particlesRef]);
 
   return (
     <div className="w-full flex items-center justify-center p-2">

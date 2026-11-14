@@ -59,6 +59,9 @@ export function App() {
     );
   }, [sideLength]);
 
+  // Stable live reference so PlateCanvas always renders particleSystem.particles even across resets without React re-renders
+  const liveParticlesRef = useRef(particleSystem.particles);
+
   // Single authoritative sample-frame clock accumulator
   const simClock = useMemo(() => new SimulationClockAccumulator(), []);
   const DT_PARTICLE = 0.016; // 16 ms fixed physical transport step
@@ -142,6 +145,7 @@ export function App() {
     modalBank.reset();
     simClock.reset();
     particleSystem.initParticles();
+    liveParticlesRef.current = particleSystem.particles;
   };
 
   return (
@@ -173,6 +177,7 @@ export function App() {
             particles={particleSystem.particles}
             sideLength={sideLength}
             canvasRefExternal={canvasRef}
+            particlesRefExternal={liveParticlesRef}
           />
         </section>
 

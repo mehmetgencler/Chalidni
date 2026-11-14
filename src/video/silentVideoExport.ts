@@ -494,13 +494,44 @@ export function startSilentVideoExport(options: SilentVideoExportOptions): Activ
         throw new Error('Could not acquire 2D context for 480x480 video export canvas.');
       }
 
+      // Prefer manual requestFrame() capture (captureStream(0)) when supported so every copied frame
+      // is explicitly emitted to MediaRecorder; fall back to timed captureStream(EXPORT_FPS) otherwise.
+      let manualTrack: (MediaStreamTrack & { requestFrame?: () => void }) | null = null;
+      const manualCandidate = exportCanvas.captureStream(0);
+      const candidateTrack = manualCandidate.getVideoTracks()[0] as
+        | (MediaStreamTrack & { requestFrame?: () => void })
+        | undefined;
+      if (
+        candidateTrack &&
+        typeof candidateTrack.requestFrame === 'function' &&
+        manualCandidate.getAudioTracks().length === 0
+      ) {
+        captureStream = manualCandidate;
+        manualTrack = candidateTrack;
+      } else {
+        for (const t of manualCandidate.getTracks()) {
+          try {
+            t.stop();
+          } catch {
+            // ignore
+          }
+        }
+        captureStream = exportCanvas.captureStream(EXPORT_FPS);
+      }
+
       const drawFrameFromPlateCanvas = () => {
         if (!exportCtx || !exportCanvas || sourceCanvas.width <= 0 || sourceCanvas.height <= 0) return;
         exportCtx.drawImage(sourceCanvas, 0, 0, EXPORT_WIDTH, EXPORT_HEIGHT);
+        if (manualTrack && typeof manualTrack.requestFrame === 'function') {
+          try {
+            manualTrack.requestFrame();
+          } catch {
+            // ignore if track already stopped
+          }
+        }
       };
 
-      // Initialize capture stream strictly from canvas with zero audio tracks
-      captureStream = exportCanvas.captureStream(EXPORT_FPS);
+      // Verify stream strictly contains video track and zero audio tracks
       const videoTrackCount = captureStream.getVideoTracks().length;
       const audioTrackCount = captureStream.getAudioTracks().length;
       if (videoTrackCount === 0 || audioTrackCount !== 0) {
