@@ -49,6 +49,16 @@ export interface SilentVideoExportProgress {
   message: string;
 }
 
+export interface CapturePerformanceMetrics {
+  capturedFrames: number;
+  averageFps: number;
+  rollingFps: number;
+  minRollingFps: number | null;
+  lastIntervalMs: number | null;
+  maxIntervalMs: number;
+  warningCount: number;
+}
+
 export interface SilentVideoExportResult {
   file: File;
   downloadFileName: string;
@@ -61,6 +71,7 @@ export interface SilentVideoExportResult {
   videoTrackCount: number;
   audioTrackCount: number;
   chunksWritten: number;
+  captureMetrics?: CapturePerformanceMetrics;
 }
 
 export interface SilentVideoExportOptions {
@@ -74,6 +85,7 @@ export interface SilentVideoExportOptions {
 export const EXPORT_WIDTH = 480;
 export const EXPORT_HEIGHT = 480;
 export const EXPORT_FPS = 30;
+export const MIN_HEALTHY_CAPTURE_FPS = 25;
 export const EXPORT_VIDEO_BITRATE_BPS = 350_000;
 export const EXPORT_TIMESLICE_MS = 2000;
 
@@ -95,6 +107,134 @@ export function advanceCaptureDeadline(
     next = nowMs + intervalMs;
   }
   return { shouldCapture: true, nextDeadlineMs: next };
+}
+
+export interface CapturePerformanceMonitorOptions {
+  minHealthyFps?: number;
+  windowSize?: number;
+  minSamplesBeforeWindowWarn?: number;
+  warningCooldownMs?: number;
+  onWarning?: (message: string, metrics: CapturePerformanceMetrics) => void;
+}
+
+/**
+ * Tracks actual inter-frame capture intervals during silent video export in O(1) per frame
+ * without per-frame heap allocations, logging a rate-limited warning if capture cadence drops
+ * below MIN_HEALTHY_CAPTURE_FPS (25 FPS).
+ */
+export class CapturePerformanceMonitor {
+  private readonly minHealthyFps: number;
+  private readonly maxHealthyIntervalMs: number;
+  private readonly windowBuffer: Float64Array;
+  private readonly minSamplesBeforeWindowWarn: number;
+  private readonly warningCooldownMs: number;
+  private readonly onWarning: (message: string, metrics: CapturePerformanceMetrics) => void;
+
+  private lastCaptureTimeMs: number | null = null;
+  private capturedFrames = 0;
+  private totalIntervals = 0;
+  private totalIntervalMs = 0;
+  private windowCount = 0;
+  private windowIndex = 0;
+  private windowSumMs = 0;
+  private lastIntervalMs: number | null = null;
+  private maxIntervalMs = 0;
+  private minRollingFps: number | null = null;
+  private warningCount = 0;
+  private lastWarningTimeMs = -Infinity;
+
+  constructor(options: CapturePerformanceMonitorOptions = {}) {
+    this.minHealthyFps = Math.max(1, options.minHealthyFps ?? MIN_HEALTHY_CAPTURE_FPS);
+    this.maxHealthyIntervalMs = 1000 / this.minHealthyFps;
+    const windowSize = Math.max(2, Math.floor(options.windowSize ?? 15));
+    this.windowBuffer = new Float64Array(windowSize);
+    this.minSamplesBeforeWindowWarn = Math.max(2, Math.floor(options.minSamplesBeforeWindowWarn ?? 5));
+    this.warningCooldownMs = Math.max(0, options.warningCooldownMs ?? 2000);
+    this.onWarning =
+      options.onWarning ??
+      ((msg) => {
+        console.warn(msg);
+      });
+  }
+
+  recordCapture(timestampMs: number): CapturePerformanceMetrics {
+    this.capturedFrames++;
+
+    if (this.lastCaptureTimeMs === null) {
+      this.lastCaptureTimeMs = timestampMs;
+      return this.getMetrics();
+    }
+
+    const intervalMs = timestampMs - this.lastCaptureTimeMs;
+    this.lastCaptureTimeMs = timestampMs;
+
+    if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+      return this.getMetrics();
+    }
+
+    this.totalIntervals++;
+    this.totalIntervalMs += intervalMs;
+    this.lastIntervalMs = intervalMs;
+    if (intervalMs > this.maxIntervalMs) {
+      this.maxIntervalMs = intervalMs;
+    }
+
+    const len = this.windowBuffer.length;
+    if (this.windowCount < len) {
+      this.windowBuffer[this.windowIndex] = intervalMs;
+      this.windowSumMs += intervalMs;
+      this.windowCount++;
+    } else {
+      this.windowSumMs -= this.windowBuffer[this.windowIndex];
+      this.windowBuffer[this.windowIndex] = intervalMs;
+      this.windowSumMs += intervalMs;
+    }
+    this.windowIndex = (this.windowIndex + 1) % len;
+
+    const rollingFps = this.windowSumMs > 0 ? (this.windowCount * 1000) / this.windowSumMs : EXPORT_FPS;
+    if (this.windowCount >= this.minSamplesBeforeWindowWarn) {
+      if (this.minRollingFps === null || rollingFps < this.minRollingFps) {
+        this.minRollingFps = rollingFps;
+      }
+    }
+
+    const windowDropped =
+      this.windowCount >= this.minSamplesBeforeWindowWarn && rollingFps < this.minHealthyFps;
+    const severeFrameStall = intervalMs > this.maxHealthyIntervalMs * 2.0;
+
+    if ((windowDropped || severeFrameStall) && timestampMs - this.lastWarningTimeMs >= this.warningCooldownMs) {
+      this.warningCount++;
+      this.lastWarningTimeMs = timestampMs;
+      const metrics = this.getMetrics();
+      const effectiveFps = windowDropped ? rollingFps : 1000 / intervalMs;
+      this.onWarning(
+        `[SilentVideoExport] Frame capture dropped below ${this.minHealthyFps} FPS (rolling ${rollingFps.toFixed(1)} FPS, last interval ${intervalMs.toFixed(1)} ms / ${effectiveFps.toFixed(1)} FPS; particle-to-video synchronization may lag).`,
+        metrics
+      );
+      return metrics;
+    }
+
+    return this.getMetrics();
+  }
+
+  getMetrics(): CapturePerformanceMetrics {
+    const averageFps =
+      this.totalIntervals > 0 && this.totalIntervalMs > 0
+        ? (this.totalIntervals * 1000) / this.totalIntervalMs
+        : 0;
+    const rollingFps =
+      this.windowCount > 0 && this.windowSumMs > 0 ? (this.windowCount * 1000) / this.windowSumMs : 0;
+
+    return {
+      capturedFrames: this.capturedFrames,
+      averageFps: Number(averageFps.toFixed(2)),
+      rollingFps: Number(rollingFps.toFixed(2)),
+      minRollingFps: this.minRollingFps !== null ? Number(this.minRollingFps.toFixed(2)) : null,
+      lastIntervalMs: this.lastIntervalMs !== null ? Number(this.lastIntervalMs.toFixed(2)) : null,
+      maxIntervalMs: Number(this.maxIntervalMs.toFixed(2)),
+      warningCount: this.warningCount,
+    };
+  }
 }
 
 const CODEC_CANDIDATES: VideoCodecSelection[] = [
@@ -539,6 +679,10 @@ export function startSilentVideoExport(options: SilentVideoExportOptions): Activ
         captureStream = exportCanvas.captureStream(EXPORT_FPS);
       }
 
+      const captureMonitor = new CapturePerformanceMonitor({
+        minHealthyFps: MIN_HEALTHY_CAPTURE_FPS,
+      });
+
       const drawFrameFromPlateCanvas = () => {
         if (!exportCtx || !exportCanvas || sourceCanvas.width <= 0 || sourceCanvas.height <= 0) return;
         exportCtx.drawImage(sourceCanvas, 0, 0, EXPORT_WIDTH, EXPORT_HEIGHT);
@@ -549,6 +693,7 @@ export function startSilentVideoExport(options: SilentVideoExportOptions): Activ
             // ignore if track already stopped
           }
         }
+        captureMonitor.recordCapture(performance.now());
       };
 
       // Verify stream strictly contains video track and zero audio tracks
@@ -731,6 +876,7 @@ export function startSilentVideoExport(options: SilentVideoExportOptions): Activ
         videoTrackCount,
         audioTrackCount,
         chunksWritten,
+        captureMetrics: captureMonitor.getMetrics(),
       };
     } catch (err) {
       audioEngine.cancelSilentWavStream();

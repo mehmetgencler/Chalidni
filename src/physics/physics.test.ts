@@ -44,9 +44,11 @@ import {
 import {
   advanceCaptureDeadline,
   buildExportDownloadFileName,
+  CapturePerformanceMonitor,
   estimateExportSizeBytes,
   EXPORT_FPS,
   EXPORT_VIDEO_BITRATE_BPS,
+  MIN_HEALTHY_CAPTURE_FPS,
   selectSupportedVideoCodec,
 } from '../video/silentVideoExport.ts';
 import { computeParticleRenderParams } from '../components/plateVisuals.ts';
@@ -3047,5 +3049,50 @@ test('35. Silent video export targets 30 FPS and advanceCaptureDeadline locks 60
     if (step.shouldCapture) captured120++;
   }
   assert.equal(captured120, 30);
+});
+
+test('36. CapturePerformanceMonitor tracks capture intervals, tolerates steady 30 FPS jitter, and warns below 25 FPS', () => {
+  assert.equal(MIN_HEALTHY_CAPTURE_FPS, 25);
+
+  const warnings: string[] = [];
+  const monitor = new CapturePerformanceMonitor({
+    minHealthyFps: 25,
+    windowSize: 10,
+    minSamplesBeforeWindowWarn: 5,
+    warningCooldownMs: 1000,
+    onWarning: (msg) => warnings.push(msg),
+  });
+
+  // 1. Steady 30 FPS with minor +/-4 ms scheduling jitter (mean = 33.33 ms = 30 FPS) -> zero warnings
+  let t = 1000;
+  monitor.recordCapture(t);
+  for (let i = 1; i <= 20; i++) {
+    const jitter = i % 2 === 0 ? 4 : -4;
+    t += 1000 / 30 + jitter;
+    monitor.recordCapture(t);
+  }
+  const healthy = monitor.getMetrics();
+  assert.equal(healthy.capturedFrames, 21);
+  assert.equal(healthy.warningCount, 0);
+  assert.equal(warnings.length, 0);
+  assert.ok(healthy.averageFps > 29 && healthy.averageFps < 31);
+
+  // 2. Capture loop degrades to ~21 FPS (47.5 ms intervals) -> emits rate-limited warning
+  for (let i = 0; i < 12; i++) {
+    t += 47.5;
+    monitor.recordCapture(t);
+  }
+  const degraded = monitor.getMetrics();
+  assert.equal(degraded.warningCount, 1);
+  assert.equal(warnings.length, 1);
+  assert.ok(warnings[0].includes('below 25 FPS'));
+  assert.ok(degraded.minRollingFps !== null && degraded.minRollingFps < 25);
+
+  // 3. Severe single-frame stall (> 80 ms) after cooldown emits another warning and records maxIntervalMs
+  t += 1200;
+  monitor.recordCapture(t);
+  const stalled = monitor.getMetrics();
+  assert.equal(stalled.warningCount, 2);
+  assert.equal(stalled.maxIntervalMs, 1200);
 });
 
