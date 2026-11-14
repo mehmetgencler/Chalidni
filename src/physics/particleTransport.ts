@@ -17,7 +17,7 @@
  * D_g = D_ref * max(Gamma - Gamma_c, 0)^p
  */
 
-import { DimensionalTransportConfig, Particle } from './types.ts';
+import { DimensionalTransportConfig, Particle, ParticleColor } from './types.ts';
 
 export const DEFAULT_DIMENSIONAL_CONFIG: DimensionalTransportConfig = {
   particleCount: 3000, // Fixed high particle density for realistic powder accumulation
@@ -107,6 +107,7 @@ export class ParticleTransportSystem {
   config: DimensionalTransportConfig;
   sideLength: number; // L (m)
   private prng: Mulberry32PRNG;
+  private colorPrng: Mulberry32PRNG;
   private initialParticleCount: number;
   private feedCooldownElapsed: number = 0;
   private edgeRecycleCursor: number = 0;
@@ -131,6 +132,7 @@ export class ParticleTransportSystem {
     this.sideLength = sideLength;
     this.initialParticleCount = this.config.particleCount;
     this.prng = new Mulberry32PRNG(this.config.seed);
+    this.colorPrng = new Mulberry32PRNG((this.config.seed ^ 0x9e3779b9) >>> 0);
     this.initParticles();
   }
 
@@ -145,6 +147,24 @@ export class ParticleTransportSystem {
     this.initParticles();
   }
 
+  private buildBalancedShuffledColors(count: number): ParticleColor[] {
+    const palette: ParticleColor[] = ['green', 'blue', 'red'];
+    // Randomize starting rotation so remainders (when count % 3 !== 0) are unbiased
+    const startOffset = Math.floor(this.colorPrng.next() * 3);
+    const colors: ParticleColor[] = new Array(count);
+    for (let i = 0; i < count; i++) {
+      colors[i] = palette[(i + startOffset) % 3];
+    }
+    // Fisher-Yates shuffle for uniform random distribution across plate
+    for (let i = count - 1; i > 0; i--) {
+      const j = Math.floor(this.colorPrng.next() * (i + 1));
+      const tmp = colors[i];
+      colors[i] = colors[j];
+      colors[j] = tmp;
+    }
+    return colors;
+  }
+
   initParticles(): void {
     this.particles = [];
     this.initialParticleCount = this.config.particleCount;
@@ -152,6 +172,8 @@ export class ParticleTransportSystem {
     this.edgeRecycleCursor = 0;
     this.lastAddedCount = 0;
     this.totalAddedCount = 0;
+    this.colorPrng = new Mulberry32PRNG((this.config.seed ^ 0x9e3779b9) >>> 0);
+    const colors = this.buildBalancedShuffledColors(this.config.particleCount);
     const L = this.sideLength;
     for (let i = 0; i < this.config.particleCount; i++) {
       // Natural subtle powder variations
@@ -165,6 +187,7 @@ export class ParticleTransportSystem {
         active: true,
         radius,
         brightness,
+        color: colors[i],
       });
     }
     this.lastInteriorCount = this.countInteriorParticles(0.001);
@@ -291,6 +314,7 @@ export class ParticleTransportSystem {
     const toAppend = Math.min(maxBatchSize, deficit, headroom);
     const innerSpan = Math.max(0, this.sideLength - 2.0 * perimeterBandM);
 
+    const fedColors = this.buildBalancedShuffledColors(toAppend);
     let introduced = 0;
     for (let i = 0; i < toAppend; i++) {
       const radius = 0.9 + 0.5 * this.prng.next();
@@ -303,6 +327,7 @@ export class ParticleTransportSystem {
         active: true,
         radius,
         brightness,
+        color: fedColors[i],
       });
       introduced++;
     }

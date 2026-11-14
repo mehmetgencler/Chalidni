@@ -11,7 +11,7 @@
  */
 
 import React, { useEffect, useRef } from 'react';
-import { Particle } from '../physics/types.ts';
+import { Particle, ParticleColor } from '../physics/types.ts';
 import { computeParticleRenderParams, SPRITE_BASE_PX } from './plateVisuals.ts';
 
 export type HeatmapType = 'none' | 'diffusivity' | 'displacement' | 'nodal';
@@ -22,14 +22,38 @@ interface PlateCanvasProps {
   canvasRefExternal?: React.RefObject<HTMLCanvasElement | null>;
 }
 
-const GRAIN_SPRITE_TIERS = [
-  { body: 'rgba(198, 206, 218, 0.80)', spec: 'rgba(255, 255, 255, 0.35)' }, // Dimmer cool silica
-  { body: 'rgba(215, 222, 232, 0.86)', spec: 'rgba(255, 255, 255, 0.44)' }, // Soft quartz
-  { body: 'rgba(232, 236, 240, 0.90)', spec: 'rgba(255, 255, 255, 0.52)' }, // Pale aluminum powder
-  { body: 'rgba(246, 241, 214, 0.92)', spec: 'rgba(255, 255, 255, 0.58)' }, // Warm fine sand
-  { body: 'rgba(244, 247, 251, 0.95)', spec: 'rgba(255, 255, 255, 0.68)' }, // Bright quartz
-  { body: 'rgba(254, 246, 198, 0.96)', spec: 'rgba(255, 255, 255, 0.78)' }, // High-luminance pale grain
-];
+const GRAIN_COLOR_TIERS: Record<ParticleColor, { body: string; spec: string }[]> = {
+  green: [
+    { body: 'rgba(34, 197, 94, 0.84)', spec: 'rgba(220, 252, 231, 0.40)' },
+    { body: 'rgba(52, 211, 153, 0.88)', spec: 'rgba(220, 252, 231, 0.48)' },
+    { body: 'rgba(74, 222, 128, 0.91)', spec: 'rgba(236, 253, 245, 0.56)' },
+    { body: 'rgba(94, 234, 150, 0.93)', spec: 'rgba(240, 253, 244, 0.64)' },
+    { body: 'rgba(118, 242, 166, 0.95)', spec: 'rgba(255, 255, 255, 0.72)' },
+    { body: 'rgba(134, 247, 178, 0.97)', spec: 'rgba(255, 255, 255, 0.80)' },
+  ],
+  blue: [
+    { body: 'rgba(59, 130, 246, 0.84)', spec: 'rgba(219, 234, 254, 0.40)' },
+    { body: 'rgba(66, 153, 248, 0.88)', spec: 'rgba(219, 234, 254, 0.48)' },
+    { body: 'rgba(84, 168, 250, 0.91)', spec: 'rgba(239, 246, 255, 0.56)' },
+    { body: 'rgba(96, 178, 252, 0.93)', spec: 'rgba(239, 246, 255, 0.64)' },
+    { body: 'rgba(122, 192, 253, 0.95)', spec: 'rgba(255, 255, 255, 0.72)' },
+    { body: 'rgba(147, 205, 254, 0.97)', spec: 'rgba(255, 255, 255, 0.80)' },
+  ],
+  red: [
+    { body: 'rgba(220, 38, 38, 0.84)', spec: 'rgba(254, 226, 226, 0.40)' },
+    { body: 'rgba(239, 68, 68, 0.88)', spec: 'rgba(254, 226, 226, 0.48)' },
+    { body: 'rgba(244, 88, 88, 0.91)', spec: 'rgba(254, 242, 242, 0.56)' },
+    { body: 'rgba(248, 113, 113, 0.93)', spec: 'rgba(254, 242, 242, 0.64)' },
+    { body: 'rgba(250, 138, 138, 0.95)', spec: 'rgba(255, 255, 255, 0.72)' },
+    { body: 'rgba(252, 165, 165, 0.97)', spec: 'rgba(255, 255, 255, 0.80)' },
+  ],
+};
+
+const FALLBACK_COLORS: Record<ParticleColor, string> = {
+  green: 'rgba(74, 222, 128, 0.95)',
+  blue: 'rgba(96, 178, 252, 0.95)',
+  red: 'rgba(248, 113, 113, 0.95)',
+};
 
 export const PlateCanvas: React.FC<PlateCanvasProps> = ({
   particles,
@@ -41,43 +65,50 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
   const particlesRef = useRef<Particle[]>(particles);
   particlesRef.current = particles;
 
-  // Pre-rendered grain sprite tiers ordered by luminance/tint
-  const spritesRef = useRef<HTMLCanvasElement[] | null>(null);
+  // Pre-rendered grain sprite tiers grouped by color ('green' | 'blue' | 'red')
+  const spritesRef = useRef<Record<ParticleColor, HTMLCanvasElement[]> | null>(null);
   // Cached brushed aluminum plate background (only re-rendered when size or dpr changes)
   const plateSurfaceRef = useRef<{ canvas: HTMLCanvasElement; size: number; dpr: number } | null>(null);
 
   useEffect(() => {
-    const sprites: HTMLCanvasElement[] = [];
     const s = SPRITE_BASE_PX;
+    const banks: Record<ParticleColor, HTMLCanvasElement[]> = {
+      green: [],
+      blue: [],
+      red: [],
+    };
 
-    for (let i = 0; i < GRAIN_SPRITE_TIERS.length; i++) {
-      const tier = GRAIN_SPRITE_TIERS[i];
-      const sprite = document.createElement('canvas');
-      sprite.width = s;
-      sprite.height = s;
-      const sCtx = sprite.getContext('2d');
-      if (sCtx) {
-        // Subtle pre-baked contact drop shadow
-        sCtx.fillStyle = 'rgba(0, 0, 0, 0.42)';
-        sCtx.beginPath();
-        sCtx.arc(s / 2 + 0.55, s / 2 + 0.75, 2.0, 0, Math.PI * 2);
-        sCtx.fill();
+    (Object.keys(GRAIN_COLOR_TIERS) as ParticleColor[]).forEach((colorKey) => {
+      const tiers = GRAIN_COLOR_TIERS[colorKey];
+      for (let i = 0; i < tiers.length; i++) {
+        const tier = tiers[i];
+        const sprite = document.createElement('canvas');
+        sprite.width = s;
+        sprite.height = s;
+        const sCtx = sprite.getContext('2d');
+        if (sCtx) {
+          // Subtle pre-baked contact drop shadow
+          sCtx.fillStyle = 'rgba(0, 0, 0, 0.42)';
+          sCtx.beginPath();
+          sCtx.arc(s / 2 + 0.55, s / 2 + 0.75, 2.0, 0, Math.PI * 2);
+          sCtx.fill();
 
-        // Main grain body
-        sCtx.fillStyle = tier.body;
-        sCtx.beginPath();
-        sCtx.arc(s / 2, s / 2, 1.85, 0, Math.PI * 2);
-        sCtx.fill();
+          // Main grain body
+          sCtx.fillStyle = tier.body;
+          sCtx.beginPath();
+          sCtx.arc(s / 2, s / 2, 1.85, 0, Math.PI * 2);
+          sCtx.fill();
 
-        // Subtle specular micro-highlight
-        sCtx.fillStyle = tier.spec;
-        sCtx.beginPath();
-        sCtx.arc(s / 2 - 0.5, s / 2 - 0.5, 0.7, 0, Math.PI * 2);
-        sCtx.fill();
+          // Subtle specular micro-highlight
+          sCtx.fillStyle = tier.spec;
+          sCtx.beginPath();
+          sCtx.arc(s / 2 - 0.5, s / 2 - 0.5, 0.7, 0, Math.PI * 2);
+          sCtx.fill();
+        }
+        banks[colorKey].push(sprite);
       }
-      sprites.push(sprite);
-    }
-    spritesRef.current = sprites;
+    });
+    spritesRef.current = banks;
   }, []);
 
   // Pure rendering loop (never advances physics or particle transport)
@@ -181,13 +212,13 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
       ctx.scale(dpr, dpr);
       ctx.drawImage(cached.canvas, 0, 0, size, size);
 
-      // 3. Render granular powder particles using per-particle radius & brightness
+      // 3. Render granular powder particles using per-particle color, radius & brightness
       const activeParticles = particlesRef.current;
       const scale = size / sideLength;
-      const sprites = spritesRef.current;
+      const spriteBanks = spritesRef.current;
 
-      if (sprites && sprites.length > 0) {
-        const tierCount = sprites.length;
+      if (spriteBanks && spriteBanks.green.length > 0) {
+        const tierCount = spriteBanks.green.length;
         for (let i = 0; i < activeParticles.length; i++) {
           const p = activeParticles[i];
           if (!p.active) continue;
@@ -196,14 +227,16 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
           const py = p.y * scale;
           const { spriteTier, drawSize } = computeParticleRenderParams(p, tierCount);
           const half = drawSize * 0.5;
+          const colorKey: ParticleColor = p.color ?? 'green';
+          const bank = spriteBanks[colorKey];
 
-          ctx.drawImage(sprites[spriteTier], px - half, py - half, drawSize, drawSize);
+          ctx.drawImage(bank[spriteTier], px - half, py - half, drawSize, drawSize);
         }
       } else {
-        ctx.fillStyle = 'rgba(241, 245, 249, 0.95)';
         for (let i = 0; i < activeParticles.length; i++) {
           const p = activeParticles[i];
           if (!p.active) continue;
+          ctx.fillStyle = FALLBACK_COLORS[p.color ?? 'green'];
           ctx.beginPath();
           ctx.arc(p.x * scale, p.y * scale, p.radius ?? 1.2, 0, Math.PI * 2);
           ctx.fill();

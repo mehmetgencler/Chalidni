@@ -2963,3 +2963,59 @@ test('33. AudioEngine.startSilentWavStream rejects promptly with AudioContextSus
     (globalThis as Record<string, unknown>).AudioContext = prevAudioContext;
   }
 });
+
+test('34. Particle colors are randomly shuffled in exact 1/3 green, 1/3 blue, 1/3 red proportions and preserved across external feed', () => {
+  const sys = new ParticleTransportSystem(
+    { particleCount: 3000, seed: 42, enableExternalPowderFeed: true, maxParticleCount: 4500 },
+    0.30
+  );
+
+  const counts = { green: 0, blue: 0, red: 0 };
+  for (const p of sys.particles) {
+    assert.ok(p.color === 'green' || p.color === 'blue' || p.color === 'red');
+    counts[p.color]++;
+  }
+  assert.equal(counts.green, 1000);
+  assert.equal(counts.blue, 1000);
+  assert.equal(counts.red, 1000);
+
+  // Confirm spatial randomness: top-left quadrant contains all 3 colors (~250 each) rather than grouped blocks
+  const qCounts = { green: 0, blue: 0, red: 0 };
+  for (const p of sys.particles) {
+    if (p.x < 0.15 && p.y < 0.15 && p.color) {
+      qCounts[p.color]++;
+    }
+  }
+  assert.ok(qCounts.green > 180 && qCounts.blue > 180 && qCounts.red > 180, `Expected balanced mix in quadrant, got ${JSON.stringify(qCounts)}`);
+
+  // Confirm not sorted in repeating pattern across indices
+  let consecutiveSameOrder = 0;
+  for (let i = 0; i < 30; i += 3) {
+    if (
+      sys.particles[i].color === 'green' &&
+      sys.particles[i + 1].color === 'blue' &&
+      sys.particles[i + 2].color === 'red'
+    ) {
+      consecutiveSameOrder++;
+    }
+  }
+  assert.ok(consecutiveSameOrder < 5, 'Particle colors must be shuffled randomly');
+
+  // Force interior deficit -> feedInteriorParticlesIfNeeded introduces a balanced 60-particle batch (20/20/20)
+  for (let i = 0; i < 1200; i++) {
+    sys.particles[i].x = 0.0002;
+  }
+  const halfN = 5;
+  const activeGrid = new Float64Array(halfN * halfN).fill(25.0);
+  const added = sys.feedInteriorParticlesIfNeeded(0.25, false, activeGrid, halfN);
+  assert.equal(added, 60);
+
+  const totalAfter = { green: 0, blue: 0, red: 0 };
+  for (const p of sys.particles) {
+    if (p.color) totalAfter[p.color]++;
+  }
+  assert.equal(totalAfter.green, 1020);
+  assert.equal(totalAfter.blue, 1020);
+  assert.equal(totalAfter.red, 1020);
+});
+

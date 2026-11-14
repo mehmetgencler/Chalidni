@@ -44,6 +44,8 @@ export interface ExcitationConfig {
   amplitude: number; // N for point force, Pa for uniform pressure
 }
 
+export type ParticleColor = 'green' | 'blue' | 'red';
+
 export interface Particle {
   x: number; // [0, L]
   y: number; // [0, L]
@@ -52,6 +54,7 @@ export interface Particle {
   active: boolean;
   radius?: number;
   brightness?: number;
+  color?: ParticleColor;
 }
 
 export interface DimensionalTransportConfig {
