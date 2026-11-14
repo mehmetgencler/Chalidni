@@ -250,7 +250,7 @@ export const SilentVideoExport: React.FC<SilentVideoExportProps> = ({
           <div className="flex items-start gap-2 rounded-lg bg-amber-950/35 border border-amber-800/40 px-2.5 py-2 text-[11px] text-amber-200/90">
             <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
             <span>
-              Runs in real time at 480&times;480 (12 fps) directly to browser disk (OPFS) with zero speaker output. Keep this tab active and screen unlocked while exporting.
+              Runs in real time at 480&times;480 (30 fps) directly to browser disk (OPFS) with zero speaker output. Keep this tab active and screen unlocked while exporting.
             </span>
           </div>
 

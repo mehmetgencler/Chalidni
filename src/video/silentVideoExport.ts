@@ -2,7 +2,7 @@
  * silentVideoExport.ts: Memory-bounded Silent PCM WAV-to-Video Export Controller.
  *
  * - Reads long PCM WAV files via bounded slice streaming (AudioEngine.startSilentWavStream).
- * - Captures ONLY the rendered Chladni PlateCanvas (downscaled to 480x480 at 12 FPS, 0 audio tracks).
+ * - Captures ONLY the rendered Chladni PlateCanvas (downscaled to 480x480 at 30 FPS, 0 audio tracks).
  * - Selects H.264 MP4 when MediaRecorder.isTypeSupported allows, with matching container/extension fallback.
  * - Streams encoded MediaRecorder timeslice chunks sequentially straight into OPFS via Web Worker.
  * - Never accumulates recording Blobs in JS heap memory.
@@ -73,9 +73,29 @@ export interface SilentVideoExportOptions {
 
 export const EXPORT_WIDTH = 480;
 export const EXPORT_HEIGHT = 480;
-export const EXPORT_FPS = 12;
-export const EXPORT_VIDEO_BITRATE_BPS = 200_000;
+export const EXPORT_FPS = 30;
+export const EXPORT_VIDEO_BITRATE_BPS = 350_000;
 export const EXPORT_TIMESLICE_MS = 2000;
+
+/**
+ * Timestamp-paced capture scheduler aiming for targetFps without drift or double-capture
+ * on 60 Hz / 120 Hz requestAnimationFrame displays.
+ */
+export function advanceCaptureDeadline(
+  nowMs: number,
+  nextDeadlineMs: number,
+  targetFps: number = EXPORT_FPS
+): { shouldCapture: boolean; nextDeadlineMs: number } {
+  const intervalMs = 1000 / Math.max(1, targetFps);
+  if (nowMs + 2.0 < nextDeadlineMs) {
+    return { shouldCapture: false, nextDeadlineMs };
+  }
+  let next = nextDeadlineMs + intervalMs;
+  if (next < nowMs - intervalMs) {
+    next = nowMs + intervalMs;
+  }
+  return { shouldCapture: true, nextDeadlineMs: next };
+}
 
 const CODEC_CANDIDATES: VideoCodecSelection[] = [
   { mimeType: 'video/mp4;codecs=avc1.42E01E', baseMimeType: 'video/mp4', extension: 'mp4' },
@@ -235,7 +255,7 @@ export function startSilentVideoExport(options: SilentVideoExportOptions): Activ
   let worker: Worker | null = null;
   let recorder: MediaRecorder | null = null;
   let captureStream: MediaStream | null = null;
-  let drawIntervalId: ReturnType<typeof setInterval> | null = null;
+  let captureRafId: number | null = null;
   let exportCanvas: HTMLCanvasElement | null = null;
   let visibilityListener: (() => void) | null = null;
   let backgroundWarning = false;
@@ -278,9 +298,9 @@ export function startSilentVideoExport(options: SilentVideoExportOptions): Activ
   };
 
   const stopRenderLoopAndTracks = () => {
-    if (drawIntervalId !== null) {
-      clearInterval(drawIntervalId);
-      drawIntervalId = null;
+    if (captureRafId !== null) {
+      cancelAnimationFrame(captureRafId);
+      captureRafId = null;
     }
     if (visibilityListener && typeof document !== 'undefined') {
       document.removeEventListener('visibilitychange', visibilityListener);
@@ -485,7 +505,7 @@ export function startSilentVideoExport(options: SilentVideoExportOptions): Activ
         document.addEventListener('visibilitychange', visibilityListener);
       }
 
-      // Prepare 480x480 offscreen canvas copying from PlateCanvas at 12 FPS
+      // Prepare 480x480 offscreen canvas copying from PlateCanvas at 30 FPS
       exportCanvas = document.createElement('canvas');
       exportCanvas.width = EXPORT_WIDTH;
       exportCanvas.height = EXPORT_HEIGHT;
@@ -607,10 +627,23 @@ export function startSilentVideoExport(options: SilentVideoExportOptions): Activ
             },
             onStreamStart: () => {
               if (cancelled || settled) return;
-              // Draw initial reset frame and begin synchronized 12 FPS capture + 2s MediaRecorder timeslice
-              drawFrameFromPlateCanvas();
+              // Begin MediaRecorder, push initial reset frame, and run vsync-paced 30 FPS capture
               localRecorder.start(EXPORT_TIMESLICE_MS);
-              drawIntervalId = setInterval(drawFrameFromPlateCanvas, Math.round(1000 / EXPORT_FPS));
+              drawFrameFromPlateCanvas();
+              let nextDeadlineMs = performance.now() + 1000 / EXPORT_FPS;
+              const captureTick = (nowMs: number) => {
+                if (cancelled || settled) {
+                  captureRafId = null;
+                  return;
+                }
+                const step = advanceCaptureDeadline(nowMs, nextDeadlineMs, EXPORT_FPS);
+                nextDeadlineMs = step.nextDeadlineMs;
+                if (step.shouldCapture) {
+                  drawFrameFromPlateCanvas();
+                }
+                captureRafId = requestAnimationFrame(captureTick);
+              };
+              captureRafId = requestAnimationFrame(captureTick);
               emitProgress('recording', 0, 12, 'Simulating plate and recording silent video...');
             },
             onEnded: () => {
@@ -647,9 +680,9 @@ export function startSilentVideoExport(options: SilentVideoExportOptions): Activ
       drawFrameFromPlateCanvas();
       await new Promise((r) => setTimeout(r, 140));
 
-      if (drawIntervalId !== null) {
-        clearInterval(drawIntervalId);
-        drawIntervalId = null;
+      if (captureRafId !== null) {
+        cancelAnimationFrame(captureRafId);
+        captureRafId = null;
       }
       if (localRecorder.state !== 'inactive') {
         localRecorder.stop();

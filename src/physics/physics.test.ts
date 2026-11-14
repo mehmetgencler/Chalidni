@@ -42,8 +42,11 @@ import {
   WavByteSource,
 } from '../audio/wavPcmStream.ts';
 import {
+  advanceCaptureDeadline,
   buildExportDownloadFileName,
   estimateExportSizeBytes,
+  EXPORT_FPS,
+  EXPORT_VIDEO_BITRATE_BPS,
   selectSupportedVideoCodec,
 } from '../video/silentVideoExport.ts';
 import { computeParticleRenderParams } from '../components/plateVisuals.ts';
@@ -3017,5 +3020,32 @@ test('34. Particle colors are randomly shuffled in exact 1/3 green, 1/3 blue, 1/
   assert.equal(totalAfter.green, 1020);
   assert.equal(totalAfter.blue, 1020);
   assert.equal(totalAfter.red, 1020);
+});
+
+test('35. Silent video export targets 30 FPS and advanceCaptureDeadline locks 60 Hz & 120 Hz RAF ticks cleanly to 30 fps', () => {
+  assert.equal(EXPORT_FPS, 30);
+  assert.ok(EXPORT_VIDEO_BITRATE_BPS >= 300_000 && EXPORT_VIDEO_BITRATE_BPS <= 500_000);
+
+  // Simulate 1.0 second of 60 Hz RAF ticks (every 16.6667 ms) -> exactly 30 captured frames
+  let captured60 = 0;
+  let deadline60 = 1000 / EXPORT_FPS;
+  for (let tick = 1; tick <= 60; tick++) {
+    const nowMs = tick * (1000 / 60);
+    const step = advanceCaptureDeadline(nowMs, deadline60, EXPORT_FPS);
+    deadline60 = step.nextDeadlineMs;
+    if (step.shouldCapture) captured60++;
+  }
+  assert.equal(captured60, 30);
+
+  // Simulate 1.0 second of 120 Hz iPhone ProMotion RAF ticks (every 8.3333 ms) -> exactly 30 captured frames
+  let captured120 = 0;
+  let deadline120 = 1000 / EXPORT_FPS;
+  for (let tick = 1; tick <= 120; tick++) {
+    const nowMs = tick * (1000 / 120);
+    const step = advanceCaptureDeadline(nowMs, deadline120, EXPORT_FPS);
+    deadline120 = step.nextDeadlineMs;
+    if (step.shouldCapture) captured120++;
+  }
+  assert.equal(captured120, 30);
 });
 
