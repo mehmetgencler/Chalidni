@@ -223,4 +223,53 @@ test.describe('Memory-Bounded Silent WAV-to-Video Export E2E', () => {
     });
     expect(remainingOpfs).toBe(0);
   });
+
+  test('3. Suspended AudioContext after file picker never hangs in validating state and recovers cleanly via Start Silent Export', async ({
+    page,
+  }) => {
+    // Inject wrapper mimicking iOS Safari / iframe AudioContext staying suspended until direct button click
+    await page.addInitScript(() => {
+      const OrigAC = window.AudioContext;
+      let allowResume = false;
+      (window as unknown as { __unlockAudio?: () => void }).__unlockAudio = () => {
+        allowResume = true;
+      };
+      class GatedAudioContext extends OrigAC {
+        private _fakeSuspended = true;
+        override get state(): AudioContextState {
+          return this._fakeSuspended && !allowResume ? 'suspended' : super.state;
+        }
+        override resume(): Promise<void> {
+          if (!allowResume) {
+            return new Promise<void>(() => {}); // Simulate non-resolving resume outside fresh tap
+          }
+          this._fakeSuspended = false;
+          return super.resume();
+        }
+      }
+      window.AudioContext = GatedAudioContext as unknown as typeof AudioContext;
+    });
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto('/');
+
+    const exportDetails = page.getByTestId('silent-video-export');
+    await exportDetails.locator('summary').click();
+    await page.getByTestId('silent-wav-file-input').setInputFiles(wav15sPath);
+
+    // Must settle quickly into error/pending state with "Start Silent Export" button (not stuck validating!)
+    const startBtn = page.getByRole('button', { name: 'Start Silent Export' });
+    await expect(startBtn).toBeVisible({ timeout: 5000 });
+    await expect(exportDetails).toHaveAttribute('data-export-phase', 'error');
+
+    // Now simulate direct user tap unlocking AudioContext and starting export without re-picking the file
+    await page.evaluate(() => {
+      (window as unknown as { __unlockAudio?: () => void }).__unlockAudio?.();
+    });
+    await startBtn.click();
+    await expect(exportDetails).toHaveAttribute('data-export-phase', 'recording', { timeout: 10_000 });
+
+    await page.getByRole('button', { name: 'Cancel' }).click();
+    await expect(exportDetails).toHaveAttribute('data-export-phase', 'cancelled', { timeout: 5000 });
+  });
 });

@@ -190,7 +190,17 @@ export class AudioEngine {
         if (!this.ctx) return false;
 
         const workletUrl = '/audio/modal-worklet-processor.js';
-        await this.ctx.audioWorklet.addModule(workletUrl);
+        let addModuleTimer: ReturnType<typeof setTimeout> | null = null;
+        await Promise.race([
+          this.ctx.audioWorklet.addModule(workletUrl),
+          new Promise<never>((_, reject) => {
+            addModuleTimer = setTimeout(() => {
+              reject(new Error('Timed out loading AudioWorklet modal processor module.'));
+            }, 6000);
+          }),
+        ]).finally(() => {
+          if (addModuleTimer !== null) clearTimeout(addModuleTimer);
+        });
 
         this.workletNode = new AudioWorkletNode(this.ctx, 'modal-worklet-processor', {
           numberOfInputs: 1,
@@ -242,6 +252,7 @@ export class AudioEngine {
       } catch (err) {
         console.error('AudioWorklet initialization error:', err);
         this.isWorkletReady = false;
+        this.workletInitPromise = null;
         return false;
       }
     })();
@@ -834,16 +845,17 @@ export class AudioEngine {
       throw new Error('Silent WAV stream cancelled.');
     }
     if (!this.ctx || !this.fileGain) {
-      throw new Error('Web Audio context is unavailable.');
+      throw new Error('Web Audio context or AudioWorklet failed to initialize.');
     }
 
     if ((this.ctx.state as string) !== 'running') {
-      await this.waitForContextResumeBounded(this.triggerContextResume(), 200);
+      await this.waitForContextResumeBounded(this.triggerContextResume(), 450);
       if ((this.ctx.state as string) !== 'running') {
-        await this.ctx.resume().catch(() => {});
-      }
-      if ((this.ctx.state as string) !== 'running') {
-        throw new Error('AudioContext remained suspended; user interaction is required to run simulation.');
+        const suspendedErr = new Error(
+          'Browser paused AudioContext after file selection. Tap "Start Silent Export" to continue.'
+        );
+        suspendedErr.name = 'AudioContextSuspendedError';
+        throw suspendedErr;
       }
     }
 

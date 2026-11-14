@@ -110,6 +110,22 @@ export function estimateExportSizeBytes(durationSec: number, bitrateBps: number 
   return { estimatedVideoBytes, requiredBytesWithHeadroom };
 }
 
+async function withOptionalTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | null> {
+  let timerId: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<null>((resolve) => {
+        timerId = setTimeout(() => resolve(null), timeoutMs);
+      }),
+    ]);
+  } catch {
+    return null;
+  } finally {
+    if (timerId !== null) clearTimeout(timerId);
+  }
+}
+
 export async function runStoragePreflight(durationSec: number): Promise<StoragePreflightResult> {
   if (typeof navigator === 'undefined' || !navigator.storage?.getDirectory) {
     throw new Error(
@@ -124,32 +140,23 @@ export async function runStoragePreflight(durationSec: number): Promise<StorageP
 
   let availableQuotaBytes: number | null = null;
   if (typeof navigator.storage.estimate === 'function') {
-    try {
-      const est = await navigator.storage.estimate();
-      if (typeof est.quota === 'number' && typeof est.usage === 'number') {
-        availableQuotaBytes = Math.max(0, est.quota - est.usage);
-        if (availableQuotaBytes < requiredBytesWithHeadroom) {
-          const needMb = (requiredBytesWithHeadroom / (1024 * 1024)).toFixed(1);
-          const availMb = (availableQuotaBytes / (1024 * 1024)).toFixed(1);
-          throw new Error(
-            `Insufficient browser storage quota for silent video export (need ~${needMb} MB including headroom, only ${availMb} MB available).`
-          );
-        }
-      }
-    } catch (err) {
-      if (err instanceof Error && err.message.startsWith('Insufficient browser storage quota')) {
-        throw err;
+    const est = await withOptionalTimeout(navigator.storage.estimate(), 1500);
+    if (est && typeof est.quota === 'number' && typeof est.usage === 'number') {
+      availableQuotaBytes = Math.max(0, est.quota - est.usage);
+      if (availableQuotaBytes < requiredBytesWithHeadroom) {
+        const needMb = (requiredBytesWithHeadroom / (1024 * 1024)).toFixed(1);
+        const availMb = (availableQuotaBytes / (1024 * 1024)).toFixed(1);
+        throw new Error(
+          `Insufficient browser storage quota for silent video export (need ~${needMb} MB including headroom, only ${availMb} MB available).`
+        );
       }
     }
   }
 
   let persistentStorageGranted = false;
   if (typeof navigator.storage.persist === 'function') {
-    try {
-      persistentStorageGranted = await navigator.storage.persist();
-    } catch {
-      persistentStorageGranted = false;
-    }
+    const persisted = await withOptionalTimeout(navigator.storage.persist(), 1000);
+    persistentStorageGranted = persisted === true;
   }
 
   return {
@@ -370,23 +377,48 @@ export function startSilentVideoExport(options: SilentVideoExportOptions): Activ
       wavInfo = await parseWavHeader(wavFile);
       if (cancelled) throw new Error('Silent video export cancelled by user.');
 
+      emitProgress('validating', 0, 0, 'Checking browser storage quota...');
       await runStoragePreflight(wavInfo.durationSec);
       if (cancelled) throw new Error('Silent video export cancelled by user.');
 
       // Open OPFS SyncAccessHandle writer Worker immediately so unsupported environments fail fast
+      emitProgress('validating', 0, 0, 'Opening disk video writer (OPFS)...');
       opfsFileName = `chladni-export-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${codec.extension}`;
       worker = new Worker(new URL('./videoFileWriter.worker.ts', import.meta.url), { type: 'module' });
 
       await new Promise<void>((resolve, reject) => {
         let settled = false;
+        const initTimeout = setTimeout(() => {
+          if (!settled) {
+            settled = true;
+            reject(
+              new Error(
+                'Timed out opening OPFS disk video writer. Private browsing or restricted iframes may block OPFS SyncAccessHandle.'
+              )
+            );
+          }
+        }, 5000);
+
+        const finishInitResolve = () => {
+          clearTimeout(initTimeout);
+          if (!settled) {
+            settled = true;
+            resolve();
+          }
+        };
+        const finishInitReject = (err: Error) => {
+          clearTimeout(initTimeout);
+          if (!settled) {
+            settled = true;
+            reject(err);
+          }
+        };
+
         worker!.onmessage = (event: MessageEvent<WorkerOutboundMessage>) => {
           const msg = event.data;
           if (!msg) return;
           if (msg.type === 'READY') {
-            if (!settled) {
-              settled = true;
-              resolve();
-            }
+            finishInitResolve();
             return;
           }
           if (msg.type === 'CHUNK_ACK') {
@@ -409,8 +441,7 @@ export function startSilentVideoExport(options: SilentVideoExportOptions): Activ
             const err = new Error(msg.error);
             workerFatalError = err;
             if (!settled) {
-              settled = true;
-              reject(err);
+              finishInitReject(err);
               return;
             }
             pendingFinalizeReject?.(err);
@@ -420,11 +451,20 @@ export function startSilentVideoExport(options: SilentVideoExportOptions): Activ
           }
         };
         worker!.onerror = (ev) => {
-          const err = new Error(ev.message || 'OPFS video writer Worker crashed.');
+          const err = new Error(ev.message || 'OPFS video writer Worker failed to load.');
           workerFatalError = err;
           if (!settled) {
-            settled = true;
-            reject(err);
+            finishInitReject(err);
+            return;
+          }
+          pendingFinalizeReject?.(err);
+          abortActiveRun?.(err);
+        };
+        worker!.onmessageerror = () => {
+          const err = new Error('OPFS video writer Worker message error.');
+          workerFatalError = err;
+          if (!settled) {
+            finishInitReject(err);
             return;
           }
           pendingFinalizeReject?.(err);
@@ -515,7 +555,7 @@ export function startSilentVideoExport(options: SilentVideoExportOptions): Activ
             onStatus: (st) => {
               if (cancelled || settled) return;
               if (st.phase === 'validating') {
-                emitProgress('validating', 0, st.bufferedAheadSec, 'Validating WAV file...');
+                emitProgress('validating', 0, st.bufferedAheadSec, 'Starting silent audio engine...');
               } else if (st.phase === 'buffering') {
                 emitProgress(
                   'buffering',

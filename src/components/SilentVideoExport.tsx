@@ -8,7 +8,7 @@
  */
 
 import React, { useEffect, useId, useRef, useState } from 'react';
-import { AlertTriangle, CheckCircle2, ChevronDown, Download, Share2, Upload, Video, X } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, ChevronDown, Download, Play, Share2, Upload, Video, X } from 'lucide-react';
 import { AudioEngine } from '../audio/audioEngine.ts';
 import { WavFormatInfo } from '../audio/wavPcmStream.ts';
 import {
@@ -73,6 +73,7 @@ export const SilentVideoExport: React.FC<SilentVideoExportProps> = ({
   const [progress, setProgress] = useState<SilentVideoExportProgress>(INITIAL_PROGRESS);
   const [result, setResult] = useState<SilentVideoExportResult | null>(null);
   const [saveFeedback, setSaveFeedback] = useState<string | null>(null);
+  const [pendingWavFile, setPendingWavFile] = useState<File | null>(null);
 
   const controllerRef = useRef<ActiveSilentVideoExportController | null>(null);
   const resultRef = useRef<SilentVideoExportResult | null>(null);
@@ -96,26 +97,9 @@ export const SilentVideoExport: React.FC<SilentVideoExportProps> = ({
     progress.phase === 'recording' ||
     progress.phase === 'finalizing';
 
-  const effectiveOpen = isOpen || progress.phase !== 'idle' || result !== null;
+  const effectiveOpen = isOpen || progress.phase !== 'idle' || result !== null || pendingWavFile !== null;
 
-  const handleWavSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const input = e.currentTarget;
-    const file = input.files?.[0];
-    input.value = '';
-    if (!file) return;
-
-    setSaveFeedback(null);
-
-    if (!isWavFileName(file.name)) {
-      setProgress({
-        ...INITIAL_PROGRESS,
-        phase: 'error',
-        sourceFileName: file.name,
-        message: 'Unsupported file extension. Please choose a .wav PCM audio file.',
-      });
-      return;
-    }
-
+  const runExportForFile = async (file: File) => {
     const canvasEl = canvasRef.current;
     if (!canvasEl) {
       setProgress({
@@ -133,7 +117,7 @@ export const SilentVideoExport: React.FC<SilentVideoExportProps> = ({
       setResult(null);
     }
 
-    // Wake AudioContext immediately inside the file-change gesture before async header/OPFS checks
+    // Wake AudioContext inside the user gesture before async header/OPFS checks
     await audioEngine.resumeContext();
 
     const controller = startSilentVideoExport({
@@ -151,13 +135,47 @@ export const SilentVideoExport: React.FC<SilentVideoExportProps> = ({
       const exported = await controller.promise;
       if (controllerRef.current === controller) {
         controllerRef.current = null;
+        setPendingWavFile(null);
         setResult(exported);
       }
-    } catch {
+    } catch (err) {
       if (controllerRef.current === controller) {
         controllerRef.current = null;
       }
+      if (err instanceof Error && err.name === 'AudioContextSuspendedError') {
+        setPendingWavFile(file);
+      }
     }
+  };
+
+  const handleWavSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const input = e.currentTarget;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file) return;
+
+    setSaveFeedback(null);
+    setPendingWavFile(null);
+
+    if (!isWavFileName(file.name)) {
+      setProgress({
+        ...INITIAL_PROGRESS,
+        phase: 'error',
+        sourceFileName: file.name,
+        message: 'Unsupported file extension. Please choose a .wav PCM audio file.',
+      });
+      return;
+    }
+
+    await runExportForFile(file);
+  };
+
+  const handleResumePendingExport = async () => {
+    if (!pendingWavFile) return;
+    const file = pendingWavFile;
+    setPendingWavFile(null);
+    setSaveFeedback(null);
+    await runExportForFile(file);
   };
 
   const handleCancel = async () => {
@@ -209,7 +227,12 @@ export const SilentVideoExport: React.FC<SilentVideoExportProps> = ({
       data-export-bytes={String(progress.bytesWritten)}
       className="w-full max-w-xl mx-auto rounded-xl bg-slate-900/75 border border-slate-800/90 text-slate-200 text-xs"
     >
-      <summary className="list-none cursor-pointer select-none px-4 py-2.5 flex items-center justify-between gap-3 text-slate-300 hover:text-white transition-colors">
+      <summary
+        onClick={() => {
+          void audioEngine.resumeContext();
+        }}
+        className="list-none cursor-pointer select-none px-4 py-2.5 flex items-center justify-between gap-3 text-slate-300 hover:text-white transition-colors"
+      >
         <span className="flex items-center gap-2 font-medium">
           <Video className="w-3.5 h-3.5 text-sky-400 shrink-0" />
           <span>Export Silent Video (WAV)</span>
@@ -244,12 +267,26 @@ export const SilentVideoExport: React.FC<SilentVideoExportProps> = ({
                 />
                 <label
                   htmlFor={wavInputId}
+                  onClick={() => {
+                    void audioEngine.resumeContext();
+                  }}
                   className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-100 border border-slate-700 cursor-pointer select-none peer-focus-visible:ring-2 peer-focus-visible:ring-sky-400 transition-colors"
                 >
                   <Upload className="w-3.5 h-3.5" />
                   <span>{result ? 'Export Another WAV' : 'Choose WAV File'}</span>
                 </label>
               </>
+            )}
+
+            {!isActive && pendingWavFile && (
+              <button
+                type="button"
+                onClick={handleResumePendingExport}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-semibold bg-sky-600 hover:bg-sky-500 text-white transition-colors"
+              >
+                <Play className="w-3.5 h-3.5 fill-current" />
+                <span>Start Silent Export</span>
+              </button>
             )}
 
             {progress.sourceFileName && (

@@ -80,7 +80,18 @@ async function readByteSlice(source: WavByteSource, start: number, end: number):
   if (start < 0 || end < start || end > source.size) {
     throw new Error(`WAV read out of bounds [${start}, ${end}) for file size ${source.size}.`);
   }
-  const buf = await source.slice(start, end).arrayBuffer();
+  const slicePromise = source.slice(start, end).arrayBuffer();
+  let timerId: ReturnType<typeof setTimeout> | null = null;
+  const buf = await Promise.race([
+    slicePromise,
+    new Promise<never>((_, reject) => {
+      timerId = setTimeout(() => {
+        reject(new Error(`Timed out reading WAV byte range [${start}, ${end}).`));
+      }, 10_000);
+    }),
+  ]).finally(() => {
+    if (timerId !== null) clearTimeout(timerId);
+  });
   if (buf.byteLength !== end - start) {
     throw new Error(`Truncated WAV read: expected ${end - start} bytes, got ${buf.byteLength}.`);
   }

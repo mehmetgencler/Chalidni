@@ -2904,4 +2904,62 @@ test('32. Silent video codec selection prioritizes H.264 MP4 and pairs container
   }
 });
 
+test('33. AudioEngine.startSilentWavStream rejects promptly with AudioContextSuspendedError instead of hanging if resume() never resolves', async () => {
+  const prevWindow = (globalThis as Record<string, unknown>).window;
+  const prevAudioWorkletNode = (globalThis as Record<string, unknown>).AudioWorkletNode;
+  const prevAudioContext = (globalThis as Record<string, unknown>).AudioContext;
 
+  try {
+    const wavBytes = buildCustomWavBuffer({
+      audioFormat: 0x0001,
+      channels: 1,
+      sampleRate: 8000,
+      bitsPerSample: 16,
+      frames: [[0.1], [0.2], [0.3], [0.4]],
+    });
+    const wavSource = makeSliceOnlySource(wavBytes);
+
+    class MockWorkletNode {
+      port = { onmessage: null, postMessage: () => {} };
+      connect() {}
+    }
+
+    class MockSuspendedAudioContext {
+      sampleRate = 8000;
+      state = 'suspended';
+      currentTime = 0;
+      destination = {};
+      audioWorklet = { addModule: async () => {} };
+      resume = () => new Promise<void>(() => {}); // Never resolves (simulates iOS/Safari suspended without gesture)
+      close = async () => {};
+      createGain = () => ({
+        channelCount: 2,
+        channelCountMode: 'max',
+        gain: { setValueAtTime: () => {}, cancelScheduledValues: () => {}, setTargetAtTime: () => {} },
+        connect: () => {},
+      });
+    }
+
+    (globalThis as Record<string, unknown>).window = {
+      AudioContext: MockSuspendedAudioContext,
+      location: { search: '' },
+    };
+    (globalThis as Record<string, unknown>).AudioWorkletNode = MockWorkletNode;
+    (globalThis as Record<string, unknown>).AudioContext = MockSuspendedAudioContext;
+
+    const engine = new AudioEngine();
+    const t0 = Date.now();
+    await assert.rejects(
+      () => engine.startSilentWavStream(wavSource),
+      (err: unknown) =>
+        err instanceof Error && err.name === 'AudioContextSuspendedError' && /Start Silent Export/i.test(err.message)
+    );
+    const elapsedMs = Date.now() - t0;
+    assert.ok(elapsedMs < 1500, `Suspended AudioContext check must abort promptly (<1500ms), took ${elapsedMs}ms`);
+    engine.cleanup();
+  } finally {
+    (globalThis as Record<string, unknown>).window = prevWindow;
+    (globalThis as Record<string, unknown>).AudioWorkletNode = prevAudioWorkletNode;
+    (globalThis as Record<string, unknown>).AudioContext = prevAudioContext;
+  }
+});
