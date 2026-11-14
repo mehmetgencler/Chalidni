@@ -225,6 +225,11 @@ export const SilentVideoExport: React.FC<SilentVideoExportProps> = ({
       data-export-ext={progress.codec?.extension ?? ''}
       data-export-audio-tracks={result ? String(result.audioTrackCount) : ''}
       data-export-bytes={String(progress.bytesWritten)}
+      data-capture-fps={result?.captureMetrics ? String(result.captureMetrics.averageFps) : ''}
+      data-capture-frames={result?.captureMetrics ? String(result.captureMetrics.capturedFrames) : ''}
+      data-capture-min-rolling-fps={result?.captureMetrics?.minRollingFps != null ? String(result.captureMetrics.minRollingFps) : ''}
+      data-capture-max-interval-ms={result?.captureMetrics ? String(result.captureMetrics.maxIntervalMs) : ''}
+      data-capture-warnings={result?.captureMetrics ? String(result.captureMetrics.warningCount) : ''}
       className="w-full max-w-xl mx-auto rounded-xl bg-slate-900/75 border border-slate-800/90 text-slate-200 text-xs"
     >
       <summary

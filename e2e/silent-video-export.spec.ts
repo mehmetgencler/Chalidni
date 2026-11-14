@@ -327,7 +327,7 @@ test.describe('Memory-Bounded Silent WAV-to-Video Export E2E', () => {
   test('4. Resonance 269.815 Hz silent export renders live moving particles on PlateCanvas and produces non-static decoded video frames', async ({
     page,
   }) => {
-    test.setTimeout(75_000);
+    test.setTimeout(90_000);
     const consoleErrors: string[] = [];
     page.on('console', (msg) => {
       if (msg.type() === 'error') consoleErrors.push(msg.text());
@@ -523,50 +523,86 @@ test.describe('Memory-Bounded Silent WAV-to-Video Export E2E', () => {
       const earlyVsLate = diffFrames(frames[0], frames[2]);
       const midVsLate = diffFrames(frames[1], frames[2]);
 
-      // Measure actual encoded FPS across a 1.5s 1.0x playback window using requestVideoFrameCallback
-      let measuredFps = 0;
-      let sampleFrameCount = 0;
-      await seekTo(0.5);
-      vid.playbackRate = 1.0;
+      // Measure actual decoded/presented frame cadence across >= 5.0 s 1.0x playback using requestVideoFrameCallback
       const rvfcVid = vid as HTMLVideoElement & {
         requestVideoFrameCallback?: (
           cb: (now: number, meta: { mediaTime: number; presentedFrames: number }) => void
         ) => number;
       };
-      if (typeof rvfcVid.requestVideoFrameCallback === 'function') {
-        let firstMediaTime: number | null = null;
-        let lastMediaTime: number | null = null;
-        let callbackHandle = 0;
-        let finishedSampling = false;
-        await new Promise<void>((resolve) => {
-          const doneTimer = setTimeout(() => {
-            finishedSampling = true;
-            resolve();
-          }, 1600);
-          const onFrame = (_now: number, meta: { mediaTime: number }) => {
-            if (finishedSampling) return;
-            if (firstMediaTime === null) {
-              firstMediaTime = meta.mediaTime;
-            }
-            lastMediaTime = meta.mediaTime;
-            sampleFrameCount++;
-            if (meta.mediaTime - firstMediaTime >= 1.35 || sampleFrameCount >= 50) {
-              finishedSampling = true;
-              clearTimeout(doneTimer);
-              resolve();
-              return;
-            }
-            callbackHandle = rvfcVid.requestVideoFrameCallback!(onFrame);
-          };
-          callbackHandle = rvfcVid.requestVideoFrameCallback!(onFrame);
-          void vid.play();
-        });
-        void callbackHandle;
-        vid.pause();
-        if (firstMediaTime !== null && lastMediaTime !== null && lastMediaTime > firstMediaTime) {
-          measuredFps = Number(((sampleFrameCount - 1) / (lastMediaTime - firstMediaTime)).toFixed(2));
-        }
+      if (typeof rvfcVid.requestVideoFrameCallback !== 'function') {
+        throw new Error('requestVideoFrameCallback is required for decoded frame cadence measurement');
       }
+
+      const uniqueMediaTimes: number[] = [];
+      let rvfcCallbackCount = 0;
+      let duplicateMediaTimeCallbacks = 0;
+      await seekTo(0.5);
+      vid.playbackRate = 1.0;
+
+      let finishedSampling = false;
+      await new Promise<void>((resolve) => {
+        const doneTimer = setTimeout(() => {
+          finishedSampling = true;
+          resolve();
+        }, 7500);
+        const onFrame = (_now: number, meta: { mediaTime: number }) => {
+          if (finishedSampling) return;
+          rvfcCallbackCount++;
+          const prev = uniqueMediaTimes.length > 0 ? uniqueMediaTimes[uniqueMediaTimes.length - 1] : null;
+          if (prev === null || meta.mediaTime > prev + 1e-6) {
+            uniqueMediaTimes.push(meta.mediaTime);
+          } else {
+            duplicateMediaTimeCallbacks++;
+          }
+          const span = uniqueMediaTimes[uniqueMediaTimes.length - 1] - uniqueMediaTimes[0];
+          if (span >= 5.5 || vid.ended) {
+            finishedSampling = true;
+            clearTimeout(doneTimer);
+            resolve();
+            return;
+          }
+          rvfcVid.requestVideoFrameCallback!(onFrame);
+        };
+        rvfcVid.requestVideoFrameCallback!(onFrame);
+        void vid.play();
+      });
+      vid.pause();
+
+      const presentedFrames = uniqueMediaTimes.length;
+      const mediaTimeSpanSec =
+        presentedFrames >= 2
+          ? Number((uniqueMediaTimes[presentedFrames - 1] - uniqueMediaTimes[0]).toFixed(4))
+          : 0;
+      const decodedFps =
+        presentedFrames >= 2 && mediaTimeSpanSec > 0
+          ? Number(((presentedFrames - 1) / mediaTimeSpanSec).toFixed(2))
+          : 0;
+
+      const intervalsMs: number[] = [];
+      for (let i = 1; i < uniqueMediaTimes.length; i++) {
+        intervalsMs.push((uniqueMediaTimes[i] - uniqueMediaTimes[i - 1]) * 1000);
+      }
+      const sortedIntervals = [...intervalsMs].sort((a, b) => a - b);
+      const percentile = (sorted: number[], p: number): number => {
+        if (sorted.length === 0) return 0;
+        const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil(p * sorted.length) - 1));
+        return Number(sorted[idx].toFixed(2));
+      };
+      const medianIntervalMs =
+        sortedIntervals.length === 0
+          ? 0
+          : sortedIntervals.length % 2 === 1
+            ? Number(sortedIntervals[(sortedIntervals.length - 1) / 2].toFixed(2))
+            : Number(
+                (
+                  (sortedIntervals[sortedIntervals.length / 2 - 1] +
+                    sortedIntervals[sortedIntervals.length / 2]) /
+                  2
+                ).toFixed(2)
+              );
+      const p95IntervalMs = percentile(sortedIntervals, 0.95);
+      const maxIntervalMs =
+        sortedIntervals.length > 0 ? Number(sortedIntervals[sortedIntervals.length - 1].toFixed(2)) : 0;
 
       const width = vid.videoWidth;
       const height = vid.videoHeight;
@@ -579,26 +615,43 @@ test.describe('Memory-Bounded Silent WAV-to-Video Export E2E', () => {
         height,
         seekWorked,
         actualTimes,
-        sampleFrameCount,
-        measuredFps,
+        presentedFrames,
+        rvfcCallbackCount,
+        duplicateMediaTimeCallbacks,
+        mediaTimeSpanSec,
+        decodedFps,
+        medianIntervalMs,
+        p95IntervalMs,
+        maxIntervalMs,
         earlyVsMid,
         earlyVsLate,
         midVsLate,
       };
     });
 
+    const captureLoopMetrics = {
+      captureFps: Number((await exportDetails.getAttribute('data-capture-fps')) || '0'),
+      capturedFrames: Number((await exportDetails.getAttribute('data-capture-frames')) || '0'),
+      minRollingFps: await exportDetails.getAttribute('data-capture-min-rolling-fps'),
+      maxCaptureIntervalMs: Number((await exportDetails.getAttribute('data-capture-max-interval-ms')) || '0'),
+      warningCount: Number((await exportDetails.getAttribute('data-capture-warnings')) || '0'),
+    };
+
     console.log(
       '[E2E Test 4 Telemetry]',
-      JSON.stringify({ liveEarly, liveLate, liveCanvasDiff, decodedDiff })
+      JSON.stringify({ liveEarly, liveLate, liveCanvasDiff, captureLoopMetrics, decodedDiff })
     );
 
     expect(decodedDiff.width).toBe(480);
     expect(decodedDiff.height).toBe(480);
-    expect(decodedDiff.measuredFps).toBeGreaterThan(20);
+    expect(decodedDiff.mediaTimeSpanSec).toBeGreaterThanOrEqual(5.0);
+    expect(decodedDiff.decodedFps).toBeGreaterThanOrEqual(25);
     expect(decodedDiff.earlyVsMid.changedPixels).toBeGreaterThan(2000);
     expect(decodedDiff.earlyVsMid.totalAbsRgbDiff).toBeGreaterThan(100_000);
     expect(decodedDiff.earlyVsLate.changedPixels).toBeGreaterThan(2000);
     expect(decodedDiff.earlyVsLate.totalAbsRgbDiff).toBeGreaterThan(100_000);
+    expect(decodedDiff.midVsLate.changedPixels).toBeGreaterThan(2000);
+    expect(decodedDiff.midVsLate.totalAbsRgbDiff).toBeGreaterThan(100_000);
 
     // Clean up OPFS file
     await page.getByRole('button', { name: 'Discard' }).click();
