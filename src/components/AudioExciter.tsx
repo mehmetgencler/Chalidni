@@ -8,7 +8,7 @@
  * 4. Zero unnecessary presets, gain sliders, or mode toggles.
  */
 
-import React, { useRef, useState, useEffect } from 'react';
+import React, { useId, useState, useEffect } from 'react';
 import { Play, Pause, Upload, Volume2, Square, Music } from 'lucide-react';
 import { AudioEngine, PlaybackProgress } from '../audio/audioEngine.ts';
 
@@ -47,6 +47,13 @@ function formatTime(seconds: number): string {
   return `${m}:${s < 10 ? '0' : ''}${s}`;
 }
 
+function isSupportedAudioFilename(fileName: string): boolean {
+  const lower = fileName.trim().toLowerCase();
+  return lower.endsWith('.mp3') || lower.endsWith('.wav');
+}
+
+const ACCEPTED_AUDIO_TYPES = '.mp3,.wav,audio/mpeg,audio/mp3,audio/wav,audio/x-wav,audio/wave';
+
 export const AudioExciter: React.FC<AudioExciterProps> = ({
   audioEngine,
   onFrequencyChange,
@@ -63,8 +70,9 @@ export const AudioExciter: React.FC<AudioExciterProps> = ({
     isPlaying: false,
     fileName: '',
   });
+  const [fileError, setFileError] = useState<string | null>(null);
 
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const fileInputId = useId();
 
   // Subscribe to file progress
   useEffect(() => {
@@ -99,8 +107,18 @@ export const AudioExciter: React.FC<AudioExciterProps> = ({
 
   // Handle audio file selection
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+    const input = e.currentTarget;
+    const file = input.files?.[0];
+    // Reset value immediately after capturing File so the same file can be re-selected
+    input.value = '';
     if (!file) return;
+
+    if (!isSupportedAudioFilename(file.name)) {
+      setFileError('Unsupported file format. Please select an .mp3 or .wav file.');
+      return;
+    }
+
+    setFileError(null);
 
     if (isToneActive) {
       audioEngine.stopTone();
@@ -108,15 +126,22 @@ export const AudioExciter: React.FC<AudioExciterProps> = ({
       onToneStateChange(false, frequency);
     }
 
-    await audioEngine.resumeContext();
-    const ok = await audioEngine.loadAudioFile(file);
-    if (ok) {
-      setActiveTab('file');
+    try {
+      await audioEngine.resumeContext();
+      const ok = await audioEngine.loadAudioFile(file);
+      if (ok) {
+        setActiveTab('file');
+      } else {
+        setFileError(`Unable to load or start playback for "${file.name}". Tap Play to retry or choose another MP3/WAV file.`);
+      }
+    } catch {
+      setFileError(`Unable to load or start playback for "${file.name}". Tap Play to retry or choose another MP3/WAV file.`);
     }
   };
 
   // Toggle audio file play / pause
   const handleToggleFilePlay = async () => {
+    setFileError(null);
     if (isToneActive) {
       audioEngine.stopTone();
       setIsToneActive(false);
@@ -222,22 +247,21 @@ export const AudioExciter: React.FC<AudioExciterProps> = ({
       {/* SECTION B: UPLOADED AUDIO FILE PLAYBACK */}
       {activeTab === 'file' && (
         <div className="flex flex-col gap-3 py-1">
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="audio/*"
-            onChange={handleFileSelect}
-            className="hidden"
-          />
-
           <div className="flex items-center justify-between gap-3">
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              className="flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors shadow-sm"
+            <input
+              id={fileInputId}
+              type="file"
+              accept={ACCEPTED_AUDIO_TYPES}
+              onChange={handleFileSelect}
+              className="peer sr-only"
+            />
+            <label
+              htmlFor={fileInputId}
+              className="flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 transition-colors shadow-sm cursor-pointer select-none peer-focus-visible:ring-2 peer-focus-visible:ring-sky-400"
             >
               <Upload className="w-3.5 h-3.5" />
               <span>{fileProgress.fileName ? 'Change Audio File' : 'Choose Audio File'}</span>
-            </button>
+            </label>
 
             {fileProgress.fileName ? (
               <span className="text-xs text-slate-300 truncate max-w-[220px] font-medium" title={fileProgress.fileName}>
@@ -266,6 +290,13 @@ export const AudioExciter: React.FC<AudioExciterProps> = ({
               </button>
             )}
           </div>
+
+          {/* Validation / load error feedback */}
+          {fileError && (
+            <p role="alert" className="text-xs text-rose-400">
+              {fileError}
+            </p>
+          )}
 
           {/* Audio progress bar */}
           {fileProgress.fileName && (

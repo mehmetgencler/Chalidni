@@ -48,7 +48,17 @@ export class AudioEngine {
   private currentFrequency = 269.82; // Default to (1,3)+(3,1) Chladni resonance
   private isTonePlaying = false;
 
-  // HTML5 audio file streaming
+  // Uploaded audio file playback: primary Web Audio AudioBufferSourceNode (iOS Safari compatible)
+  // with HTMLAudioElement MediaElementAudioSourceNode fallback
+  private audioBuffer: AudioBuffer | null = null;
+  private bufferSource: AudioBufferSourceNode | null = null;
+  private fileInputSplitter: ChannelSplitterNode | null = null;
+  private fileDownmixMerger: GainNode | null = null;
+  private filePlaybackStartCtxTime = 0;
+  private filePlaybackOffsetSec = 0;
+  private isBufferPlaying = false;
+  private progressTimerId: ReturnType<typeof setInterval> | null = null;
+
   private audioElement: HTMLAudioElement | null = null;
   private mediaElementSource: MediaElementAudioSourceNode | null = null;
   private fileGain: GainNode | null = null;
@@ -81,6 +91,30 @@ export class AudioEngine {
     return this.currentFrequency;
   }
 
+  private triggerContextResume(): Promise<void> | null {
+    if (!this.ctx || (this.ctx.state as string) === 'running') {
+      return null;
+    }
+    return this.ctx.resume().catch(() => {
+      // Caller inspects ctx.state and keeps file ready until explicit Play tap if still suspended
+    });
+  }
+
+  private async waitForContextResumeBounded(promise: Promise<void> | null, timeoutMs: number = 150): Promise<void> {
+    if (!promise || !this.ctx || (this.ctx.state as string) === 'running') return;
+    let timerId: ReturnType<typeof setTimeout> | null = null;
+    try {
+      await Promise.race([
+        promise,
+        new Promise<void>((resolve) => {
+          timerId = setTimeout(resolve, timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timerId !== null) clearTimeout(timerId);
+    }
+  }
+
   /**
    * Initializes the AudioContext and registers the AudioWorkletProcessor module
    */
@@ -100,11 +134,11 @@ export class AudioEngine {
       this.ctx = sampleRateOpt ? new AudioContextClass({ sampleRate: sampleRateOpt }) : new AudioContextClass();
     }
 
-    if (this.ctx.state === 'suspended') {
-      await this.ctx.resume();
-    }
-
+    // Trigger resume synchronously before awaiting ensureWorklet so browser gesture activation is preserved,
+    // without deadlocking if the browser defers resume outside a synchronous tap (e.g. after file picker closes).
+    const resumePromise = this.triggerContextResume();
     await this.ensureWorklet();
+    await this.waitForContextResumeBounded(resumePromise, 150);
     return this.ctx;
   }
 
@@ -251,14 +285,39 @@ export class AudioEngine {
     };
   }
 
+  private getCurrentBufferPlaybackTime(): number {
+    if (!this.audioBuffer) return 0;
+    if (!this.isBufferPlaying || !this.ctx) {
+      return Math.max(0, Math.min(this.audioBuffer.duration, this.filePlaybackOffsetSec));
+    }
+    const elapsed = Math.max(0, this.ctx.currentTime - this.filePlaybackStartCtxTime);
+    return Math.max(0, Math.min(this.audioBuffer.duration, this.filePlaybackOffsetSec + elapsed));
+  }
+
   private notifyProgress(): void {
-    if (!this.audioElement) return;
-    const progress: PlaybackProgress = {
-      currentTime: this.audioElement.currentTime || 0,
-      duration: this.audioElement.duration || 0,
-      isPlaying: !this.audioElement.paused && !this.audioElement.ended,
-      fileName: this.currentFileName,
-    };
+    let progress: PlaybackProgress | null = null;
+    if (this.audioBuffer) {
+      progress = {
+        currentTime: this.getCurrentBufferPlaybackTime(),
+        duration: this.audioBuffer.duration || 0,
+        isPlaying: this.isBufferPlaying,
+        fileName: this.currentFileName,
+      };
+    } else if (this.audioElement && this.currentFileName) {
+      progress = {
+        currentTime: this.audioElement.currentTime || 0,
+        duration: this.audioElement.duration || 0,
+        isPlaying: !this.audioElement.paused && !this.audioElement.ended,
+        fileName: this.currentFileName,
+      };
+    } else {
+      progress = {
+        currentTime: 0,
+        duration: 0,
+        isPlaying: false,
+        fileName: '',
+      };
+    }
     for (const listener of this.progressListeners) {
       listener(progress);
     }
@@ -266,8 +325,8 @@ export class AudioEngine {
 
   async resumeContext(): Promise<void> {
     const ctx = await this.initContext();
-    if (ctx.state === 'suspended') {
-      await ctx.resume();
+    if ((ctx.state as string) !== 'running') {
+      await this.waitForContextResumeBounded(this.triggerContextResume(), 150);
     }
   }
 
@@ -333,15 +392,140 @@ export class AudioEngine {
   /* UPLOADED AUDIO FILE STREAMING                                              */
   /* -------------------------------------------------------------------------- */
 
+  private ensureFileDownmixBus(): void {
+    if (!this.ctx || !this.fileGain) return;
+    if (this.fileInputSplitter && this.fileDownmixMerger) return;
+
+    this.fileGain.channelCount = 1;
+    this.fileGain.channelCountMode = 'explicit';
+
+    const splitter = this.ctx.createChannelSplitter(2);
+    const merger = this.ctx.createGain();
+    merger.channelCount = 1;
+    merger.channelCountMode = 'explicit';
+    merger.gain.setValueAtTime(0.5, this.ctx.currentTime); // 0.5 * (L + R)
+
+    splitter.connect(merger, 0); // L
+    splitter.connect(merger, 1); // R
+    merger.connect(this.fileGain);
+
+    this.fileInputSplitter = splitter;
+    this.fileDownmixMerger = merger;
+  }
+
+  private stopProgressTimer(): void {
+    if (this.progressTimerId !== null) {
+      clearInterval(this.progressTimerId);
+      this.progressTimerId = null;
+    }
+  }
+
+  private startProgressTimer(): void {
+    this.stopProgressTimer();
+    this.progressTimerId = setInterval(() => {
+      if (!this.isBufferPlaying) {
+        this.stopProgressTimer();
+        return;
+      }
+      this.notifyProgress();
+    }, 150);
+  }
+
+  private teardownBufferSource(): void {
+    if (this.bufferSource) {
+      this.bufferSource.onended = null;
+      try {
+        this.bufferSource.stop();
+      } catch {
+        // already stopped
+      }
+      try {
+        this.bufferSource.disconnect();
+      } catch {
+        // already disconnected
+      }
+      this.bufferSource = null;
+    }
+  }
+
+  private startBufferPlayback(offsetSec: number): void {
+    if (!this.ctx || !this.audioBuffer || !this.fileInputSplitter || !this.fileDownmixMerger) return;
+
+    this.teardownBufferSource();
+
+    const duration = this.audioBuffer.duration || 0;
+    const clampedOffset = duration > 0 && offsetSec >= duration - 0.01 ? 0 : Math.max(0, Math.min(duration, offsetSec));
+
+    const gainVal = this.audioBuffer.numberOfChannels <= 1 ? 1.0 : 0.5;
+    this.fileDownmixMerger.gain.setValueAtTime(gainVal, this.ctx.currentTime);
+
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.audioBuffer;
+    src.loop = false;
+
+    // Route decoded buffer through exact same 0.5 * (L + R) worklet bus AND stereo speakers
+    src.connect(this.fileInputSplitter);
+    src.connect(this.ctx.destination);
+    this.isFileAudibleToDestination = true;
+
+    this.filePlaybackOffsetSec = clampedOffset;
+    this.filePlaybackStartCtxTime = this.ctx.currentTime;
+    this.isBufferPlaying = true;
+    this.bufferSource = src;
+
+    src.onended = () => {
+      if (this.bufferSource !== src) return;
+      this.bufferSource = null;
+      this.isBufferPlaying = false;
+      this.filePlaybackOffsetSec = duration;
+      this.stopProgressTimer();
+      this.notifyProgress();
+      // Worklet continues modal free decay automatically
+    };
+
+    src.start(0, clampedOffset);
+    this.startProgressTimer();
+    this.notifyProgress();
+  }
+
   async loadAudioFile(file: File): Promise<boolean> {
     try {
       await this.initContext();
       if (!this.ctx || !this.fileGain) return false;
 
       this.stopTone();
+      this.stopAudioFile();
+      this.audioBuffer = null;
       this.sourceType = 'file';
       this.currentFileName = file.name;
+      this.ensureFileDownmixBus();
 
+      // Primary path: decode into AudioBuffer so samples feed AudioWorklet directly inside Web Audio
+      // (avoids iOS/macOS Safari MediaElementAudioSourceNode outputting silent zeros for blob: URLs)
+      try {
+        const arrayBuf = await file.arrayBuffer();
+        const decoded = await this.ctx.decodeAudioData(arrayBuf.slice(0));
+        this.audioBuffer = decoded;
+        this.filePlaybackOffsetSec = 0;
+        this.isBufferPlaying = false;
+
+        if ((this.ctx.state as string) !== 'running') {
+          await this.waitForContextResumeBounded(this.triggerContextResume(), 100);
+        }
+
+        if ((this.ctx.state as string) === 'running') {
+          this.startBufferPlayback(0);
+        } else {
+          this.isFileAudibleToDestination = true;
+          this.notifyProgress();
+        }
+        return true;
+      } catch (decodeErr) {
+        console.warn('decodeAudioData fallback to MediaElementAudioSourceNode:', decodeErr);
+        this.audioBuffer = null;
+      }
+
+      // Fallback path for containers/codecs handled by HTMLAudioElement only
       if (this.audioFileUrl) {
         URL.revokeObjectURL(this.audioFileUrl);
       }
@@ -351,18 +535,8 @@ export class AudioEngine {
         this.audioElement = new Audio();
         this.audioElement.loop = false; // Never loop by default
 
-        // Handle stereo input: downmix to mono for plate excitation,
-        // while routing full stereo to user's system output!
         this.mediaElementSource = this.ctx.createMediaElementSource(this.audioElement);
-
-        const splitter = this.ctx.createChannelSplitter(2);
-        const merger = this.ctx.createGain();
-        merger.gain.setValueAtTime(0.5, this.ctx.currentTime); // 0.5 * (L + R)
-
-        this.mediaElementSource.connect(splitter);
-        splitter.connect(merger, 0); // L
-        splitter.connect(merger, 1); // R
-        merger.connect(this.fileGain);
+        this.mediaElementSource.connect(this.fileInputSplitter!);
 
         // Audible system output in full stereo
         this.mediaElementSource.connect(this.ctx.destination);
@@ -381,20 +555,62 @@ export class AudioEngine {
       return true;
     } catch (err) {
       console.error('Failed to load audio file:', err);
+      this.audioBuffer = null;
+      this.currentFileName = '';
+      this.notifyProgress();
       return false;
     }
   }
 
   playAudioFile(): void {
+    this.stopTone();
+    this.sourceType = 'file';
+    if (this.audioBuffer && this.ctx) {
+      const startPlay = () => {
+        if (this.audioBuffer && !this.isBufferPlaying) {
+          this.startBufferPlayback(this.filePlaybackOffsetSec);
+        }
+      };
+      if ((this.ctx.state as string) !== 'running') {
+        const pending = this.triggerContextResume();
+        if (pending) {
+          pending
+            .then(() => {
+              if (this.ctx && (this.ctx.state as string) === 'running') {
+                startPlay();
+              } else if (this.ctx) {
+                return this.ctx.resume().then(startPlay);
+              }
+            })
+            .catch(console.error);
+        } else {
+          this.ctx.resume().then(startPlay).catch(console.error);
+        }
+      } else {
+        startPlay();
+      }
+      return;
+    }
     if (this.audioElement) {
-      this.stopTone();
-      this.sourceType = 'file';
+      if (this.ctx && (this.ctx.state as string) !== 'running') {
+        this.triggerContextResume();
+      }
       this.audioElement.play().catch(console.error);
       this.notifyProgress();
     }
   }
 
   pauseAudioFile(): void {
+    if (this.audioBuffer) {
+      if (this.isBufferPlaying) {
+        this.filePlaybackOffsetSec = this.getCurrentBufferPlaybackTime();
+        this.isBufferPlaying = false;
+        this.teardownBufferSource();
+        this.stopProgressTimer();
+      }
+      this.notifyProgress();
+      return;
+    }
     if (this.audioElement) {
       this.audioElement.pause();
       this.notifyProgress();
@@ -403,13 +619,32 @@ export class AudioEngine {
   }
 
   seekAudioFile(timeSec: number): void {
-    if (this.audioElement && Number.isFinite(timeSec)) {
+    if (!Number.isFinite(timeSec)) return;
+    if (this.audioBuffer) {
+      const duration = this.audioBuffer.duration || 0;
+      const clamped = Math.max(0, Math.min(duration, timeSec));
+      this.filePlaybackOffsetSec = clamped;
+      if (this.isBufferPlaying) {
+        this.startBufferPlayback(clamped);
+      } else {
+        this.notifyProgress();
+      }
+      return;
+    }
+    if (this.audioElement) {
       this.audioElement.currentTime = Math.max(0, Math.min(this.audioElement.duration || 0, timeSec));
       this.notifyProgress();
     }
   }
 
   stopAudioFile(): void {
+    if (this.audioBuffer) {
+      this.isBufferPlaying = false;
+      this.filePlaybackOffsetSec = 0;
+      this.teardownBufferSource();
+      this.stopProgressTimer();
+      this.notifyProgress();
+    }
     if (this.audioElement) {
       this.audioElement.pause();
       this.audioElement.currentTime = 0;
@@ -420,6 +655,8 @@ export class AudioEngine {
   cleanup(): void {
     this.stopTone();
     this.stopAudioFile();
+    this.stopProgressTimer();
+    this.audioBuffer = null;
     if (this.audioFileUrl) {
       URL.revokeObjectURL(this.audioFileUrl);
       this.audioFileUrl = null;

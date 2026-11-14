@@ -1873,7 +1873,153 @@ test('24. External powder feed & perimeter recycling are gated by actual interio
   }
 });
 
+test('25. AudioEngine decodeAudioData + AudioBufferSourceNode routes audio to both AudioWorklet and speakers without deadlocking on suspended resume', async () => {
+  const prevWindow = (globalThis as Record<string, unknown>).window;
+  const prevAudioWorkletNode = (globalThis as Record<string, unknown>).AudioWorkletNode;
+  const prevAudioContext = (globalThis as Record<string, unknown>).AudioContext;
 
+  try {
+    const mergerGainCalls: number[] = [];
+    const bufferConnections: { sourceId: number; to: string }[] = [];
+    const startedOffsets: number[] = [];
+    let allowResume = false;
+    let mockState: 'suspended' | 'running' = 'suspended';
+    let sourceSeq = 0;
+    const createdSources: { onended: (() => void) | null }[] = [];
+    let decodeChannels = 2;
 
+    const makeGain = (name: string) => ({
+      name,
+      channelCount: 2,
+      channelCountMode: 'max',
+      gain: {
+        value: 1,
+        setValueAtTime: (v: number) => {
+          if (name === 'gain_merger' || name.startsWith('gain_')) {
+            mergerGainCalls.push(v);
+          }
+        },
+        cancelScheduledValues: () => {},
+        setTargetAtTime: () => {},
+      },
+      connect: () => {},
+    });
 
+    class MockWorkletNode {
+      name = 'workletNode';
+      port = { onmessage: null, postMessage: () => {} };
+      connect() {}
+    }
 
+    class MockAudioContext {
+      sampleRate = 44100;
+      currentTime = 0;
+      destination = { name: 'destination' };
+      audioWorklet = { addModule: async () => {} };
+      private gainCount = 0;
+      get state() {
+        return mockState;
+      }
+      resume() {
+        if (!allowResume) {
+          // Simulate WebKit/Safari keeping resume pending when invoked outside synchronous tap
+          return new Promise<void>(() => {});
+        }
+        mockState = 'running';
+        return Promise.resolve();
+      }
+      close = async () => {};
+      createGain = () => {
+        this.gainCount += 1;
+        return makeGain(`gain_${this.gainCount}`);
+      };
+      createChannelSplitter = () => ({
+        name: 'channelSplitter',
+        connect: () => {},
+      });
+      createBufferSource = () => {
+        const id = ++sourceSeq;
+        const src = {
+          buffer: null as unknown,
+          loop: false,
+          onended: null as (() => void) | null,
+          connect: (target: { name?: string }) => {
+            bufferConnections.push({ sourceId: id, to: target.name || 'unknown' });
+          },
+          start: (_when?: number, offset?: number) => {
+            startedOffsets.push(offset ?? 0);
+          },
+          stop: () => {},
+          disconnect: () => {},
+        };
+        createdSources.push(src);
+        return src;
+      };
+      decodeAudioData = async () => ({
+        duration: 4.5,
+        numberOfChannels: decodeChannels,
+        sampleRate: 44100,
+      });
+    }
+
+    (globalThis as Record<string, unknown>).AudioWorkletNode = MockWorkletNode;
+    (globalThis as Record<string, unknown>).AudioContext = MockAudioContext;
+    (globalThis as Record<string, unknown>).window = {
+      AudioContext: MockAudioContext,
+      location: { search: '' },
+    };
+
+    const engine = new AudioEngine();
+    const events: { isPlaying: boolean; duration: number; fileName: string; currentTime: number }[] = [];
+    engine.onProgress((p) => events.push({ ...p }));
+
+    const fakeFile = new File([new Uint8Array(64)], 'music-track.mp3', { type: 'audio/mpeg' });
+
+    // 1) Suspended context & blocked resume (file picker return): must NOT hang, loads buffer ready for Play tap
+    const t0 = Date.now();
+    const loadedSuspended = await engine.loadAudioFile(fakeFile);
+    const elapsedMs = Date.now() - t0;
+    assert.equal(loadedSuspended, true);
+    assert.ok(elapsedMs < 1500, `Suspended loadAudioFile must not deadlock (took ${elapsedMs} ms)`);
+    assert.equal(startedOffsets.length, 0, 'Must wait for explicit Play tap while AudioContext is suspended');
+    assert.equal(events[events.length - 1]?.isPlaying, false);
+    assert.equal(events[events.length - 1]?.duration, 4.5);
+    assert.equal(events[events.length - 1]?.fileName, 'music-track.mp3');
+
+    // 2) User taps Play (resume allowed): must unlock context and route buffer to BOTH splitter->worklet AND destination
+    allowResume = true;
+    await engine.resumeContext();
+    engine.playAudioFile();
+    await new Promise((r) => setTimeout(r, 20));
+
+    assert.equal(startedOffsets.length, 1);
+    assert.equal(startedOffsets[0], 0);
+    assert.ok(bufferConnections.some((c) => c.sourceId === 1 && c.to === 'channelSplitter'));
+    assert.ok(bufferConnections.some((c) => c.sourceId === 1 && c.to === 'destination'));
+    assert.equal(events[events.length - 1]?.isPlaying, true);
+    assert.equal(mergerGainCalls[mergerGainCalls.length - 1], 0.5, 'Stereo buffer must use 0.5 downmix gain');
+
+    // 3) Pause, seek, natural end, and mono 1.0 downmix gain
+    engine.pauseAudioFile();
+    assert.equal(events[events.length - 1]?.isPlaying, false);
+    engine.seekAudioFile(2.25);
+    assert.equal(events[events.length - 1]?.currentTime, 2.25);
+    engine.playAudioFile();
+    assert.equal(startedOffsets[startedOffsets.length - 1], 2.25);
+    createdSources[createdSources.length - 1]?.onended?.();
+    assert.equal(events[events.length - 1]?.isPlaying, false);
+    assert.equal(events[events.length - 1]?.currentTime, 4.5);
+
+    decodeChannels = 1;
+    const monoFile = new File([new Uint8Array(64)], 'mono-tone.wav', { type: 'audio/wav' });
+    const loadedMono = await engine.loadAudioFile(monoFile);
+    assert.equal(loadedMono, true);
+    assert.equal(mergerGainCalls[mergerGainCalls.length - 1], 1.0, 'Mono buffer must use 1.0 unity gain');
+
+    engine.cleanup();
+  } finally {
+    (globalThis as Record<string, unknown>).window = prevWindow;
+    (globalThis as Record<string, unknown>).AudioWorkletNode = prevAudioWorkletNode;
+    (globalThis as Record<string, unknown>).AudioContext = prevAudioContext;
+  }
+});
