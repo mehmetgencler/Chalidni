@@ -18,25 +18,32 @@
 3. **Transport-Eligibility Gate & Down-Sweep Recovery (`src/physics/particleTransport.ts`)**:
    - Gated `feedInteriorParticlesIfNeeded()` and `1 mm` perimeter recycling in `stepFromRmsGrid()` with `hasTransportEligibleInteriorField(rmsQuadrant, halfN, 0.001)` (`D_g > 1e-15`).
 
-## Files Modified
+4. **Memory-Bounded Silent WAV-to-Video Export (`src/audio/wavPcmStream.ts`, `src/video/videoFileWriter.worker.ts`, `src/audio/audioEngine.ts`, `src/video/silentVideoExport.ts`, `src/components/SilentVideoExport.tsx`, `src/App.tsx`)**:
+   - **Slice-based PCM WAV streaming (`src/audio/wavPcmStream.ts`)**: Parses RIFF/WAVE headers and reads `~4 s` frame-aligned chunks strictly via `file.slice(start, end).arrayBuffer()` (never full-file `file.arrayBuffer()` or `decodeAudioData()` on slices). Scans metadata chunks with RIFF odd-byte padding and decodes mono/stereo (`0.5 * (L + R)`) across 8/16/24/32-bit PCM, IEEE Float32, and `WAVE_FORMAT_EXTENSIBLE`.
+   - **Silent Worklet Streaming Scheduler (`src/audio/audioEngine.ts`)**: `AudioEngine.startSilentWavStream()` routes streamed mono `AudioBufferSourceNode` chunks strictly into `fileGain` -> `AudioWorkletNode` (`'music'` excitation profile + `RESET_MODES`) and never connects to `ctx.destination` (zero speaker output). Prebuffers `12–16 s` before `onStreamStart`, maintains `<= 4` look-ahead sources with prompt `onended` buffer release, and aborts cleanly on underrun or cancellation.
+   - **OPFS Disk-Backed Capture & Export (`src/video/videoFileWriter.worker.ts`, `src/video/silentVideoExport.ts`, `src/components/SilentVideoExport.tsx`)**: Preflights `MediaRecorder.isTypeSupported` (preferring H.264 MP4, matching container/extension fallback), `navigator.storage.estimate()`, `persist()`, and OPFS `FileSystemSyncAccessHandle`. Captures only a `480×480` downscaled canvas copy at `12 FPS` (`0` audio tracks, `200 kbps`, `2000 ms` timeslice), transferring chunks sequentially to the dedicated OPFS Worker with bounded `16 MB` queue protection and cleanup on cancel/error.
 
-- `public/audio/modal-worklet-processor.js`
+## Files Modified / Added
+
+- `src/audio/wavPcmStream.ts` (new)
+- `src/video/videoFileWriter.worker.ts` (new)
+- `src/video/silentVideoExport.ts` (new)
+- `src/components/SilentVideoExport.tsx` (new)
 - `src/audio/audioEngine.ts`
-- `src/components/AudioExciter.tsx`
-- `src/physics/particleTransport.ts`
-- `src/physics/physics.test.ts` (`Tests 24–27` added; `Tests 1–23` preserved)
-- `CHECKPOINT.md`
+- `src/App.tsx`
+- `src/physics/physics.test.ts` (`Tests 28–32` added; `Tests 1–27` preserved)
+- `e2e/silent-video-export.spec.ts` (new)
+- `public/audio/modal-worklet-processor.js`, `src/physics/modalSolver.ts`, `src/physics/particleTransport.ts`, `src/physics/simulationClock.ts`, `src/physics/plate.ts`, `src/components/PlateCanvas.tsx`: untouched.
 
 ## Tests Executed & Actual Results
 
 - **TypeScript Lint (`npm run lint`)**: Passed (`0` errors).
 - **Production Build (`npm run build`)**: Passed.
-- **Unit Tests (`npm run test` -> `tsx --test src/physics/physics.test.ts`)**: `25/25` passed (`Tests 1–27`), including:
-  - `Test 26`: `-70 dBFS` center `aRms = 12.328 m/s²` (`0.771 m/s²` under `'raw'`), particle movement `0.1413 mm`; `-78 dBFS` center `aRms = 4.900 m/s² < 9.80687 m/s²` with zero movement and zero feeding/recycling; digital silence free of artificial excitation with natural modal free decay; gain strictly in `[1.0, 16.0]`; loud signal stays at `1.0` unity.
-  - `Test 27`: `SET_EXCITATION_PROFILE` ordering across generator, primary buffer, suspended load + Play, and HTMLAudio fallback.
+- **Unit & Scheduler Integration Tests (`npm run test` -> `tsx --test src/physics/physics.test.ts`)**: `30/30` passed (`Tests 1–32`), covering PCM 8/16/24/32, Float32, `EXTENSIBLE`, odd metadata padding, slice-only read verification, frame alignment, prebuffering, lookahead bounds, silent routing (`isFileAudibleToDestination === false`), cancellation, underrun abort, and codec/extension pairing.
 - **Scientific Audit (`npm run audit` -> `tsx src/physics/independentAudit.ts`)**: `17/17` executable checks passed (`3` hardware/physical-device checks `NOT RUN`).
-- **Playwright E2E (`npm run test:e2e`)**: `2/2` passed in Chromium (`0` console/page errors).
+- **Playwright E2E (`npm run test:e2e`)**: `4/4` passed in headless Chromium (`e2e/chladni-e2e.spec.ts`: `2/2`; `e2e/silent-video-export.spec.ts`: `2/2` covering 15 s silent stereo WAV export to OPFS, `0` audio tracks, `480×480` playable video decode check, Discard cleanup, and active export Cancellation cleanup; `0` console/page errors).
 
 ## Outstanding Manual Validation
 
-- **Physical iPhone Safari MP3/WAV Selection & Playback**: Not executed in this Linux container (no physical iOS Safari browser available). Must be confirmed on a real iPhone Safari device.
+- **Physical iPhone Safari Long-WAV (e.g. 50-minute) Export & Background/Screen-Lock Behavior**: Not executed in this Linux Chromium container. Real physical iPhone Safari H.264 MP4 `MediaRecorder`, OPFS `SyncAccessHandle`, `navigator.share` Files export, and screen-lock behavior must be confirmed directly on an iOS Safari device.
+

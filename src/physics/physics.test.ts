@@ -36,6 +36,16 @@ import { calculateAnalyticalHarmonicResponse, ModalBank } from './modalSolver.ts
 import { ParticleTransportSystem, reflectCoordinate } from './particleTransport.ts';
 import { SimulationClockAccumulator } from './simulationClock.ts';
 import { AudioEngine } from '../audio/audioEngine.ts';
+import {
+  createWavPcmChunkStream,
+  parseWavHeader,
+  WavByteSource,
+} from '../audio/wavPcmStream.ts';
+import {
+  buildExportDownloadFileName,
+  estimateExportSizeBytes,
+  selectSupportedVideoCodec,
+} from '../video/silentVideoExport.ts';
 import { computeParticleRenderParams } from '../components/plateVisuals.ts';
 import { ModalSnapshot } from './types.ts';
 
@@ -2371,4 +2381,527 @@ test('27. AudioEngine sends SET_EXCITATION_PROFILE raw for generator and music b
     (globalThis as Record<string, unknown>).URL = prevURL;
   }
 });
+
+/* -------------------------------------------------------------------------- */
+/* TESTS 28–32: MEMORY-BOUNDED SILENT WAV STREAMING & VIDEO EXPORT HELPERS    */
+/* -------------------------------------------------------------------------- */
+
+function buildCustomWavBuffer(opts: {
+  audioFormat: number;
+  channels: 1 | 2;
+  sampleRate: number;
+  bitsPerSample: 8 | 16 | 24 | 32;
+  frames: number[][];
+  extensibleSubtype?: 'pcm' | 'float';
+  extraChunks?: { id: string; payload: Uint8Array }[];
+}): Uint8Array {
+  const { audioFormat, channels, sampleRate, bitsPerSample, frames, extensibleSubtype, extraChunks } = opts;
+  const bytesPerSample = bitsPerSample / 8;
+  const blockAlign = channels * bytesPerSample;
+  const dataSize = frames.length * blockAlign;
+  const fmtSize = audioFormat === 0xfffe ? 40 : 16;
+
+  const extraBlocks: Uint8Array[] = [];
+  let extraTotal = 0;
+  for (const ch of extraChunks ?? []) {
+    const padded = ch.payload.length + (ch.payload.length & 1);
+    const block = new Uint8Array(8 + padded);
+    const dv = new DataView(block.buffer);
+    for (let i = 0; i < 4; i++) block[i] = ch.id.charCodeAt(i);
+    dv.setUint32(4, ch.payload.length, true);
+    block.set(ch.payload, 8);
+    extraBlocks.push(block);
+    extraTotal += block.length;
+  }
+
+  const totalSize = 12 + 8 + fmtSize + extraTotal + 8 + dataSize;
+  const out = new Uint8Array(totalSize);
+  const dv = new DataView(out.buffer);
+  const writeStr = (off: number, s: string) => {
+    for (let i = 0; i < 4; i++) out[off + i] = s.charCodeAt(i);
+  };
+
+  writeStr(0, 'RIFF');
+  dv.setUint32(4, totalSize - 8, true);
+  writeStr(8, 'WAVE');
+
+  let pos = 12;
+  writeStr(pos, 'fmt ');
+  dv.setUint32(pos + 4, fmtSize, true);
+  dv.setUint16(pos + 8, audioFormat, true);
+  dv.setUint16(pos + 10, channels, true);
+  dv.setUint32(pos + 12, sampleRate, true);
+  dv.setUint32(pos + 16, sampleRate * blockAlign, true);
+  dv.setUint16(pos + 20, blockAlign, true);
+  dv.setUint16(pos + 22, bitsPerSample, true);
+  if (audioFormat === 0xfffe) {
+    dv.setUint16(pos + 24, 22, true); // cbSize
+    dv.setUint16(pos + 26, bitsPerSample, true); // wValidBitsPerSample
+    dv.setUint32(pos + 28, channels === 2 ? 0x3 : 0x4, true);
+    const guid =
+      extensibleSubtype === 'float'
+        ? [0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71]
+        : [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71];
+    out.set(guid, pos + 32);
+  }
+  pos += 8 + fmtSize;
+
+  for (const b of extraBlocks) {
+    out.set(b, pos);
+    pos += b.length;
+  }
+
+  writeStr(pos, 'data');
+  dv.setUint32(pos + 4, dataSize, true);
+  pos += 8;
+
+  for (let f = 0; f < frames.length; f++) {
+    for (let c = 0; c < channels; c++) {
+      const s = frames[f][c];
+      const off = pos + f * blockAlign + c * bytesPerSample;
+      if (audioFormat === 0x0003 || extensibleSubtype === 'float') {
+        dv.setFloat32(off, s, true);
+      } else if (bitsPerSample === 8) {
+        out[off] = Math.max(0, Math.min(255, Math.round(s * 128 + 128)));
+      } else if (bitsPerSample === 16) {
+        dv.setInt16(off, Math.max(-32768, Math.min(32767, Math.round(s * 32768))), true);
+      } else if (bitsPerSample === 24) {
+        const v = Math.max(-8388608, Math.min(8388607, Math.round(s * 8388608)));
+        out[off] = v & 0xff;
+        out[off + 1] = (v >> 8) & 0xff;
+        out[off + 2] = (v >> 16) & 0xff;
+      } else {
+        dv.setInt32(off, Math.max(-2147483648, Math.min(2147483647, Math.round(s * 2147483648))), true);
+      }
+    }
+  }
+  return out;
+}
+
+function makeSliceOnlySource(bytes: Uint8Array): WavByteSource & { arrayBuffer: () => never } {
+  return {
+    size: bytes.byteLength,
+    arrayBuffer(): never {
+      throw new Error('Full-file arrayBuffer() must NEVER be called on streaming WAV source!');
+    },
+    slice(start?: number, end?: number): Blob {
+      const s = Math.max(0, start ?? 0);
+      const e = Math.min(bytes.byteLength, end ?? bytes.byteLength);
+      const copy = bytes.slice(s, e);
+      return new Blob([copy]);
+    },
+  };
+}
+
+test('28. Streaming PCM WAV parser supports PCM 8/16/24/32, Float32, EXTENSIBLE, odd metadata chunks, stereo 0.5*(L+R), and never calls full arrayBuffer()', async () => {
+  // Stereo frames testing boundary polarity across formats
+  const sampleFrames = [
+    [0.5, -0.25], // mono = 0.125
+    [-0.5, -0.5], // mono = -0.5
+    [0.0, 0.75], // mono = 0.375
+    [-0.25, 0.25], // mono = 0.0
+  ];
+
+  const formats: Array<{
+    label: string;
+    audioFormat: number;
+    bitsPerSample: 8 | 16 | 24 | 32;
+    extensibleSubtype?: 'pcm' | 'float';
+    tol: number;
+  }> = [
+    { label: 'PCM 8-bit', audioFormat: 0x0001, bitsPerSample: 8, tol: 0.01 },
+    { label: 'PCM 16-bit', audioFormat: 0x0001, bitsPerSample: 16, tol: 1e-4 },
+    { label: 'PCM 24-bit', audioFormat: 0x0001, bitsPerSample: 24, tol: 1e-6 },
+    { label: 'PCM 32-bit', audioFormat: 0x0001, bitsPerSample: 32, tol: 1e-7 },
+    { label: 'IEEE Float32', audioFormat: 0x0003, bitsPerSample: 32, tol: 1e-6 },
+    { label: 'EXTENSIBLE PCM 24-bit', audioFormat: 0xfffe, bitsPerSample: 24, extensibleSubtype: 'pcm', tol: 1e-6 },
+    { label: 'EXTENSIBLE Float32', audioFormat: 0xfffe, bitsPerSample: 32, extensibleSubtype: 'float', tol: 1e-6 },
+  ];
+
+  for (const fmt of formats) {
+    // Include odd-sized metadata chunk ("JUNK" 5 bytes -> 1 pad byte) before "data"
+    const wav = buildCustomWavBuffer({
+      audioFormat: fmt.audioFormat,
+      channels: 2,
+      sampleRate: 44100,
+      bitsPerSample: fmt.bitsPerSample,
+      frames: sampleFrames,
+      extensibleSubtype: fmt.extensibleSubtype,
+      extraChunks: [
+        { id: 'JUNK', payload: new Uint8Array([1, 2, 3, 4, 5]) },
+        { id: 'LIST', payload: new Uint8Array([9, 8, 7, 6]) },
+      ],
+    });
+    const src = makeSliceOnlySource(wav);
+    const stream = await createWavPcmChunkStream(src, { chunkDurationSec: 0.25 });
+    assert.equal(stream.info.channels, 2, fmt.label);
+    assert.equal(stream.info.totalFrames, sampleFrames.length, fmt.label);
+
+    const chunk = await stream.nextChunk();
+    assert.ok(chunk, fmt.label);
+    assert.equal(chunk.isLast, true);
+    assert.equal(chunk.frameCount, sampleFrames.length);
+    for (let i = 0; i < sampleFrames.length; i++) {
+      const expected = 0.5 * (sampleFrames[i][0] + sampleFrames[i][1]);
+      assert.ok(
+        Math.abs(chunk.monoSamples[i] - expected) <= fmt.tol,
+        `${fmt.label} sample ${i}: got ${chunk.monoSamples[i]}, expected ${expected}`
+      );
+    }
+    assert.equal(await stream.nextChunk(), null);
+  }
+});
+
+test('29. Streaming WAV chunker preserves exact frame alignment and boundary values across multi-chunk reads', async () => {
+  const sr = 8000;
+  const totalFrames = 6500; // 0.8125 s -> 4 chunks at chunkDurationSec=0.25 (2000 frames/chunk -> 2000, 2000, 2000, 500)
+  const frames: number[][] = [];
+  for (let i = 0; i < totalFrames; i++) {
+    frames.push([Math.sin((2 * Math.PI * 100 * i) / sr) * 0.8]);
+  }
+  const wav = buildCustomWavBuffer({
+    audioFormat: 0x0001,
+    channels: 1,
+    sampleRate: sr,
+    bitsPerSample: 16,
+    frames,
+  });
+  const src = makeSliceOnlySource(wav);
+  const stream = await createWavPcmChunkStream(src, { chunkDurationSec: 0.25 });
+
+  assert.equal(stream.chunkFrames, 2000);
+  assert.equal(stream.totalChunks, 4);
+
+  let collectedFrames = 0;
+  let expectedStart = 0;
+  const reconstructed: number[] = [];
+  while (stream.hasNext()) {
+    const ch = await stream.nextChunk();
+    assert.ok(ch);
+    assert.equal(ch.startFrame, expectedStart);
+    assert.equal(ch.sampleRate, sr);
+    expectedStart += ch.frameCount;
+    collectedFrames += ch.frameCount;
+    for (let i = 0; i < ch.frameCount; i++) {
+      reconstructed.push(ch.monoSamples[i]);
+    }
+    assert.equal(ch.isLast, collectedFrames === totalFrames);
+  }
+
+  assert.equal(collectedFrames, totalFrames);
+  // Verify exact first, chunk-boundary, and final sample continuity
+  assert.ok(Math.abs(reconstructed[0] - frames[0][0]) < 1e-4);
+  assert.ok(Math.abs(reconstructed[1999] - frames[1999][0]) < 1e-4);
+  assert.ok(Math.abs(reconstructed[2000] - frames[2000][0]) < 1e-4);
+  assert.ok(Math.abs(reconstructed[totalFrames - 1] - frames[totalFrames - 1][0]) < 1e-4);
+});
+
+test('30. Streaming WAV parser rejects malformed, truncated, unsupported-format, and >2ch files', async () => {
+  await assert.rejects(() => parseWavHeader(makeSliceOnlySource(new Uint8Array(16))), /too small/);
+
+  // Non-RIFF header
+  const nonRiff = new Uint8Array(64);
+  await assert.rejects(() => parseWavHeader(makeSliceOnlySource(nonRiff)), /Unsupported file container/);
+
+  // Truncated data chunk
+  const valid = buildCustomWavBuffer({
+    audioFormat: 0x0001,
+    channels: 1,
+    sampleRate: 44100,
+    bitsPerSample: 16,
+    frames: [[0.1], [0.2], [0.3], [0.4]],
+  });
+  const truncated = valid.slice(0, valid.byteLength - 3);
+  await assert.rejects(() => parseWavHeader(makeSliceOnlySource(truncated)), /Truncated WAV/);
+
+  // Unsupported format tag (e.g. ADPCM 0x0002)
+  const adpcm = valid.slice();
+  new DataView(adpcm.buffer).setUint16(20, 0x0002, true);
+  await assert.rejects(() => parseWavHeader(makeSliceOnlySource(adpcm)), /Unsupported WAV format tag/);
+
+  // Non-finite IEEE Float sample rejection
+  const nanWav = buildCustomWavBuffer({
+    audioFormat: 0x0003,
+    channels: 1,
+    sampleRate: 44100,
+    bitsPerSample: 32,
+    frames: [[0.25], [NaN]],
+  });
+  const nanStream = await createWavPcmChunkStream(makeSliceOnlySource(nanWav));
+  await assert.rejects(() => nanStream.nextChunk(), /non-finite/);
+});
+
+test('31. AudioEngine.startSilentWavStream prebuffers 12-16s, schedules gap-free mono to fileGain ONLY, avoids ctx.destination, drives Worklet clock, and handles cancel/underrun', async () => {
+  const prevWindow = (globalThis as Record<string, unknown>).window;
+  const prevAudioWorkletNode = (globalThis as Record<string, unknown>).AudioWorkletNode;
+  const prevAudioContext = (globalThis as Record<string, unknown>).AudioContext;
+
+  try {
+    const sr = 8000;
+    const totalSec = 24;
+    const frames: number[][] = [];
+    for (let i = 0; i < sr * totalSec; i++) {
+      const s = 0.5 * Math.sin((2 * Math.PI * 269.815 * i) / sr);
+      frames.push([s, s]);
+    }
+    const longWavBytes = buildCustomWavBuffer({
+      audioFormat: 0x0001,
+      channels: 2,
+      sampleRate: sr,
+      bitsPerSample: 16,
+      frames,
+    });
+    const wavSource = makeSliceOnlySource(longWavBytes);
+
+    const { processor, snapshots } = createProductionWorklet(sr);
+    const postedWorkletMsgs: unknown[] = [];
+    let fakeCtxTime = 1.0;
+
+    interface MockSourceNode {
+      buffer: AudioBuffer | null;
+      loop: boolean;
+      onended: (() => void) | null;
+      connections: string[];
+      startTime: number;
+      stopped: boolean;
+      disconnected: boolean;
+      connect: (target: { name?: string }) => void;
+      start: (when?: number) => void;
+      stop: () => void;
+      disconnect: () => void;
+    }
+
+    const allCreatedSources: MockSourceNode[] = [];
+    const mockDestination = { name: 'ctx.destination' };
+    let sinkConnected = false;
+
+    class MockWorkletNode {
+      name = 'workletNode';
+      port = {
+        onmessage: null as ((e: { data: unknown }) => void) | null,
+        postMessage: (msg: unknown) => {
+          postedWorkletMsgs.push(msg);
+          processor.handleMessage(msg);
+        },
+      };
+      connect(target: { name?: string }) {
+        if (target?.name === 'workletSink' || target === mockDestination) {
+          sinkConnected = true;
+        }
+      }
+    }
+
+    class MockAudioContext {
+      sampleRate = sr;
+      state = 'running';
+      destination = mockDestination;
+      audioWorklet = { addModule: async () => {} };
+      get currentTime() {
+        return fakeCtxTime;
+      }
+      resume = async () => {};
+      close = async () => {};
+      createGain = () => {
+        const g = {
+          name: 'gain',
+          channelCount: 2,
+          channelCountMode: 'max',
+          gain: {
+            setValueAtTime: () => {},
+            cancelScheduledValues: () => {},
+            setTargetAtTime: () => {},
+          },
+          connect: (target: { name?: string }) => {
+            if (g.name === 'workletSink' && target === mockDestination) {
+              sinkConnected = true;
+            }
+          },
+        };
+        if (sinkConnected === false && allCreatedSources.length === 0) {
+          // AudioEngine creates toneGain, audibleMonitor, fileGain, workletSink in order
+        }
+        return g;
+      };
+      createBuffer = (_ch: number, len: number, sampleRate: number) => {
+        const chData = new Float32Array(len);
+        return {
+          numberOfChannels: 1,
+          length: len,
+          sampleRate,
+          duration: len / sampleRate,
+          getChannelData: () => chData,
+          copyToChannel: (src: Float32Array) => chData.set(src),
+        } as unknown as AudioBuffer;
+      };
+      createBufferSource = () => {
+        const node: MockSourceNode = {
+          buffer: null,
+          loop: false,
+          onended: null,
+          connections: [],
+          startTime: -1,
+          stopped: false,
+          disconnected: false,
+          connect: (target: { name?: string }) => {
+            node.connections.push(target === mockDestination ? 'ctx.destination' : target?.name || 'fileGain');
+          },
+          start: (when: number = 0) => {
+            node.startTime = when;
+          },
+          stop: () => {
+            node.stopped = true;
+          },
+          disconnect: () => {
+            node.disconnected = true;
+          },
+        };
+        allCreatedSources.push(node);
+        return node as unknown as AudioBufferSourceNode;
+      };
+    }
+
+    (globalThis as Record<string, unknown>).window = {
+      AudioContext: MockAudioContext,
+      location: { search: '' },
+    };
+    (globalThis as Record<string, unknown>).AudioWorkletNode = MockWorkletNode;
+    (globalThis as Record<string, unknown>).AudioContext = MockAudioContext;
+
+    const mb = new ModalBank(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY, 0.01);
+    const clock = new SimulationClockAccumulator();
+    const engine = new AudioEngine();
+    engine.configureModes(mb.getWorkletModeConfig());
+
+    let prepareCalled = false;
+    let streamStarted = false;
+    let streamStartCtx = 0;
+
+    await engine.startSilentWavStream(
+      wavSource,
+      {
+        onPrepareSimulation: () => {
+          prepareCalled = true;
+          mb.reset();
+          clock.reset();
+        },
+        onStreamStart: ({ startCtxTime }) => {
+          streamStarted = true;
+          streamStartCtx = startCtxTime;
+        },
+      },
+      {
+        chunkDurationSec: 4.0,
+        minPrebufferSec: 12.0,
+        maxLookaheadSec: 16.0,
+        pumpIntervalMs: 30,
+      }
+    );
+
+    assert.equal(prepareCalled, true);
+    assert.equal(streamStarted, true);
+    assert.equal(engine.getExcitationProfile(), 'music');
+    assert.equal(engine.getBrowserAudioTelemetry().isFileAudibleToDestination, false);
+    assert.ok(
+      postedWorkletMsgs.some((m) => (m as { type?: string }).type === 'RESET_MODES'),
+      'Worklet must receive RESET_MODES'
+    );
+
+    // Prebuffer for 12s using 4s chunks = exactly 3 scheduled chunks (bounded <= 4, <= 16s!)
+    assert.equal(allCreatedSources.length, 3, 'Initial prebuffer schedules 3 x 4s = 12s');
+    for (let i = 0; i < allCreatedSources.length; i++) {
+      const s = allCreatedSources[i];
+      assert.equal(s.connections.includes('ctx.destination'), false, 'Streamed chunk MUST NEVER connect to ctx.destination');
+      assert.ok(Math.abs(s.startTime - (streamStartCtx + i * 4.0)) < 1e-9, `Chunk ${i} gap-free exact startTime`);
+    }
+
+    // Simulate playback passing chunk 0 -> chunk 0 releases buffer & pump schedules chunk 3 (12-16s lookahead bounded)
+    fakeCtxTime = streamStartCtx + 4.01;
+    allCreatedSources[0].onended?.();
+    assert.equal(allCreatedSources[0].disconnected, true);
+    assert.equal(allCreatedSources[0].buffer, null);
+
+    await new Promise((r) => setTimeout(r, 90));
+    assert.ok(allCreatedSources.length >= 4 && allCreatedSources.length <= 6);
+    assert.ok(engine.getSilentWavStreamTelemetry().scheduledSourceCount <= 4, 'Lookahead must stay bounded <= 4 chunks');
+
+    // Feed chunk 0 samples into real production ModalWorkletProcessor and confirm SimulationClock tracks sampleFramesProcessed
+    const directStream = await createWavPcmChunkStream(wavSource, { chunkDurationSec: 1.0 });
+    const firstChunk = await directStream.nextChunk();
+    assert.ok(firstChunk);
+    for (let off = 0; off < firstChunk.frameCount; off += 128) {
+      const sub = firstChunk.monoSamples.subarray(off, Math.min(firstChunk.frameCount, off + 128));
+      const inB = new Float32Array(128);
+      inB.set(sub);
+      processor.process([[inB]], [[new Float32Array(128)]]);
+    }
+    assert.ok(snapshots.length > 0);
+    const lastSnap = snapshots[snapshots.length - 1];
+    assert.ok(Math.abs(lastSnap.elapsedSimTime - lastSnap.sampleFramesProcessed / sr) < 1e-12);
+
+    // Cancel mid-stream -> stops & disconnects all remaining sources cleanly
+    engine.cancelSilentWavStream();
+    assert.equal(engine.isSilentWavStreaming, false);
+    assert.equal(engine.getSilentWavStreamTelemetry().scheduledSourceCount, 0);
+    assert.equal(allCreatedSources[1].stopped, true);
+
+    // Verify underrun detection aborts cleanly without gap corruption when clock jumps past unbuffered time
+    let underrunErr: Error | null = null;
+    await engine.startSilentWavStream(
+      wavSource,
+      {
+        onError: (e) => {
+          underrunErr = e;
+        },
+      },
+      {
+        chunkDurationSec: 4.0,
+        minPrebufferSec: 8.0,
+        maxLookaheadSec: 12.0,
+        pumpIntervalMs: 25,
+        underrunGuardSec: 0.2,
+      }
+    );
+    fakeCtxTime += 9.0; // Jump beyond scheduled 8s prebuffer before pump refills!
+    await new Promise((r) => setTimeout(r, 80));
+    assert.ok(underrunErr && /underrun/i.test((underrunErr as Error).message), 'Underrun must trigger clean abort');
+    assert.equal(engine.isSilentWavStreaming, false);
+
+    engine.cleanup();
+  } finally {
+    (globalThis as Record<string, unknown>).window = prevWindow;
+    (globalThis as Record<string, unknown>).AudioWorkletNode = prevAudioWorkletNode;
+    (globalThis as Record<string, unknown>).AudioContext = prevAudioContext;
+  }
+});
+
+test('32. Silent video codec selection prioritizes H.264 MP4 and pairs containers/extensions consistently', () => {
+  const prevMediaRecorder = (globalThis as Record<string, unknown>).MediaRecorder;
+  try {
+    // 1. Safari / H.264 MP4 supported
+    (globalThis as Record<string, unknown>).MediaRecorder = {
+      isTypeSupported: (mime: string) => mime === 'video/mp4;codecs=avc1.42E01E' || mime === 'video/webm',
+    };
+    const mp4 = selectSupportedVideoCodec();
+    assert.equal(mp4.extension, 'mp4');
+    assert.equal(mp4.baseMimeType, 'video/mp4');
+    assert.equal(buildExportDownloadFileName('50-Min Concert.WAV', mp4.extension), '50-Min-Concert-chladni-silent.mp4');
+
+    // 2. Fallback when only WebM VP9 is supported (e.g. Linux Chromium) -> extension must be .webm, NOT .mp4
+    (globalThis as Record<string, unknown>).MediaRecorder = {
+      isTypeSupported: (mime: string) => mime === 'video/webm;codecs=vp9',
+    };
+    const webm = selectSupportedVideoCodec();
+    assert.equal(webm.extension, 'webm');
+    assert.equal(webm.baseMimeType, 'video/webm');
+    assert.equal(buildExportDownloadFileName('Track 01.wav', webm.extension), 'Track-01-chladni-silent.webm');
+
+    // 3. Size estimator for 50-minute 200 kbps video (~75 MB payload + headroom)
+    const est50m = estimateExportSizeBytes(3000, 200_000);
+    assert.equal(est50m.estimatedVideoBytes, 75_000_000);
+    assert.ok(est50m.requiredBytesWithHeadroom > 100_000_000);
+  } finally {
+    (globalThis as Record<string, unknown>).MediaRecorder = prevMediaRecorder;
+  }
+});
+
 

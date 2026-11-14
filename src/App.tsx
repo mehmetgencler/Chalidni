@@ -23,6 +23,7 @@ import { SimulationClockAccumulator } from './physics/simulationClock.ts';
 import { DEFAULT_ALUMINUM, DEFAULT_GEOMETRY } from './physics/plate.ts';
 import { PlateCanvas } from './components/PlateCanvas.tsx';
 import { AudioExciter } from './components/AudioExciter.tsx';
+import { SilentVideoExport } from './components/SilentVideoExport.tsx';
 
 export function App() {
   const sideLength = DEFAULT_GEOMETRY.sideLength; // 0.30 m
@@ -137,6 +138,12 @@ export function App() {
     // ModalWorkletProcessor handles forced excitation and natural free modal decay.
   };
 
+  const handlePrepareSilentSimulation = () => {
+    modalBank.reset();
+    simClock.reset();
+    particleSystem.initParticles();
+  };
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans select-none">
       {/* Refined Minimal Header */}
@@ -170,11 +177,16 @@ export function App() {
         </section>
 
         {/* Minimal Audio Controls */}
-        <section aria-label="Acoustic Excitation Controls" className="w-full shrink-0">
+        <section aria-label="Acoustic Excitation Controls" className="w-full shrink-0 flex flex-col gap-2">
           <AudioExciter
             audioEngine={audioEngine}
             onFrequencyChange={handleFrequencyChange}
             onToneStateChange={handleToneStateChange}
+          />
+          <SilentVideoExport
+            audioEngine={audioEngine}
+            canvasRef={canvasRef}
+            onPrepareSimulation={handlePrepareSilentSimulation}
           />
         </section>
       </main>
