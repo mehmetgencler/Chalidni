@@ -56,7 +56,18 @@ import {
   selectSupportedVideoCodec,
 } from '../video/silentVideoExport.ts';
 import { computeParticleRenderParams } from '../components/plateVisuals.ts';
-import { ModalSnapshot } from './types.ts';
+import {
+  computeHalfLifeDecay,
+  mapDensityToAlpha,
+  MEMORY_MAX_ALPHA,
+  MEMORY_MAX_CELL_DENSITY,
+  PATTERN_MEMORY_DEFAULT_SEC,
+  PATTERN_MEMORY_MAX_SEC,
+  PATTERN_MEMORY_MIN_SEC,
+  PATTERN_MEMORY_STEP_SEC,
+  PatternMemoryField,
+} from '../components/patternMemory.ts';
+import { ModalSnapshot, Particle } from './types.ts';
 
 interface WorkletInstance {
   modes: { m: number; n: number; frequency: number; omega: number; zeta: number; modalMass: number }[];
@@ -3182,5 +3193,106 @@ test('37. CapturePerformanceMonitor keeps 60 FPS across transient 2s dip and tri
   assert.ok(metrics.fallbackAtSec !== null && metrics.fallbackAtSec > 7.0);
   assert.ok(metrics.postFallbackAverageFps !== null && metrics.postFallbackAverageFps > 35);
   assert.equal(fallbackEvents.length, 1);
+});
+
+test('38. PatternMemoryField obeys exact half-life EWMA decay (1.0s & 2.0s), preserves pause state, and bypasses cleanly at 0.00s', () => {
+  assert.equal(PATTERN_MEMORY_MIN_SEC, 0);
+  assert.equal(PATTERN_MEMORY_MAX_SEC, 4);
+  assert.equal(PATTERN_MEMORY_DEFAULT_SEC, 1.5);
+  assert.equal(PATTERN_MEMORY_STEP_SEC, 0.05);
+
+  assert.equal(computeHalfLifeDecay(1.0, 0.0), 0);
+  assert.ok(Math.abs(computeHalfLifeDecay(1.0, 1.0) - 0.5) < 1e-12);
+  assert.ok(Math.abs(computeHalfLifeDecay(2.0, 2.0) - 0.5) < 1e-12);
+
+  // Build synthetic centered particle cluster + empty field for decay verification
+  const sideLength = 0.30;
+  const clusterParticles: Particle[] = [];
+  for (let i = 0; i < 64; i++) {
+    clusterParticles.push({ x: 0.15, y: 0.15, vx: 0, vy: 0, active: true, color: 'green' });
+  }
+
+  // 1) 1.00s half-life test stepped at 60 Hz after preloading cluster density
+  const field1 = new PatternMemoryField(64);
+  field1.rasterizeParticles(clusterParticles, sideLength);
+  field1.memoryDensity.set(field1.currentDensity);
+  const initialPeak1 = field1.getMaxMemoryDensity();
+  assert.ok(initialPeak1 > 1.0);
+
+  // Now particles leave (empty currentDensity) and advance 1.0 second in 60 steps
+  for (let frame = 0; frame < 60; frame++) {
+    field1.step([], sideLength, 1 / 60, 1.0, false);
+  }
+  const ratio1 = field1.getMaxMemoryDensity() / initialPeak1;
+  assert.ok(Math.abs(ratio1 - 0.5) < 0.01, `Expected ~50% after 1.0s at 1.0s half-life, got ${(ratio1 * 100).toFixed(2)}%`);
+
+  // 2) Live slider increase from 1.00s -> 2.00s keeps accumulated memory and slows subsequent decay to 50% over 2.0s
+  const beforeChange = field1.getMaxMemoryDensity();
+  for (let frame = 0; frame < 120; frame++) {
+    field1.step([], sideLength, 1 / 60, 2.0, false);
+  }
+  const ratio2 = field1.getMaxMemoryDensity() / beforeChange;
+  assert.ok(Math.abs(ratio2 - 0.5) < 0.01, `Expected ~50% after 2.0s at 2.0s half-life, got ${(ratio2 * 100).toFixed(2)}%`);
+
+  // 3) Paused playback freezes accumulated density without decay or overwrite
+  const pausedValBefore = field1.getMaxMemoryDensity();
+  for (let frame = 0; frame < 60; frame++) {
+    const activeWhilePaused = field1.step(clusterParticles, sideLength, 1 / 60, 1.5, true);
+    assert.equal(activeWhilePaused, true);
+  }
+  assert.equal(field1.getMaxMemoryDensity(), pausedValBefore);
+
+  // 4) Explicit reset clear() zeroes all memory cleanly
+  field1.clear();
+  assert.equal(field1.isActive, false);
+  assert.equal(field1.getMaxMemoryDensity(), 0);
+
+  // 5) 0.00s completely disables & bypasses memory accumulation without touching particles
+  const snapshotX = clusterParticles[0].x;
+  field1.step(clusterParticles, sideLength, 1 / 60, 1.5, false);
+  assert.equal(field1.isActive, true);
+  const disabledResult = field1.step(clusterParticles, sideLength, 1 / 60, 0.0, false);
+  assert.equal(disabledResult, false);
+  assert.equal(field1.isActive, false);
+  assert.equal(field1.getMaxMemoryDensity(), 0);
+  assert.equal(clusterParticles[0].x, snapshotX);
+});
+
+test('39. PatternMemoryField preserves buffer identities, stays bounded/finite across 5 minutes, and maps density stably', () => {
+  const sideLength = 0.30;
+  const sys = new ParticleTransportSystem({ particleCount: 3000, seed: 42 }, sideLength);
+  const field = new PatternMemoryField(128);
+  const currentRef = field.currentDensity;
+  const memoryRef = field.memoryDensity;
+  const rgba = new Uint8ClampedArray(field.gridRes * field.gridRes * 4);
+
+  // Simulate 5 minutes (18,000 frames @ 60 Hz) without reallocating or overflowing
+  for (let frame = 0; frame < 18_000; frame++) {
+    // Move one cluster slowly around center while keeping particle coordinates valid
+    if (frame % 300 === 0) {
+      for (let i = 0; i < 600; i++) {
+        sys.particles[i].x = 0.14 + 0.01 * Math.cos(frame * 0.01);
+        sys.particles[i].y = 0.14 + 0.01 * Math.sin(frame * 0.01);
+      }
+    }
+    field.step(sys.particles, sideLength, 1 / 60, 1.5, false);
+  }
+
+  assert.equal(field.currentDensity, currentRef, 'currentDensity Float32Array must be reused');
+  assert.equal(field.memoryDensity, memoryRef, 'memoryDensity Float32Array must be reused');
+
+  let nonZeroCount = 0;
+  for (let i = 0; i < field.memoryDensity.length; i++) {
+    const v = field.memoryDensity[i];
+    assert.ok(Number.isFinite(v) && v >= 0 && v <= MEMORY_MAX_CELL_DENSITY, `Invalid density ${v}`);
+    if (v > 0) nonZeroCount++;
+  }
+  assert.ok(nonZeroCount > 100);
+
+  // Stable intensity mapping is monotonic and independent of any single-frame maximum
+  field.writeToRgba(rgba);
+  assert.equal(mapDensityToAlpha(0), 0);
+  assert.ok(mapDensityToAlpha(1.5) > mapDensityToAlpha(0.6));
+  assert.equal(mapDensityToAlpha(100), MEMORY_MAX_ALPHA);
 });
 

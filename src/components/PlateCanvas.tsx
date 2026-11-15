@@ -13,6 +13,7 @@
 import React, { useEffect, useRef } from 'react';
 import { Particle, ParticleColor } from '../physics/types.ts';
 import { computeParticleRenderParams, SPRITE_BASE_PX } from './plateVisuals.ts';
+import { DEFAULT_MEMORY_GRID_RES, PatternMemoryField } from './patternMemory.ts';
 
 export type HeatmapType = 'none' | 'diffusivity' | 'displacement' | 'nodal';
 
@@ -21,6 +22,9 @@ interface PlateCanvasProps {
   sideLength: number; // m
   canvasRefExternal?: React.RefObject<HTMLCanvasElement | null>;
   particlesRefExternal?: React.RefObject<Particle[]>;
+  patternMemoryHalfLifeSec?: number;
+  patternMemoryResetToken?: number;
+  isPatternMemoryPausedRef?: React.RefObject<boolean>;
 }
 
 const GRAIN_COLOR_TIERS: Record<ParticleColor, { body: string; spec: string }[]> = {
@@ -61,12 +65,31 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
   sideLength,
   canvasRefExternal,
   particlesRefExternal,
+  patternMemoryHalfLifeSec = 0,
+  patternMemoryResetToken = 0,
+  isPatternMemoryPausedRef,
 }) => {
   const internalCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const canvasRef = canvasRefExternal ?? internalCanvasRef;
   const internalParticlesRef = useRef<Particle[]>(particles);
   internalParticlesRef.current = particles;
   const particlesRef = particlesRefExternal ?? internalParticlesRef;
+
+  const halfLifeRef = useRef<number>(patternMemoryHalfLifeSec);
+  halfLifeRef.current = patternMemoryHalfLifeSec;
+  const resetTokenRef = useRef<number>(patternMemoryResetToken);
+  resetTokenRef.current = patternMemoryResetToken;
+  const appliedResetTokenRef = useRef<number>(patternMemoryResetToken);
+  const fallbackPausedRef = useRef<boolean>(false);
+  const pausedRef = isPatternMemoryPausedRef ?? fallbackPausedRef;
+
+  // Reusable visual pattern-memory buffers & offscreen ImageData target (allocated once)
+  const memoryFieldRef = useRef<PatternMemoryField | null>(null);
+  const memorySurfaceRef = useRef<{
+    canvas: HTMLCanvasElement;
+    ctx: CanvasRenderingContext2D;
+    imageData: ImageData;
+  } | null>(null);
 
   // Pre-rendered grain sprite tiers grouped by color ('green' | 'blue' | 'red')
   const spritesRef = useRef<Record<ParticleColor, HTMLCanvasElement[]> | null>(null);
@@ -117,8 +140,13 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
   // Pure rendering loop (never advances physics or particle transport)
   useEffect(() => {
     let animId: number;
+    let lastRenderMs: number | null = null;
 
-    const render = () => {
+    const render = (nowMs: number) => {
+      const dtSec =
+        lastRenderMs === null ? 1 / 60 : Math.min(0.1, Math.max(0, (nowMs - lastRenderMs) / 1000));
+      lastRenderMs = nowMs;
+
       const canvas = canvasRef.current;
       if (!canvas) {
         animId = requestAnimationFrame(render);
@@ -215,8 +243,56 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
       ctx.scale(dpr, dpr);
       ctx.drawImage(cached.canvas, 0, 0, size, size);
 
-      // 3. Render granular powder particles using per-particle color, radius & brightness
       const activeParticles = particlesRef.current;
+
+      // Clear accumulated visual pattern memory on explicit simulation reset
+      if (appliedResetTokenRef.current !== resetTokenRef.current) {
+        appliedResetTokenRef.current = resetTokenRef.current;
+        memoryFieldRef.current?.clear();
+      }
+
+      // 2.5 Visual-only density memory layer rendered smoothly beneath live particles
+      const halfLifeSec = halfLifeRef.current;
+      canvas.dataset.patternMemorySec = halfLifeSec.toFixed(2);
+      if (halfLifeSec > 0) {
+        let field = memoryFieldRef.current;
+        if (!field) {
+          field = new PatternMemoryField(DEFAULT_MEMORY_GRID_RES);
+          memoryFieldRef.current = field;
+        }
+        let memSurface = memorySurfaceRef.current;
+        if (!memSurface) {
+          const mCanvas = document.createElement('canvas');
+          mCanvas.width = field.gridRes;
+          mCanvas.height = field.gridRes;
+          const mCtx = mCanvas.getContext('2d');
+          if (mCtx) {
+            const imageData = mCtx.createImageData(field.gridRes, field.gridRes);
+            memSurface = { canvas: mCanvas, ctx: mCtx, imageData };
+            memorySurfaceRef.current = memSurface;
+          }
+        }
+
+        const isPaused = pausedRef.current;
+        const hasMemory = field.step(activeParticles, sideLength, dtSec, halfLifeSec, isPaused);
+        if (hasMemory && memSurface) {
+          if (!isPaused) {
+            field.writeToRgba(memSurface.imageData.data);
+            memSurface.ctx.putImageData(memSurface.imageData, 0, 0);
+          }
+          ctx.drawImage(memSurface.canvas, 0, 0, size, size);
+        }
+        canvas.dataset.patternMemoryActive = String(hasMemory);
+        canvas.dataset.patternMemoryPeak = field.getMaxMemoryDensity().toFixed(3);
+      } else {
+        if (memoryFieldRef.current?.isActive) {
+          memoryFieldRef.current.clear();
+        }
+        canvas.dataset.patternMemoryActive = 'false';
+        canvas.dataset.patternMemoryPeak = '0.000';
+      }
+
+      // 3. Render granular powder particles using per-particle color, radius & brightness
       const scale = size / sideLength;
       const spriteBanks = spritesRef.current;
 
@@ -255,8 +331,8 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
   }, [sideLength, canvasRef, particlesRef]);
 
   return (
-    <div className="w-full flex items-center justify-center p-2">
-      <div className="relative w-full max-w-[min(80vw,560px)] aspect-square rounded-lg shadow-2xl overflow-hidden bg-black/80 ring-1 ring-slate-800">
+    <div className="w-full flex items-center justify-center p-1">
+      <div className="relative w-full max-w-[min(80vw,560px,54vh)] aspect-square rounded-lg shadow-2xl overflow-hidden bg-black/80 ring-1 ring-slate-800">
         <canvas
           ref={canvasRef}
           data-testid="chladni-plate-canvas"

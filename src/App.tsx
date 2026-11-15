@@ -14,7 +14,7 @@
  * - True per-mode physical free decay when excitation pauses, stops, or ends.
  */
 
-import React, { useEffect, useMemo, useRef } from 'react';
+import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Waves } from 'lucide-react';
 import { AudioEngine } from './audio/audioEngine.ts';
 import { ModalBank } from './physics/modalSolver.ts';
@@ -24,6 +24,12 @@ import { DEFAULT_ALUMINUM, DEFAULT_GEOMETRY } from './physics/plate.ts';
 import { PlateCanvas } from './components/PlateCanvas.tsx';
 import { AudioExciter } from './components/AudioExciter.tsx';
 import { SilentVideoExport } from './components/SilentVideoExport.tsx';
+import {
+  PATTERN_MEMORY_DEFAULT_SEC,
+  PATTERN_MEMORY_MAX_SEC,
+  PATTERN_MEMORY_MIN_SEC,
+  PATTERN_MEMORY_STEP_SEC,
+} from './components/patternMemory.ts';
 
 export function App() {
   const sideLength = DEFAULT_GEOMETRY.sideLength; // 0.30 m
@@ -61,6 +67,12 @@ export function App() {
 
   // Stable live reference so PlateCanvas always renders particleSystem.particles even across resets without React re-renders
   const liveParticlesRef = useRef(particleSystem.particles);
+
+  // Visual-only pattern-memory controls (independent of physics simulation & audio)
+  const [patternMemorySec, setPatternMemorySec] = useState<number>(PATTERN_MEMORY_DEFAULT_SEC);
+  const [patternMemoryResetToken, setPatternMemoryResetToken] = useState<number>(0);
+  const isPatternMemoryPausedRef = useRef<boolean>(false);
+  const memorySliderId = useId();
 
   // Single authoritative sample-frame clock accumulator
   const simClock = useMemo(() => new SimulationClockAccumulator(), []);
@@ -124,6 +136,20 @@ export function App() {
     return unsubscribe;
   }, [audioEngine, modalBank, particleSystem, simClock]);
 
+  // Freeze pattern memory accumulation when uploaded audio playback is explicitly paused
+  useEffect(() => {
+    return audioEngine.onProgress((progress) => {
+      const isExplicitFilePause =
+        !audioEngine.isSilentWavStreaming &&
+        audioEngine.activeSourceType === 'file' &&
+        Boolean(progress.fileName) &&
+        !progress.isPlaying &&
+        progress.duration > 0 &&
+        progress.currentTime < progress.duration - 0.05;
+      isPatternMemoryPausedRef.current = isExplicitFilePause;
+    });
+  }, [audioEngine]);
+
   // Clean up audio on unmount
   useEffect(() => {
     return () => {
@@ -136,9 +162,12 @@ export function App() {
     // ModalWorkletProcessor integrates physical plate response at sampleRate.
   };
 
-  const handleToneStateChange = (_isPlaying: boolean, _f: number) => {
+  const handleToneStateChange = (isPlaying: boolean, _f: number) => {
     // Tone gain ramps smoothly in AudioEngine;
     // ModalWorkletProcessor handles forced excitation and natural free modal decay.
+    if (isPlaying) {
+      isPatternMemoryPausedRef.current = false;
+    }
   };
 
   const handlePrepareSilentSimulation = () => {
@@ -146,12 +175,14 @@ export function App() {
     simClock.reset();
     particleSystem.initParticles();
     liveParticlesRef.current = particleSystem.particles;
+    isPatternMemoryPausedRef.current = false;
+    setPatternMemoryResetToken((token) => token + 1);
   };
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans select-none">
       {/* Refined Minimal Header */}
-      <header className="border-b border-slate-900 bg-slate-950/90 backdrop-blur-md px-4 py-3 shrink-0">
+      <header className="border-b border-slate-900 bg-slate-950/90 backdrop-blur-md px-4 py-2.5 shrink-0">
         <div className="max-w-4xl mx-auto flex items-center justify-between">
           <div className="flex items-center gap-2.5">
             <div className="p-1.5 rounded-lg bg-sky-950 text-sky-400 border border-sky-800/60">
@@ -170,14 +201,17 @@ export function App() {
       </header>
 
       {/* Main Screen: Visualization Dominates */}
-      <main className="flex-1 flex flex-col items-center justify-center p-2 sm:p-4 gap-3 max-w-4xl mx-auto w-full">
+      <main className="flex-1 flex flex-col items-center justify-center p-2 sm:p-3 gap-2 max-w-4xl mx-auto w-full">
         {/* The Square Metal Plate */}
-        <section aria-label="Chladni Plate Visualization" className="w-full flex-1 flex items-center justify-center min-h-[300px]">
+        <section aria-label="Chladni Plate Visualization" className="w-full flex-1 flex items-center justify-center min-h-[280px]">
           <PlateCanvas
             particles={particleSystem.particles}
             sideLength={sideLength}
             canvasRefExternal={canvasRef}
             particlesRefExternal={liveParticlesRef}
+            patternMemoryHalfLifeSec={patternMemorySec}
+            patternMemoryResetToken={patternMemoryResetToken}
+            isPatternMemoryPausedRef={isPatternMemoryPausedRef}
           />
         </section>
 
@@ -188,6 +222,40 @@ export function App() {
             onFrequencyChange={handleFrequencyChange}
             onToneStateChange={handleToneStateChange}
           />
+          {/* Pattern Memory Fine-Control Slider (visual-only) */}
+          <div className="w-full max-w-xl mx-auto px-4 py-2.5 rounded-xl bg-slate-900/80 border border-slate-800 backdrop-blur-sm text-slate-200 flex flex-col gap-1">
+            <div className="flex items-center justify-between gap-3">
+              <label
+                htmlFor={memorySliderId}
+                className="text-xs font-medium text-slate-200 tracking-tight"
+              >
+                Desen Hafızası
+              </label>
+              <span
+                data-testid="pattern-memory-value"
+                className="text-xs font-mono font-semibold text-sky-400 tabular-nums"
+              >
+                {patternMemorySec.toFixed(2)} s
+              </span>
+            </div>
+            <input
+              id={memorySliderId}
+              type="range"
+              min={PATTERN_MEMORY_MIN_SEC}
+              max={PATTERN_MEMORY_MAX_SEC}
+              step={PATTERN_MEMORY_STEP_SEC}
+              value={patternMemorySec}
+              onChange={(e) => {
+                const next = parseFloat(e.target.value);
+                setPatternMemorySec(Number.isFinite(next) ? next : PATTERN_MEMORY_DEFAULT_SEC);
+              }}
+              data-testid="pattern-memory-slider"
+              className="w-full h-2 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-sky-400 focus:outline-none"
+            />
+            <p className="text-[11px] text-slate-400 leading-snug">
+              Eski desenlerin ne kadar süreyle görünür kalacağını ayarlar.
+            </p>
+          </div>
           <SilentVideoExport
             audioEngine={audioEngine}
             canvasRef={canvasRef}

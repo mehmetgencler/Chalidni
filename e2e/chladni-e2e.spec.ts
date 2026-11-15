@@ -147,12 +147,17 @@ test.describe('Stage 9 Real Browser AudioWorklet & Granular Simulation E2E', () 
     await page.setViewportSize({ width: 1440, height: 900 });
     await page.goto('/');
 
-    // Check Stage 7/8 minimal UI preservation (zero extra controls, zero microphone)
+    // Check Stage 7/8 minimal UI preservation + Desen Hafızası visual control
     await expect(page.getByRole('button', { name: 'Sine Test Tone (20 Hz – 20 kHz)' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Audio File Playback' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Start Tone' })).toBeVisible();
-    await expect(page.locator('input[type="range"]')).toHaveCount(1);
+    await expect(page.locator('input[type="range"]')).toHaveCount(2);
     await expect(page.locator('button')).toHaveCount(3); // 2 tabs + Start Tone
+    await expect(page.getByLabel('Desen Hafızası')).toBeVisible();
+    await expect(page.getByTestId('pattern-memory-value')).toHaveText('1.50 s');
+    await expect(
+      page.getByText('Eski desenlerin ne kadar süreyle görünür kalacağını ayarlar.')
+    ).toBeVisible();
 
     // 1. Start Sine Test Tone (269.82 Hz default)
     await page.getByRole('button', { name: 'Start Tone' }).click();
@@ -168,7 +173,7 @@ test.describe('Stage 9 Real Browser AudioWorklet & Granular Simulation E2E', () 
     expect(Number(dsTone1.maxSubstepRms)).toBeLessThanOrEqual(0.008001);
 
     // 2. Sweep above 2.7 kHz (~5 kHz -> u = log10(5000/20)/3 = 0.7993) and verify >2.7 kHz mode response
-    const slider = page.locator('input[type="range"]');
+    const slider = page.getByLabel('Excitation Frequency (Logarithmic 20 Hz to 20,000 Hz)');
     const box = (await slider.boundingBox())!;
     await page.mouse.click(box.x + box.width * 0.8, box.y + box.height / 2);
     await page.waitForTimeout(600);
@@ -254,7 +259,7 @@ test.describe('Stage 9 Real Browser AudioWorklet & Granular Simulation E2E', () 
       // Start tone at 269.82 Hz and also sweep to high-order 19.9 kHz region to trigger full adaptive resolution
       await page.getByRole('button', { name: 'Start Tone' }).click();
       await page.waitForTimeout(400);
-      const slider = page.locator('input[type="range"]');
+      const slider = page.getByLabel('Excitation Frequency (Logarithmic 20 Hz to 20,000 Hz)');
       const box = (await slider.boundingBox())!;
       await page.mouse.click(box.x + box.width * 0.999, box.y + box.height / 2);
       await page.waitForTimeout(300);
@@ -279,5 +284,72 @@ test.describe('Stage 9 Real Browser AudioWorklet & Granular Simulation E2E', () 
 
     console.log('\n[Stage 9 Browser Performance Table (Chromium)]:');
     console.table(results);
+  });
+
+  test('3. Desen Hafızası slider adjusts pattern memory live without interrupting simulation, audio, or particle state', async ({
+    page,
+  }) => {
+    const consoleErrors: string[] = [];
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => consoleErrors.push(String(err)));
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto('/');
+
+    const memorySlider = page.getByTestId('pattern-memory-slider');
+    const memoryReadout = page.getByTestId('pattern-memory-value');
+    await expect(memorySlider).toHaveAttribute('min', '0');
+    await expect(memorySlider).toHaveAttribute('max', '4');
+    await expect(memorySlider).toHaveAttribute('step', '0.05');
+    await expect(memoryReadout).toHaveText('1.50 s');
+
+    // Start playing tone and let particles start forming resonance pattern
+    await page.getByRole('button', { name: 'Start Tone' }).click();
+    await page.waitForTimeout(800);
+
+    const dsBefore = await readCanvasDataset(page);
+    expect(dsBefore.patternMemorySec).toBe('1.50');
+    expect(dsBefore.patternMemoryActive).toBe('true');
+
+    // Adjust memory slider smoothly to 3.25 s during live playback
+    await memorySlider.fill('3.25');
+    await memorySlider.dispatchEvent('change');
+    await page.waitForTimeout(200);
+    await expect(memoryReadout).toHaveText('3.25 s');
+
+    const ds325 = await readCanvasDataset(page);
+    expect(ds325.patternMemorySec).toBe('3.25');
+    expect(ds325.patternMemoryActive).toBe('true');
+    expect(Number(ds325.simFrames)).toBeGreaterThan(Number(dsBefore.simFrames));
+    expect(Number(ds325.particleSteps)).toBeGreaterThan(Number(dsBefore.particleSteps));
+    await expect(page.getByRole('button', { name: 'Stop Tone' })).toBeVisible();
+
+    // Set slider to 0.00 s -> pattern memory layer disables completely
+    await memorySlider.fill('0');
+    await memorySlider.dispatchEvent('change');
+    await page.waitForTimeout(200);
+    await expect(memoryReadout).toHaveText('0.00 s');
+
+    const dsZero = await readCanvasDataset(page);
+    expect(dsZero.patternMemorySec).toBe('0.00');
+    expect(dsZero.patternMemoryActive).toBe('false');
+    expect(dsZero.patternMemoryPeak).toBe('0.000');
+    expect(Number(dsZero.simFrames)).toBeGreaterThan(Number(ds325.simFrames));
+    await expect(page.getByRole('button', { name: 'Stop Tone' })).toBeVisible();
+
+    // Restore slider to 1.50 s mid-playback -> pattern memory re-activates cleanly
+    await memorySlider.fill('1.5');
+    await memorySlider.dispatchEvent('change');
+    await page.waitForTimeout(250);
+    await expect(memoryReadout).toHaveText('1.50 s');
+
+    const dsRestored = await readCanvasDataset(page);
+    expect(dsRestored.patternMemorySec).toBe('1.50');
+    expect(dsRestored.patternMemoryActive).toBe('true');
+    expect(Number(dsRestored.simFrames)).toBeGreaterThan(Number(dsZero.simFrames));
+
+    expect(consoleErrors).toEqual([]);
   });
 });
