@@ -88,12 +88,19 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
   const fallbackPausedRef = useRef<boolean>(false);
   const pausedRef = isPatternMemoryPausedRef ?? fallbackPausedRef;
 
-  // Reusable visual pattern-memory buffers & offscreen ImageData target (allocated once)
+  // Reusable visual pattern-memory buffers & offscreen halo/core ImageData targets (allocated once)
   const memoryFieldRef = useRef<PatternMemoryField | null>(null);
   const memorySurfaceRef = useRef<{
-    canvas: HTMLCanvasElement;
-    ctx: CanvasRenderingContext2D;
-    imageData: ImageData;
+    halo: {
+      canvas: HTMLCanvasElement;
+      ctx: CanvasRenderingContext2D;
+      imageData: ImageData;
+    };
+    core: {
+      canvas: HTMLCanvasElement;
+      ctx: CanvasRenderingContext2D;
+      imageData: ImageData;
+    };
   } | null>(null);
 
   // Pre-rendered grain sprite tiers grouped by color ('green' | 'blue' | 'red')
@@ -256,12 +263,13 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
         memoryFieldRef.current?.clear();
       }
 
-      // 2.5 Visual-only density memory layer rendered smoothly beneath live particles
+      // 2.5 Visual-only two-scale density cloud (broad halo + dense core) rendered beneath live particles
       const halfLifeSec = halfLifeRef.current;
       const normalizeMemory = normalizeMemoryRef.current;
       canvas.dataset.patternMemorySec = halfLifeSec.toFixed(2);
       canvas.dataset.patternMemoryNormalized = String(normalizeMemory);
       if (halfLifeSec > 0) {
+        const memT0 = performance.now();
         let field = memoryFieldRef.current;
         if (!field) {
           field = new PatternMemoryField(DEFAULT_MEMORY_GRID_RES);
@@ -269,13 +277,22 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
         }
         let memSurface = memorySurfaceRef.current;
         if (!memSurface) {
-          const mCanvas = document.createElement('canvas');
-          mCanvas.width = field.gridRes;
-          mCanvas.height = field.gridRes;
-          const mCtx = mCanvas.getContext('2d');
-          if (mCtx) {
-            const imageData = mCtx.createImageData(field.gridRes, field.gridRes);
-            memSurface = { canvas: mCanvas, ctx: mCtx, imageData };
+          const makeOffscreen = (res: number) => {
+            const c = document.createElement('canvas');
+            c.width = res;
+            c.height = res;
+            const cCtx = c.getContext('2d');
+            if (!cCtx) return null;
+            return {
+              canvas: c,
+              ctx: cCtx,
+              imageData: cCtx.createImageData(res, res),
+            };
+          };
+          const halo = makeOffscreen(field.gridRes);
+          const core = makeOffscreen(field.gridRes);
+          if (halo && core) {
+            memSurface = { halo, core };
             memorySurfaceRef.current = memSurface;
           }
         }
@@ -286,14 +303,26 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
         const hasMemory = field.step(activeParticles, sideLength, dtSec, halfLifeSec, isPaused);
         if (hasMemory && memSurface) {
           if (!isPaused || normalizeChanged) {
-            field.writeToRgba(memSurface.imageData.data, normalizeMemory);
-            memSurface.ctx.putImageData(memSurface.imageData, 0, 0);
+            field.writeDualLayersToRgba(
+              memSurface.halo.imageData.data,
+              memSurface.core.imageData.data,
+              normalizeMemory
+            );
+            memSurface.halo.ctx.putImageData(memSurface.halo.imageData, 0, 0);
+            memSurface.core.ctx.putImageData(memSurface.core.imageData, 0, 0);
           }
-          ctx.drawImage(memSurface.canvas, 0, 0, size, size);
+          ctx.save();
+          ctx.globalCompositeOperation = 'screen';
+          ctx.imageSmoothingEnabled = true;
+          ctx.drawImage(memSurface.halo.canvas, 0, 0, size, size);
+          ctx.drawImage(memSurface.core.canvas, 0, 0, size, size);
+          ctx.restore();
         }
+        const memMs = performance.now() - memT0;
         canvas.dataset.patternMemoryActive = String(hasMemory);
         canvas.dataset.patternMemoryPeak = field.getMaxMemoryDensity().toFixed(3);
         canvas.dataset.patternMemoryMean = field.getLastMeanDensity().toFixed(4);
+        canvas.dataset.patternMemoryRenderMs = memMs.toFixed(3);
       } else {
         appliedNormalizeRef.current = normalizeMemory;
         if (memoryFieldRef.current?.isActive) {
@@ -302,6 +331,7 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
         canvas.dataset.patternMemoryActive = 'false';
         canvas.dataset.patternMemoryPeak = '0.000';
         canvas.dataset.patternMemoryMean = '0.0000';
+        canvas.dataset.patternMemoryRenderMs = '0.000';
       }
 
       // 3. Render granular powder particles using per-particle color, radius & brightness

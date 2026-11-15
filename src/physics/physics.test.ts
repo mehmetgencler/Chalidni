@@ -66,7 +66,11 @@ import { computeParticleRenderParams } from '../components/plateVisuals.ts';
 import {
   computeAttackBlend,
   computeHalfLifeDecay,
+  CORE_MAX_ALPHA,
+  HALO_MAX_ALPHA,
+  mapCoreDensityToAlpha,
   mapDensityToAlpha,
+  mapHaloDensityToAlpha,
   mapNormalizedDensityToAlpha,
   MEMORY_DENSITY_FLOOR,
   MEMORY_DENSITY_SATURATION,
@@ -3731,5 +3735,92 @@ test('44. Broadband music sensitivity drives particles across bass/low-mid off-r
   );
   assert.equal(loudRes.boundViolated, false, 'Loud resonant music excitation must not violate 8mm sub-step bound');
 });
+
+test('45. Two-scale PatternMemoryField.writeDualLayersToRgba() produces broad outer halo + brighter dense core, suppresses sparse uniform haze, preserves region separation, and works with Normalization Toggle', () => {
+  assert.ok(CORE_MAX_ALPHA > HALO_MAX_ALPHA);
+
+  const res = 64;
+  const field = new PatternMemoryField(res);
+  const haloRgba = new Uint8ClampedArray(res * res * 4);
+  const coreRgba = new Uint8ClampedArray(res * res * 4);
+
+  // 1) Two separated concentrated clusters at (16, 32) and (48, 32)
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      field.memoryDensity[(32 + dy) * res + (16 + dx)] = 4.0;
+      field.memoryDensity[(32 + dy) * res + (48 + dx)] = 4.0;
+    }
+  }
+  const snapshotBefore = new Float32Array(field.memoryDensity);
+  field.writeDualLayersToRgba(haloRgba, coreRgba, false);
+
+  // memoryDensity must never be mutated by dual-layer rendering
+  for (let i = 0; i < field.memoryDensity.length; i++) {
+    assert.equal(field.memoryDensity[i], snapshotBefore[i]);
+  }
+
+  const haloAlpha = (x: number, y: number) => haloRgba[(y * res + x) * 4 + 3];
+  const coreAlpha = (x: number, y: number) => coreRgba[(y * res + x) * 4 + 3];
+
+  let haloSupport = 0;
+  let coreSupport = 0;
+  for (let i = 0; i < res * res; i++) {
+    if (haloRgba[i * 4 + 3] > 0) haloSupport++;
+    if (coreRgba[i * 4 + 3] > 0) coreSupport++;
+  }
+
+  // Broad halo covers strictly wider neighborhood around clusters than localized core, while core peaks brighter
+  assert.ok(haloSupport > coreSupport, `Expected halo support (${haloSupport}) > core support (${coreSupport})`);
+  assert.ok(coreAlpha(16, 32) > haloAlpha(16, 32), 'Concentrated core peak must be brighter than halo peak');
+  assert.ok(haloAlpha(19, 32) > 0 && coreAlpha(19, 32) === 0, 'Outer halo ring must extend softly beyond dense core');
+
+  // Unrelated density regions stay cleanly separated across dark midpoint (x = 32)
+  assert.equal(haloAlpha(32, 32), 0, 'Separated clusters must keep dark background gap between halos');
+  assert.equal(coreAlpha(32, 32), 0, 'Separated clusters must keep dark background gap between cores');
+
+  // 2) Sparse uniform 3000-particle field must NOT turn into a uniform full-plate haze
+  const sideLength = 0.30;
+  const sys = new ParticleTransportSystem({ particleCount: 3000, seed: 42 }, sideLength);
+  const sparseField = new PatternMemoryField(128);
+  const sHalo = new Uint8ClampedArray(128 * 128 * 4);
+  const sCore = new Uint8ClampedArray(128 * 128 * 4);
+  for (let f = 0; f < 60; f++) {
+    sparseField.step(sys.particles, sideLength, 1 / 60, 1.5, false);
+  }
+  sparseField.writeDualLayersToRgba(sHalo, sCore, false);
+  let sparseHaloOver15 = 0;
+  let sparseCoreOver25 = 0;
+  for (let i = 0; i < 128 * 128; i++) {
+    if (sHalo[i * 4 + 3] >= 15) sparseHaloOver15++;
+    if (sCore[i * 4 + 3] >= 25) sparseCoreOver25++;
+  }
+  assert.equal(sparseHaloOver15, 0, 'Sparse uniform distribution must produce zero halo haze >= 15 alpha');
+  assert.ok(sparseCoreOver25 < 10, `Sparse uniform core specks should be negligible, got ${sparseCoreOver25}`);
+
+  // 3) Normalization Toggle works with both layers for faint patterns without mutating memoryDensity
+  const faintField = new PatternMemoryField(res);
+  const fHalo = new Uint8ClampedArray(res * res * 4);
+  const fCore = new Uint8ClampedArray(res * res * 4);
+  for (let y = 0; y < res; y++) {
+    for (let x = 0; x < res; x++) {
+      const onBand = Math.abs(x - 32) <= 2;
+      faintField.memoryDensity[y * res + x] = onBand ? 0.14 : 0.004;
+    }
+  }
+  faintField.writeDualLayersToRgba(fHalo, fCore, false);
+  assert.equal(fHalo[(32 * res + 32) * 4 + 3], 0);
+  assert.equal(fCore[(32 * res + 32) * 4 + 3], 0);
+
+  faintField.writeDualLayersToRgba(fHalo, fCore, true);
+  assert.ok(fHalo[(32 * res + 32) * 4 + 3] > 20, 'Normalized halo must recover faint band contrast');
+  assert.ok(fCore[(32 * res + 32) * 4 + 3] > 50, 'Normalized core must recover faint band ridge');
+  assert.equal(fHalo[(32 * res + 4) * 4 + 3], 0, 'Sparse normalized halo background must stay transparent');
+  assert.equal(fCore[(32 * res + 4) * 4 + 3], 0, 'Sparse normalized core background must stay transparent');
+
+  // Monotonic fixed mapping check
+  assert.equal(mapHaloDensityToAlpha(0), 0);
+  assert.equal(mapCoreDensityToAlpha(0), 0);
+});
+
 
 

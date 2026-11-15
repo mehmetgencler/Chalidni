@@ -27,15 +27,42 @@ export const MEMORY_DENSITY_SATURATION = 1.8;
 export const MEMORY_MAX_CELL_DENSITY = 64.0;
 export const MEMORY_MAX_ALPHA = 120; // Subtle translucent mineral powder glow (~47% max opacity)
 
+// Two-scale cloud rendering parameters (derived solely from memoryDensity)
+// Layer A: Broad soft halo (4x separable 5x5 Gaussian passes, wide spatial footprint)
+export const HALO_GAUSSIAN_PASSES = 4;
+export const HALO_DENSITY_FLOOR = 0.29;
+export const HALO_DENSITY_SATURATION = 1.75;
+export const HALO_MAX_ALPHA = 105;
+export const HALO_CURVE_GAMMA = 1.25;
+
+// Layer B: Localized dense core (1x 5x5 Gaussian pass, highlights concentrated nodal geometry)
+export const CORE_DENSITY_FLOOR = 0.38;
+export const CORE_DENSITY_SATURATION = 2.6;
+export const CORE_MAX_ALPHA = 175;
+export const CORE_CURVE_GAMMA = 0.9;
+
 // Experimental mean-density auto-scaling parameters (used only when Normalization Toggle is enabled)
 export const NORMALIZED_FLOOR_MEAN_RATIO = 0.65;
 export const NORMALIZED_SATURATION_MEAN_RATIO = 6.0;
+export const NORMALIZED_HALO_FLOOR_MEAN_RATIO = 0.9;
+export const NORMALIZED_HALO_SATURATION_MEAN_RATIO = 4.8;
+export const NORMALIZED_CORE_FLOOR_MEAN_RATIO = 1.15;
+export const NORMALIZED_CORE_SATURATION_MEAN_RATIO = 6.5;
 export const NORMALIZED_MIN_MEAN_DENSITY = 1e-6;
 
 // Cool silvery-white mineral powder tint layered beneath colored live grains
 const MEMORY_TINT_R = 216;
 const MEMORY_TINT_G = 230;
 const MEMORY_TINT_B = 246;
+
+// Two-scale mineral/silver-blue palette (cooler outer halo, brighter pale mineral core)
+const HALO_TINT_R = 196;
+const HALO_TINT_G = 218;
+const HALO_TINT_B = 244;
+
+const CORE_TINT_R = 228;
+const CORE_TINT_G = 240;
+const CORE_TINT_B = 252;
 
 /**
  * Computes exact half-life release decay factor for a frame interval deltaTimeSec.
@@ -92,11 +119,86 @@ export function mapNormalizedDensityToAlpha(density: number, meanDensity: number
   return Math.round(shaped * MEMORY_MAX_ALPHA);
 }
 
+function mapCurveToAlpha(
+  density: number,
+  floor: number,
+  saturation: number,
+  maxAlpha: number,
+  gamma: number
+): number {
+  if (!Number.isFinite(density) || density <= floor || saturation <= floor) return 0;
+  const normalized = (density - floor) / (saturation - floor);
+  const clamped = normalized >= 1 ? 1 : normalized;
+  const shaped = Math.pow(clamped, gamma);
+  return Math.round(shaped * maxAlpha);
+}
+
+/**
+ * Maps broadly blurred density to subtle outer halo alpha [0, HALO_MAX_ALPHA].
+ * Suppresses sparse uniform background below HALO_DENSITY_FLOOR so no full-plate haze forms.
+ */
+export function mapHaloDensityToAlpha(density: number): number {
+  return mapCurveToAlpha(
+    density,
+    HALO_DENSITY_FLOOR,
+    HALO_DENSITY_SATURATION,
+    HALO_MAX_ALPHA,
+    HALO_CURVE_GAMMA
+  );
+}
+
+/**
+ * Maps normalized halo density relative to measured mean density when Normalization Toggle is active.
+ */
+export function mapNormalizedHaloDensityToAlpha(density: number, meanDensity: number): number {
+  if (!Number.isFinite(meanDensity) || meanDensity < NORMALIZED_MIN_MEAN_DENSITY) {
+    return 0;
+  }
+  return mapCurveToAlpha(
+    density,
+    meanDensity * NORMALIZED_HALO_FLOOR_MEAN_RATIO,
+    meanDensity * NORMALIZED_HALO_SATURATION_MEAN_RATIO,
+    HALO_MAX_ALPHA,
+    HALO_CURVE_GAMMA
+  );
+}
+
+/**
+ * Maps 5x5 core-smoothed density to concentrated luminous core alpha [0, CORE_MAX_ALPHA].
+ */
+export function mapCoreDensityToAlpha(density: number): number {
+  return mapCurveToAlpha(
+    density,
+    CORE_DENSITY_FLOOR,
+    CORE_DENSITY_SATURATION,
+    CORE_MAX_ALPHA,
+    CORE_CURVE_GAMMA
+  );
+}
+
+/**
+ * Maps normalized core density relative to measured mean density when Normalization Toggle is active.
+ */
+export function mapNormalizedCoreDensityToAlpha(density: number, meanDensity: number): number {
+  if (!Number.isFinite(meanDensity) || meanDensity < NORMALIZED_MIN_MEAN_DENSITY) {
+    return 0;
+  }
+  return mapCurveToAlpha(
+    density,
+    meanDensity * NORMALIZED_CORE_FLOOR_MEAN_RATIO,
+    meanDensity * NORMALIZED_CORE_SATURATION_MEAN_RATIO,
+    CORE_MAX_ALPHA,
+    CORE_CURVE_GAMMA
+  );
+}
+
 export class PatternMemoryField {
   readonly gridRes: number;
   readonly currentDensity: Float32Array;
   readonly memoryDensity: Float32Array;
   private readonly smoothScratch: Float32Array;
+  private readonly coreWorkBuffer: Float32Array;
+  private readonly haloWorkBuffer: Float32Array;
   private hasAccumulated = false;
   private lastMeanDensity = 0;
 
@@ -106,6 +208,8 @@ export class PatternMemoryField {
     this.currentDensity = new Float32Array(cellCount);
     this.memoryDensity = new Float32Array(cellCount);
     this.smoothScratch = new Float32Array(cellCount);
+    this.coreWorkBuffer = new Float32Array(cellCount);
+    this.haloWorkBuffer = new Float32Array(cellCount);
   }
 
   get isActive(): boolean {
@@ -116,6 +220,8 @@ export class PatternMemoryField {
     this.currentDensity.fill(0);
     this.memoryDensity.fill(0);
     this.smoothScratch.fill(0);
+    this.coreWorkBuffer.fill(0);
+    this.haloWorkBuffer.fill(0);
     this.hasAccumulated = false;
     this.lastMeanDensity = 0;
   }
@@ -366,6 +472,166 @@ export class PatternMemoryField {
             targetRgba[p + 3] = alpha;
           }
         }
+      }
+    }
+  }
+
+  /**
+   * Applies one separable 5x5 Gaussian pass ([1, 4, 6, 4, 1] / 16) from src -> dst
+   * using smoothScratch, safely renormalizing weights along all borders. Returns mean density.
+   */
+  private applySeparableGaussian5x5(src: Float32Array, dst: Float32Array): number {
+    const res = this.gridRes;
+    const last = res - 1;
+    const lastMinus1 = res - 2;
+    const scratch = this.smoothScratch;
+
+    // Horizontal pass: src -> smoothScratch
+    for (let y = 0; y < res; y++) {
+      const row = y * res;
+      scratch[row] = (6 * src[row] + 4 * src[row + 1] + src[row + 2]) / 11;
+      scratch[row + 1] = (4 * src[row] + 6 * src[row + 1] + 4 * src[row + 2] + src[row + 3]) / 15;
+
+      for (let x = 2; x < lastMinus1; x++) {
+        const idx = row + x;
+        scratch[idx] =
+          (src[idx - 2] + 4 * src[idx - 1] + 6 * src[idx] + 4 * src[idx + 1] + src[idx + 2]) *
+          0.0625;
+      }
+
+      scratch[row + lastMinus1] =
+        (src[row + last - 3] +
+          4 * src[row + last - 2] +
+          6 * src[row + last - 1] +
+          4 * src[row + last]) /
+        15;
+      scratch[row + last] =
+        (src[row + last - 2] + 4 * src[row + last - 1] + 6 * src[row + last]) / 11;
+    }
+
+    // Vertical pass: smoothScratch -> dst
+    let totalSum = 0;
+    for (let y = 0; y < res; y++) {
+      const row0 = y * res;
+
+      if (y >= 2 && y < lastMinus1) {
+        const rM2 = row0 - 2 * res;
+        const rM1 = row0 - res;
+        const rP1 = row0 + res;
+        const rP2 = row0 + 2 * res;
+
+        for (let x = 0; x < res; x++) {
+          const v =
+            (scratch[rM2 + x] +
+              4 * scratch[rM1 + x] +
+              6 * scratch[row0 + x] +
+              4 * scratch[rP1 + x] +
+              scratch[rP2 + x]) *
+            0.0625;
+          dst[row0 + x] = v;
+          totalSum += v;
+        }
+      } else {
+        const hasM2 = y >= 2;
+        const hasM1 = y >= 1;
+        const hasP1 = y <= lastMinus1;
+        const hasP2 = y <= last - 2;
+        const wSum = (hasM2 ? 1 : 0) + (hasM1 ? 4 : 0) + 6 + (hasP1 ? 4 : 0) + (hasP2 ? 1 : 0);
+        const invW = 1 / wSum;
+        const rM2 = hasM2 ? row0 - 2 * res : 0;
+        const rM1 = hasM1 ? row0 - res : 0;
+        const rP1 = hasP1 ? row0 + res : 0;
+        const rP2 = hasP2 ? row0 + 2 * res : 0;
+
+        for (let x = 0; x < res; x++) {
+          let acc = 6 * scratch[row0 + x];
+          if (hasM2) acc += scratch[rM2 + x];
+          if (hasM1) acc += 4 * scratch[rM1 + x];
+          if (hasP1) acc += 4 * scratch[rP1 + x];
+          if (hasP2) acc += scratch[rP2 + x];
+
+          const v = acc * invW;
+          dst[row0 + x] = v;
+          totalSum += v;
+        }
+      }
+    }
+
+    return src.length > 0 ? totalSum / src.length : 0;
+  }
+
+  /**
+   * Renders TWO spatial scales from the exact same unchanged memoryDensity buffer:
+   * - Layer A (haloRgba): broad outer aura obtained via repeated 5x5 separable Gaussian passes.
+   * - Layer B (coreRgba): localized dense core using a single 5x5 separable Gaussian pass.
+   * Performs zero heap allocations and never mutates memoryDensity.
+   */
+  writeDualLayersToRgba(
+    haloRgba: Uint8ClampedArray,
+    coreRgba: Uint8ClampedArray,
+    normalizeContrast: boolean = false
+  ): void {
+    const mem = this.memoryDensity;
+    const len = mem.length;
+    if (haloRgba.length < len * 4 || coreRgba.length < len * 4) return;
+
+    const coreBuf = this.coreWorkBuffer;
+    const haloBuf = this.haloWorkBuffer;
+
+    // Pass 1 (1x 5x5): memoryDensity -> coreWorkBuffer, compute measured mean density
+    const meanDensity = this.applySeparableGaussian5x5(mem, coreBuf);
+    this.lastMeanDensity = meanDensity;
+
+    // Rasterize Layer B (Dense Core) immediately before reusing coreBuf for halo widening
+    for (let i = 0; i < len; i++) {
+      const alpha = normalizeContrast
+        ? mapNormalizedCoreDensityToAlpha(coreBuf[i], meanDensity)
+        : mapCoreDensityToAlpha(coreBuf[i]);
+      const p = i * 4;
+      if (alpha <= 0) {
+        coreRgba[p] = 0;
+        coreRgba[p + 1] = 0;
+        coreRgba[p + 2] = 0;
+        coreRgba[p + 3] = 0;
+      } else {
+        coreRgba[p] = CORE_TINT_R;
+        coreRgba[p + 1] = CORE_TINT_G;
+        coreRgba[p + 2] = CORE_TINT_B;
+        coreRgba[p + 3] = alpha;
+      }
+    }
+
+    // Additional passes (total = HALO_GAUSSIAN_PASSES) broaden the density field into a smooth outer halo.
+    // Core buffer already holds pass 1; alternate between coreBuf & haloBuf so final result lands in haloBuf
+    // when extraPasses is odd (default: 4 - 1 = 3 extra passes: core->halo, halo->core, core->halo).
+    let src = coreBuf;
+    let dst = haloBuf;
+    const extraPasses = Math.max(0, HALO_GAUSSIAN_PASSES - 1);
+    for (let pass = 0; pass < extraPasses; pass++) {
+      this.applySeparableGaussian5x5(src, dst);
+      const tmp = src;
+      src = dst;
+      dst = tmp;
+    }
+    const finalHalo = extraPasses === 0 ? coreBuf : src;
+    const haloMean = normalizeContrast ? meanDensity : 0;
+
+    // Rasterize Layer A (Broad Soft Halo)
+    for (let i = 0; i < len; i++) {
+      const alpha = normalizeContrast
+        ? mapNormalizedHaloDensityToAlpha(finalHalo[i], haloMean)
+        : mapHaloDensityToAlpha(finalHalo[i]);
+      const p = i * 4;
+      if (alpha <= 0) {
+        haloRgba[p] = 0;
+        haloRgba[p + 1] = 0;
+        haloRgba[p + 2] = 0;
+        haloRgba[p + 3] = 0;
+      } else {
+        haloRgba[p] = HALO_TINT_R;
+        haloRgba[p + 1] = HALO_TINT_G;
+        haloRgba[p + 2] = HALO_TINT_B;
+        haloRgba[p + 3] = alpha;
       }
     }
   }
