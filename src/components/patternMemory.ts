@@ -21,10 +21,10 @@ export const PATTERN_MEMORY_STEP_SEC = 0.05;
 export const DEFAULT_MEMORY_GRID_RES = 128;
 
 // Fixed, frame-independent intensity mapping parameters (never normalized per frame)
-export const MEMORY_DENSITY_FLOOR = 0.22;
-export const MEMORY_DENSITY_SATURATION = 2.6;
+export const MEMORY_DENSITY_FLOOR = 0.12;
+export const MEMORY_DENSITY_SATURATION = 1.8;
 export const MEMORY_MAX_CELL_DENSITY = 64.0;
-export const MEMORY_MAX_ALPHA = 105; // Subtle translucent mineral powder glow (~41% max opacity)
+export const MEMORY_MAX_ALPHA = 120; // Subtle translucent mineral powder glow (~47% max opacity)
 
 // Cool silvery-white mineral powder tint layered beneath colored live grains
 const MEMORY_TINT_R = 216;
@@ -205,27 +205,99 @@ export class PatternMemoryField {
   }
 
   /**
-   * Writes the accumulated density field into a pre-allocated RGBA Uint8ClampedArray
-   * matching ImageData.data layout (gridRes * gridRes * 4 bytes). Zero allocations.
+   * Writes a locally 3x3 Gaussian-smoothed view of the accumulated density field into a
+   * pre-allocated RGBA Uint8ClampedArray (gridRes * gridRes * 4 bytes).
+   * Reads strictly from memoryDensity without mutating it, renormalizes edge weights,
+   * and performs zero heap allocations.
    */
   writeToRgba(targetRgba: Uint8ClampedArray): void {
     const mem = this.memoryDensity;
     const len = mem.length;
     if (targetRgba.length < len * 4) return;
 
-    for (let i = 0; i < len; i++) {
-      const alpha = mapDensityToAlpha(mem[i]);
-      const p = i * 4;
-      if (alpha <= 0) {
-        targetRgba[p] = 0;
-        targetRgba[p + 1] = 0;
-        targetRgba[p + 2] = 0;
-        targetRgba[p + 3] = 0;
-      } else {
-        targetRgba[p] = MEMORY_TINT_R;
-        targetRgba[p + 1] = MEMORY_TINT_G;
-        targetRgba[p + 2] = MEMORY_TINT_B;
-        targetRgba[p + 3] = alpha;
+    const res = this.gridRes;
+    const last = res - 1;
+
+    for (let y = 0; y < res; y++) {
+      const row = y * res;
+      const hasTop = y > 0;
+      const hasBottom = y < last;
+
+      for (let x = 0; x < res; x++) {
+        const idx = row + x;
+        let smoothed: number;
+
+        if (hasTop && hasBottom && x > 0 && x < last) {
+          const up = idx - res;
+          const dn = idx + res;
+          smoothed =
+            (mem[up - 1] +
+              2 * mem[up] +
+              mem[up + 1] +
+              2 * mem[idx - 1] +
+              4 * mem[idx] +
+              2 * mem[idx + 1] +
+              mem[dn - 1] +
+              2 * mem[dn] +
+              mem[dn + 1]) *
+            0.0625;
+        } else {
+          const hasLeft = x > 0;
+          const hasRight = x < last;
+          let acc = 4 * mem[idx];
+          let weightSum = 4;
+
+          if (hasLeft) {
+            acc += 2 * mem[idx - 1];
+            weightSum += 2;
+          }
+          if (hasRight) {
+            acc += 2 * mem[idx + 1];
+            weightSum += 2;
+          }
+          if (hasTop) {
+            const up = idx - res;
+            acc += 2 * mem[up];
+            weightSum += 2;
+            if (hasLeft) {
+              acc += mem[up - 1];
+              weightSum += 1;
+            }
+            if (hasRight) {
+              acc += mem[up + 1];
+              weightSum += 1;
+            }
+          }
+          if (hasBottom) {
+            const dn = idx + res;
+            acc += 2 * mem[dn];
+            weightSum += 2;
+            if (hasLeft) {
+              acc += mem[dn - 1];
+              weightSum += 1;
+            }
+            if (hasRight) {
+              acc += mem[dn + 1];
+              weightSum += 1;
+            }
+          }
+
+          smoothed = acc / weightSum;
+        }
+
+        const alpha = mapDensityToAlpha(smoothed);
+        const p = idx * 4;
+        if (alpha <= 0) {
+          targetRgba[p] = 0;
+          targetRgba[p + 1] = 0;
+          targetRgba[p + 2] = 0;
+          targetRgba[p + 3] = 0;
+        } else {
+          targetRgba[p] = MEMORY_TINT_R;
+          targetRgba[p + 1] = MEMORY_TINT_G;
+          targetRgba[p + 2] = MEMORY_TINT_B;
+          targetRgba[p + 3] = alpha;
+        }
       }
     }
   }

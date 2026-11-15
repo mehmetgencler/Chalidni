@@ -66,6 +66,8 @@ import { computeParticleRenderParams } from '../components/plateVisuals.ts';
 import {
   computeHalfLifeDecay,
   mapDensityToAlpha,
+  MEMORY_DENSITY_FLOOR,
+  MEMORY_DENSITY_SATURATION,
   MEMORY_MAX_ALPHA,
   MEMORY_MAX_CELL_DENSITY,
   PATTERN_MEMORY_DEFAULT_SEC,
@@ -3360,5 +3362,94 @@ test('40. Reaction Threshold (gammaC) controls particle activation to vibration 
   assert.equal(sys.config.gammaC, REACTION_THRESHOLD_MAX_G);
   sys.setGammaC(Number.POSITIVE_INFINITY);
   assert.equal(sys.config.gammaC, REACTION_THRESHOLD_MAX_G);
+});
+
+test('41. PatternMemoryField.writeToRgba() applies 3x3 Gaussian smoothing, edge renormalization, fixed intensity mapping, and zero mutation', () => {
+  assert.equal(MEMORY_DENSITY_FLOOR, 0.12);
+  assert.equal(MEMORY_DENSITY_SATURATION, 1.8);
+  assert.equal(MEMORY_MAX_ALPHA, 120);
+
+  const res = 32;
+  const field = new PatternMemoryField(res);
+  const currentRef = field.currentDensity;
+  const memoryRef = field.memoryDensity;
+  const rgba = new Uint8ClampedArray(res * res * 4);
+  const alphaAt = (x: number, y: number): number => rgba[(y * res + x) * 4 + 3];
+
+  // 1) Concentrated single-cell cluster at interior (16, 16) with density 4.0
+  //    3x3 Gaussian neighbors receive:
+  //      center = 4.0 * 4/16 = 1.00
+  //      ortho  = 4.0 * 2/16 = 0.50
+  //      diag   = 4.0 * 1/16 = 0.25
+  //      dist>=2 = 0.00
+  const cx = 16;
+  const cy = 16;
+  field.memoryDensity[cy * res + cx] = 4.0;
+  const snapshotBefore = new Float32Array(field.memoryDensity);
+
+  field.writeToRgba(rgba);
+
+  // memoryDensity buffer must remain bit-for-bit unchanged and buffer identities preserved
+  assert.equal(field.currentDensity, currentRef);
+  assert.equal(field.memoryDensity, memoryRef);
+  for (let i = 0; i < field.memoryDensity.length; i++) {
+    assert.equal(field.memoryDensity[i], snapshotBefore[i]);
+  }
+
+  const aCenter = alphaAt(cx, cy);
+  const aLeft = alphaAt(cx - 1, cy);
+  const aRight = alphaAt(cx + 1, cy);
+  const aUp = alphaAt(cx, cy - 1);
+  const aDown = alphaAt(cx, cy + 1);
+  const aUpLeft = alphaAt(cx - 1, cy - 1);
+  const aUpRight = alphaAt(cx + 1, cy - 1);
+  const aDownLeft = alphaAt(cx - 1, cy + 1);
+  const aDownRight = alphaAt(cx + 1, cy + 1);
+
+  // Symmetry across all 4 orthogonal and 4 diagonal neighbors
+  assert.equal(aLeft, aRight);
+  assert.equal(aLeft, aUp);
+  assert.equal(aLeft, aDown);
+  assert.equal(aUpLeft, aUpRight);
+  assert.equal(aUpLeft, aDownLeft);
+  assert.equal(aUpLeft, aDownRight);
+
+  // Monotonic falloff: center > ortho > diag > 0
+  assert.ok(aCenter > aLeft && aLeft > aUpLeft && aUpLeft > 0);
+  assert.equal(aCenter, mapDensityToAlpha(1.0));
+  assert.equal(aLeft, mapDensityToAlpha(0.5));
+  assert.equal(aUpLeft, mapDensityToAlpha(0.25));
+
+  // Cells at distance >= 2 remain strictly transparent
+  for (let y = 0; y < res; y++) {
+    for (let x = 0; x < res; x++) {
+      if (Math.abs(x - cx) >= 2 || Math.abs(y - cy) >= 2) {
+        assert.equal(alphaAt(x, y), 0, `Unexpected non-zero alpha at (${x}, ${y})`);
+      }
+    }
+  }
+
+  // 2) Safe edge & corner renormalization: uniform field must map identically everywhere
+  field.memoryDensity.fill(0.9);
+  field.writeToRgba(rgba);
+  const expectedUniformAlpha = mapDensityToAlpha(0.9);
+  assert.ok(expectedUniformAlpha > 0);
+  assert.equal(alphaAt(0, 0), expectedUniformAlpha);
+  assert.equal(alphaAt(res - 1, 0), expectedUniformAlpha);
+  assert.equal(alphaAt(0, res - 1), expectedUniformAlpha);
+  assert.equal(alphaAt(res - 1, res - 1), expectedUniformAlpha);
+  assert.equal(alphaAt(0, 10), expectedUniformAlpha);
+  assert.equal(alphaAt(10, 0), expectedUniformAlpha);
+  assert.equal(alphaAt(15, 15), expectedUniformAlpha);
+
+  // 3) Corner spike (0, 0) renormalizes over valid weights (sum = 9) without wrapping across row
+  field.clear();
+  field.memoryDensity[0] = 3.6;
+  field.writeToRgba(rgba);
+  assert.equal(alphaAt(0, 0), mapDensityToAlpha((3.6 * 4) / 9));
+  assert.equal(alphaAt(1, 0), mapDensityToAlpha((3.6 * 2) / 12));
+  assert.equal(alphaAt(0, 1), mapDensityToAlpha((3.6 * 2) / 12));
+  assert.equal(alphaAt(1, 1), mapDensityToAlpha((3.6 * 1) / 16));
+  assert.equal(alphaAt(res - 1, 0), 0); // No wrap-around from (0, 0)
 });
 
