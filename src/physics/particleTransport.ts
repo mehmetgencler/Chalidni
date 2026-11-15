@@ -154,7 +154,10 @@ export class ParticleTransportSystem {
 
   setGammaC(gammaC: number): void {
     if (!Number.isFinite(gammaC)) return;
-    this.config.gammaC = Math.max(REACTION_THRESHOLD_MIN_G, Math.min(20.0, gammaC));
+    this.config.gammaC = Math.max(
+      REACTION_THRESHOLD_MIN_G,
+      Math.min(REACTION_THRESHOLD_MAX_G, gammaC)
+    );
   }
 
   private buildBalancedShuffledColors(count: number): ParticleColor[] {

@@ -304,7 +304,7 @@ export function App() {
                 className="w-full h-2 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-amber-400 focus:outline-none"
               />
               <p className="text-[11px] text-slate-400 leading-snug">
-                Minimum acceleration (g) required for particles to respond to frequencies.
+                Minimum local RMS acceleration required for particle movement.
               </p>
             </div>
           </div>

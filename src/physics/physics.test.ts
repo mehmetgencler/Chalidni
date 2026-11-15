@@ -3350,5 +3350,15 @@ test('40. Reaction Threshold (gammaC) controls particle activation to vibration 
     assert.equal(sys.particles[i].vx, 0);
     assert.equal(sys.particles[i].vy, 0);
   }
+
+  // 4) Boundary clamping & non-finite guard (0.00 g - 8.00 g)
+  sys.setGammaC(-2.5);
+  assert.equal(sys.config.gammaC, REACTION_THRESHOLD_MIN_G);
+  sys.setGammaC(25.0);
+  assert.equal(sys.config.gammaC, REACTION_THRESHOLD_MAX_G);
+  sys.setGammaC(Number.NaN);
+  assert.equal(sys.config.gammaC, REACTION_THRESHOLD_MAX_G);
+  sys.setGammaC(Number.POSITIVE_INFINITY);
+  assert.equal(sys.config.gammaC, REACTION_THRESHOLD_MAX_G);
 });
 
