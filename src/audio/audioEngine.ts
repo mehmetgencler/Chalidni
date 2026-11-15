@@ -640,6 +640,9 @@ export class AudioEngine {
     this.cancelSilentWavStream();
     this.stopTone();
     this.sourceType = 'file';
+    if (this.excitationProfile !== 'music') {
+      this.setExcitationProfile('music');
+    }
     if (this.audioBuffer && this.ctx) {
       const startPlay = () => {
         if (this.audioBuffer && !this.isBufferPlaying) {

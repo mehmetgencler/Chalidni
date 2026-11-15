@@ -43,16 +43,17 @@ class ModalWorkletProcessor extends _BaseWorkletProcessor {
     this.sideLength = 0.30;
     this.isSilent = true;
 
-    // Excitation profiles: 'raw' (default, unmodified sine/direct input) | 'music' (bounded RMS normalization)
+    // Excitation profiles: 'raw' (default, unmodified sine/direct input) | 'music' (bounded RMS normalization & broadband musical coupling)
     this.excitationProfile = 'raw';
-    this.musicTargetInputRms = 0.006;
+    this.musicTargetInputRms = 0.20;
     this.musicMinGain = 1.0;
     this.musicMaxGain = 16.0;
-    this.musicGateOpenRms = Math.pow(10.0, -78.0 / 20.0);
-    this.musicGateCloseRms = Math.pow(10.0, -84.0 / 20.0);
-    this.musicEnvTimeConstant = 0.05;
-    this.musicGainAttackTimeConstant = 0.05;
-    this.musicGainReleaseTimeConstant = 0.02;
+    this.musicForceScale = 8.0;
+    this.musicGateOpenRms = Math.pow(10.0, -74.5 / 20.0);
+    this.musicGateCloseRms = Math.pow(10.0, -80.5 / 20.0);
+    this.musicEnvTimeConstant = 0.025;
+    this.musicGainAttackTimeConstant = 0.025;
+    this.musicGainReleaseTimeConstant = 0.015;
     this.musicInputMeanSqEnvelope = 0.0;
     this.musicGateOpen = false;
     this.musicSmoothedGain = 1.0;
@@ -402,7 +403,7 @@ class ModalWorkletProcessor extends _BaseWorkletProcessor {
       }
 
       if (this.musicGateOpen && inputChannel && quantumLen > 0) {
-        const scale = this.musicSmoothedGain * 3.0;
+        const scale = this.musicSmoothedGain * this.musicForceScale;
         for (let s = 0; s < quantumLen; s++) {
           const rawSample = inputChannel[s];
           const safeSample = Number.isFinite(rawSample) ? rawSample : 0;

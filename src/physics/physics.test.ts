@@ -3620,3 +3620,116 @@ test('43. Experimental Normalization Toggle recovers contrast on extremely faint
   assert.equal(mapNormalizedDensityToAlpha(0.05, 0), 0);
 });
 
+test('44. Broadband music sensitivity drives particles across bass/low-mid off-resonance notes, quiet chords (-36/-48 dBFS), and short transients while preserving resonant bounds', () => {
+  const sr = 48000;
+  const L = DEFAULT_GEOMETRY.sideLength;
+
+  const measureMusicResponse = (
+    durSec: number,
+    signalFn: (t: number) => number,
+    sampleRateHz: number = sr
+  ) => {
+    const { processor } = createProductionWorklet(sampleRateHz);
+    processor.handleMessage({ type: 'SET_EXCITATION_PROFILE', profile: 'music' });
+    const mb = new ModalBank(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY, 0.01);
+    const sys = new ParticleTransportSystem(
+      {
+        particleCount: 3000,
+        dRef: 2.0e-6,
+        gammaC: 1.0,
+        power: 2.0,
+        g: 9.80665,
+        dt: 0.016,
+        seed: 42,
+      },
+      L
+    );
+    const initial = sys.particles.map((p) => ({ x: p.x, y: p.y }));
+    const snapBox: { snap: ModalSnapshot | null } = { snap: null };
+    processor.port.postMessage = (msg: unknown) => {
+      snapBox.snap = msg as ModalSnapshot;
+    };
+
+    const totalFrames = Math.floor(durSec * sampleRateHz);
+    const inBuf = new Float32Array(128);
+    const outBuf = new Float32Array(128);
+    let maxRms = 0;
+    let boundViolated = false;
+
+    for (let off = 0; off < totalFrames; off += 128) {
+      for (let s = 0; s < 128; s++) {
+        inBuf[s] = signalFn((off + s) / sampleRateHz);
+      }
+      processor.process([[inBuf]], [[outBuf]]);
+      const snap = snapBox.snap;
+      if (snap) {
+        mb.applySnapshot(snap);
+        const grid = mb.getFastRmsGridData();
+        for (let i = 0; i < grid.halfN * grid.halfN; i++) {
+          if (grid.quadrant[i] > maxRms) maxRms = grid.quadrant[i];
+        }
+        sys.stepFromRmsGrid(0.016, grid.quadrant, grid.halfN, Boolean(snap.isSilent) || !grid.hasEnergy);
+        if (sys.lastStepStats.boundViolated) boundViolated = true;
+        snapBox.snap = null;
+      }
+    }
+
+    let movedCount = 0;
+    let maxDispMm = 0;
+    for (let i = 0; i < sys.particles.length; i++) {
+      const dispM = Math.hypot(sys.particles[i].x - initial[i].x, sys.particles[i].y - initial[i].y);
+      if (dispM > 1e-4) movedCount++;
+      if (dispM * 1000 > maxDispMm) maxDispMm = dispM * 1000;
+    }
+    return {
+      movedPct: (movedCount / sys.particles.length) * 100,
+      maxDispMm,
+      maxRms,
+      boundViolated,
+    };
+  };
+
+  // 1) Off-resonance bass & low-mid musical notes at -18 dBFS (82.4 Hz E2, 110 Hz A2, 130 Hz, 150 Hz)
+  const amp18 = Math.SQRT2 * Math.pow(10, -18 / 20);
+  for (const freqHz of [40, 82.4, 110, 130, 150, 440, 5000]) {
+    const res = measureMusicResponse(0.8, (t) => amp18 * Math.sin(2 * Math.PI * freqHz * t));
+    assert.ok(
+      res.maxRms > 20 && res.movedPct > 40,
+      `Expected active musical movement at ${freqHz} Hz (-18 dBFS), got maxRms=${res.maxRms.toFixed(2)}, moved=${res.movedPct.toFixed(1)}%`
+    );
+  }
+
+  // 2) Quiet multi-note chords (-36 dBFS & -48 dBFS) must visibly drive particles
+  for (const db of [-36, -48]) {
+    const amp = Math.SQRT2 * Math.pow(10, db / 20);
+    const res = measureMusicResponse(
+      0.8,
+      (t) =>
+        (amp / Math.sqrt(3)) *
+        (Math.sin(2 * Math.PI * 110 * t) + Math.sin(2 * Math.PI * 330 * t) + Math.sin(2 * Math.PI * 660 * t))
+    );
+    assert.ok(
+      res.maxRms > 25 && res.movedPct > 50,
+      `Expected quiet ${db} dBFS chord to move particles, got maxRms=${res.maxRms.toFixed(2)}, moved=${res.movedPct.toFixed(1)}%`
+    );
+  }
+
+  // 3) Short 50ms percussive/bass transient must trigger immediate particle motion
+  const kickRes = measureMusicResponse(0.5, (t) =>
+    t >= 0.15 && t <= 0.2 ? amp18 * Math.sin(2 * Math.PI * 110 * t) : 0
+  );
+  assert.ok(
+    kickRes.movedPct > 25 && kickRes.maxDispMm > 1.5,
+    `Expected 50ms transient to move particles, got moved=${kickRes.movedPct.toFixed(1)}%, maxDisp=${kickRes.maxDispMm.toFixed(2)}mm`
+  );
+
+  // 4) Loud resonant WAV excitation must remain strictly bounded (no safetyCap violation)
+  const loudRes = measureMusicResponse(
+    1.5,
+    (t) => 0.85 * Math.sin(2 * Math.PI * 269.815 * t),
+    22050
+  );
+  assert.equal(loudRes.boundViolated, false, 'Loud resonant music excitation must not violate 8mm sub-step bound');
+});
+
+
