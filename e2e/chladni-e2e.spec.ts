@@ -409,4 +409,51 @@ test.describe('Stage 9 Real Browser AudioWorklet & Granular Simulation E2E', () 
     expect(mobileOverflow).toBe(false);
     expect(consoleErrors).toEqual([]);
   });
+
+  test('5. Normalization Toggle switches experimental mean-density contrast scaling live without interrupting simulation', async ({
+    page,
+  }) => {
+    const consoleErrors: string[] = [];
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => consoleErrors.push(String(err)));
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto('/');
+
+    const normToggle = page.getByTestId('normalization-toggle');
+    const normState = page.getByTestId('normalization-toggle-state');
+    await expect(normToggle).toHaveRole('switch');
+    await expect(normToggle).not.toBeChecked();
+    await expect(normState).toHaveText('OFF');
+
+    await page.getByRole('button', { name: 'Start Tone' }).click();
+    await page.waitForTimeout(700);
+
+    const dsOff = await readCanvasDataset(page);
+    expect(dsOff.patternMemoryNormalized).toBe('false');
+    expect(Number(dsOff.patternMemoryMean)).toBeGreaterThan(0);
+
+    // Enable experimental normalization live
+    await page.getByRole('switch', { name: 'Normalization Toggle' }).click({ force: true });
+    await page.waitForTimeout(300);
+
+    await expect(normToggle).toBeChecked();
+    await expect(normState).toHaveText('ON');
+    const dsOn = await readCanvasDataset(page);
+    expect(dsOn.patternMemoryNormalized).toBe('true');
+    expect(Number(dsOn.patternMemoryMean)).toBeGreaterThan(0);
+    expect(Number(dsOn.simFrames)).toBeGreaterThan(Number(dsOff.simFrames));
+    expect(Number(dsOn.particleSteps)).toBeGreaterThan(Number(dsOff.particleSteps));
+    await expect(page.getByRole('button', { name: 'Stop Tone' })).toBeVisible();
+
+    // Toggle back OFF cleanly
+    await page.getByRole('switch', { name: 'Normalization Toggle' }).click({ force: true });
+    await page.waitForTimeout(200);
+    await expect(normToggle).not.toBeChecked();
+    await expect(normState).toHaveText('OFF');
+
+    expect(consoleErrors).toEqual([]);
+  });
 });

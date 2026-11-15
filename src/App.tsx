@@ -76,9 +76,11 @@ export function App() {
 
   // Visual-only pattern-memory controls (independent of physics simulation & audio)
   const [patternMemorySec, setPatternMemorySec] = useState<number>(PATTERN_MEMORY_DEFAULT_SEC);
+  const [normalizePatternMemory, setNormalizePatternMemory] = useState<boolean>(false);
   const [patternMemoryResetToken, setPatternMemoryResetToken] = useState<number>(0);
   const isPatternMemoryPausedRef = useRef<boolean>(false);
   const memorySliderId = useId();
+  const normalizeToggleId = useId();
 
   // Physical particle activation threshold (Gamma_c in units of g)
   const [reactionThresholdG, setReactionThresholdG] = useState<number>(REACTION_THRESHOLD_DEFAULT_G);
@@ -223,6 +225,7 @@ export function App() {
             patternMemoryHalfLifeSec={patternMemorySec}
             patternMemoryResetToken={patternMemoryResetToken}
             isPatternMemoryPausedRef={isPatternMemoryPausedRef}
+            normalizePatternMemory={normalizePatternMemory}
           />
         </section>
 
@@ -306,6 +309,51 @@ export function App() {
               <p className="text-[11px] text-slate-400 leading-snug">
                 Minimum local RMS acceleration required for particle movement.
               </p>
+            </div>
+
+            <div className="sm:col-span-2 pt-2.5 border-t border-slate-800/80 flex items-center justify-between gap-4">
+              <div className="flex flex-col gap-0.5">
+                <div className="flex items-center gap-2">
+                  <label
+                    id={`${normalizeToggleId}-label`}
+                    htmlFor={normalizeToggleId}
+                    className="text-xs font-medium text-slate-200 tracking-tight cursor-pointer"
+                  >
+                    Normalization Toggle
+                  </label>
+                  <span className="text-[10px] font-medium uppercase tracking-wider text-sky-400/90">
+                    Experimental
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-400 leading-snug">
+                  Auto-scales cloud intensity from measured mean density to recover contrast on faint patterns.
+                </p>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <label
+                  htmlFor={normalizeToggleId}
+                  aria-labelledby={`${normalizeToggleId}-label`}
+                  className="relative inline-flex items-center cursor-pointer"
+                >
+                  <input
+                    id={normalizeToggleId}
+                    type="checkbox"
+                    role="switch"
+                    aria-labelledby={`${normalizeToggleId}-label`}
+                    checked={normalizePatternMemory}
+                    onChange={(e) => setNormalizePatternMemory(e.target.checked)}
+                    data-testid="normalization-toggle"
+                    className="sr-only peer"
+                  />
+                  <span className="w-9 h-5 bg-slate-800 border border-slate-700 rounded-full peer peer-focus-visible:ring-2 peer-focus-visible:ring-sky-400 peer-checked:bg-sky-500/80 peer-checked:border-sky-400 transition-colors after:content-[''] after:absolute after:top-[3px] after:left-[3px] after:bg-slate-200 after:rounded-full after:h-3.5 after:w-3.5 after:transition-transform peer-checked:after:translate-x-4" />
+                </label>
+                <span
+                  data-testid="normalization-toggle-state"
+                  className="text-[11px] font-mono font-semibold tabular-nums text-slate-300 w-7 text-right"
+                >
+                  {normalizePatternMemory ? 'ON' : 'OFF'}
+                </span>
+              </div>
             </div>
           </div>
           <SilentVideoExport

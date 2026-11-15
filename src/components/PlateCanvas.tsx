@@ -25,6 +25,7 @@ interface PlateCanvasProps {
   patternMemoryHalfLifeSec?: number;
   patternMemoryResetToken?: number;
   isPatternMemoryPausedRef?: React.RefObject<boolean>;
+  normalizePatternMemory?: boolean;
 }
 
 const GRAIN_COLOR_TIERS: Record<ParticleColor, { body: string; spec: string }[]> = {
@@ -68,6 +69,7 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
   patternMemoryHalfLifeSec = 0,
   patternMemoryResetToken = 0,
   isPatternMemoryPausedRef,
+  normalizePatternMemory = false,
 }) => {
   const internalCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const canvasRef = canvasRefExternal ?? internalCanvasRef;
@@ -77,6 +79,9 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
 
   const halfLifeRef = useRef<number>(patternMemoryHalfLifeSec);
   halfLifeRef.current = patternMemoryHalfLifeSec;
+  const normalizeMemoryRef = useRef<boolean>(normalizePatternMemory);
+  normalizeMemoryRef.current = normalizePatternMemory;
+  const appliedNormalizeRef = useRef<boolean>(normalizePatternMemory);
   const resetTokenRef = useRef<number>(patternMemoryResetToken);
   resetTokenRef.current = patternMemoryResetToken;
   const appliedResetTokenRef = useRef<number>(patternMemoryResetToken);
@@ -253,7 +258,9 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
 
       // 2.5 Visual-only density memory layer rendered smoothly beneath live particles
       const halfLifeSec = halfLifeRef.current;
+      const normalizeMemory = normalizeMemoryRef.current;
       canvas.dataset.patternMemorySec = halfLifeSec.toFixed(2);
+      canvas.dataset.patternMemoryNormalized = String(normalizeMemory);
       if (halfLifeSec > 0) {
         let field = memoryFieldRef.current;
         if (!field) {
@@ -274,22 +281,27 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
         }
 
         const isPaused = pausedRef.current;
+        const normalizeChanged = appliedNormalizeRef.current !== normalizeMemory;
+        appliedNormalizeRef.current = normalizeMemory;
         const hasMemory = field.step(activeParticles, sideLength, dtSec, halfLifeSec, isPaused);
         if (hasMemory && memSurface) {
-          if (!isPaused) {
-            field.writeToRgba(memSurface.imageData.data);
+          if (!isPaused || normalizeChanged) {
+            field.writeToRgba(memSurface.imageData.data, normalizeMemory);
             memSurface.ctx.putImageData(memSurface.imageData, 0, 0);
           }
           ctx.drawImage(memSurface.canvas, 0, 0, size, size);
         }
         canvas.dataset.patternMemoryActive = String(hasMemory);
         canvas.dataset.patternMemoryPeak = field.getMaxMemoryDensity().toFixed(3);
+        canvas.dataset.patternMemoryMean = field.getLastMeanDensity().toFixed(4);
       } else {
+        appliedNormalizeRef.current = normalizeMemory;
         if (memoryFieldRef.current?.isActive) {
           memoryFieldRef.current.clear();
         }
         canvas.dataset.patternMemoryActive = 'false';
         canvas.dataset.patternMemoryPeak = '0.000';
+        canvas.dataset.patternMemoryMean = '0.0000';
       }
 
       // 3. Render granular powder particles using per-particle color, radius & brightness

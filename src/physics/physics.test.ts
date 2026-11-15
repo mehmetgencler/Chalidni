@@ -64,12 +64,18 @@ import {
 } from '../video/silentVideoExport.ts';
 import { computeParticleRenderParams } from '../components/plateVisuals.ts';
 import {
+  computeAttackBlend,
   computeHalfLifeDecay,
   mapDensityToAlpha,
+  mapNormalizedDensityToAlpha,
   MEMORY_DENSITY_FLOOR,
   MEMORY_DENSITY_SATURATION,
   MEMORY_MAX_ALPHA,
   MEMORY_MAX_CELL_DENSITY,
+  NORMALIZED_FLOOR_MEAN_RATIO,
+  NORMALIZED_MIN_MEAN_DENSITY,
+  NORMALIZED_SATURATION_MEAN_RATIO,
+  PATTERN_MEMORY_ATTACK_TAU_SEC,
   PATTERN_MEMORY_DEFAULT_SEC,
   PATTERN_MEMORY_MAX_SEC,
   PATTERN_MEMORY_MIN_SEC,
@@ -3364,7 +3370,7 @@ test('40. Reaction Threshold (gammaC) controls particle activation to vibration 
   assert.equal(sys.config.gammaC, REACTION_THRESHOLD_MAX_G);
 });
 
-test('41. PatternMemoryField.writeToRgba() applies 3x3 Gaussian smoothing, edge renormalization, fixed intensity mapping, and zero mutation', () => {
+test('41. PatternMemoryField.writeToRgba() applies 5x5 separable Gaussian smoothing, edge renormalization, fixed intensity mapping, and zero mutation', () => {
   assert.equal(MEMORY_DENSITY_FLOOR, 0.12);
   assert.equal(MEMORY_DENSITY_SATURATION, 1.8);
   assert.equal(MEMORY_MAX_ALPHA, 120);
@@ -3376,15 +3382,17 @@ test('41. PatternMemoryField.writeToRgba() applies 3x3 Gaussian smoothing, edge 
   const rgba = new Uint8ClampedArray(res * res * 4);
   const alphaAt = (x: number, y: number): number => rgba[(y * res + x) * 4 + 3];
 
-  // 1) Concentrated single-cell cluster at interior (16, 16) with density 4.0
-  //    3x3 Gaussian neighbors receive:
-  //      center = 4.0 * 4/16 = 1.00
-  //      ortho  = 4.0 * 2/16 = 0.50
-  //      diag   = 4.0 * 1/16 = 0.25
-  //      dist>=2 = 0.00
+  // 1) Concentrated single-cell cluster at interior (16, 16) with density 16.0
+  //    5x5 separable [1,4,6,4,1]/16 outer-product weights / 256:
+  //      (0,0) = 36/256 -> 2.250
+  //      (1,0) = 24/256 -> 1.500
+  //      (1,1) = 16/256 -> 1.000
+  //      (2,0) =  6/256 -> 0.375
+  //      (2,1) =  4/256 -> 0.250
+  //      (2,2) =  1/256 -> 0.0625 (< floor => 0 alpha)
   const cx = 16;
   const cy = 16;
-  field.memoryDensity[cy * res + cx] = 4.0;
+  field.memoryDensity[cy * res + cx] = 16.0;
   const snapshotBefore = new Float32Array(field.memoryDensity);
 
   field.writeToRgba(rgba);
@@ -3397,33 +3405,42 @@ test('41. PatternMemoryField.writeToRgba() applies 3x3 Gaussian smoothing, edge 
   }
 
   const aCenter = alphaAt(cx, cy);
-  const aLeft = alphaAt(cx - 1, cy);
-  const aRight = alphaAt(cx + 1, cy);
-  const aUp = alphaAt(cx, cy - 1);
-  const aDown = alphaAt(cx, cy + 1);
-  const aUpLeft = alphaAt(cx - 1, cy - 1);
-  const aUpRight = alphaAt(cx + 1, cy - 1);
-  const aDownLeft = alphaAt(cx - 1, cy + 1);
-  const aDownRight = alphaAt(cx + 1, cy + 1);
+  const aOrtho1L = alphaAt(cx - 1, cy);
+  const aOrtho1R = alphaAt(cx + 1, cy);
+  const aOrtho1U = alphaAt(cx, cy - 1);
+  const aOrtho1D = alphaAt(cx, cy + 1);
+  const aDiag1UL = alphaAt(cx - 1, cy - 1);
+  const aDiag1UR = alphaAt(cx + 1, cy - 1);
+  const aDiag1DL = alphaAt(cx - 1, cy + 1);
+  const aDiag1DR = alphaAt(cx + 1, cy + 1);
+  const aOrtho2L = alphaAt(cx - 2, cy);
+  const aOrtho2R = alphaAt(cx + 2, cy);
+  const aOrtho2U = alphaAt(cx, cy - 2);
+  const aOrtho2D = alphaAt(cx, cy + 2);
 
-  // Symmetry across all 4 orthogonal and 4 diagonal neighbors
-  assert.equal(aLeft, aRight);
-  assert.equal(aLeft, aUp);
-  assert.equal(aLeft, aDown);
-  assert.equal(aUpLeft, aUpRight);
-  assert.equal(aUpLeft, aDownLeft);
-  assert.equal(aUpLeft, aDownRight);
+  // Exact 4-way spatial symmetry at distance 1 and distance 2
+  assert.equal(aOrtho1L, aOrtho1R);
+  assert.equal(aOrtho1L, aOrtho1U);
+  assert.equal(aOrtho1L, aOrtho1D);
+  assert.equal(aDiag1UL, aDiag1UR);
+  assert.equal(aDiag1UL, aDiag1DL);
+  assert.equal(aDiag1UL, aDiag1DR);
+  assert.equal(aOrtho2L, aOrtho2R);
+  assert.equal(aOrtho2L, aOrtho2U);
+  assert.equal(aOrtho2L, aOrtho2D);
 
-  // Monotonic falloff: center > ortho > diag > 0
-  assert.ok(aCenter > aLeft && aLeft > aUpLeft && aUpLeft > 0);
-  assert.equal(aCenter, mapDensityToAlpha(1.0));
-  assert.equal(aLeft, mapDensityToAlpha(0.5));
-  assert.equal(aUpLeft, mapDensityToAlpha(0.25));
+  // Continuous smooth falloff across 5x5 neighborhood
+  assert.ok(aCenter >= aOrtho1L && aOrtho1L > aDiag1UL && aDiag1UL > aOrtho2L && aOrtho2L > 0);
+  assert.equal(aCenter, mapDensityToAlpha((16.0 * 36) / 256));
+  assert.equal(aOrtho1L, mapDensityToAlpha((16.0 * 24) / 256));
+  assert.equal(aDiag1UL, mapDensityToAlpha((16.0 * 16) / 256));
+  assert.equal(aOrtho2L, mapDensityToAlpha((16.0 * 6) / 256));
+  assert.equal(alphaAt(cx + 2, cy + 1), mapDensityToAlpha((16.0 * 4) / 256));
 
-  // Cells at distance >= 2 remain strictly transparent
+  // Cells outside 5x5 support (|dx| >= 3 or |dy| >= 3) remain strictly transparent
   for (let y = 0; y < res; y++) {
     for (let x = 0; x < res; x++) {
-      if (Math.abs(x - cx) >= 2 || Math.abs(y - cy) >= 2) {
+      if (Math.abs(x - cx) >= 3 || Math.abs(y - cy) >= 3) {
         assert.equal(alphaAt(x, y), 0, `Unexpected non-zero alpha at (${x}, ${y})`);
       }
     }
@@ -3434,22 +3451,172 @@ test('41. PatternMemoryField.writeToRgba() applies 3x3 Gaussian smoothing, edge 
   field.writeToRgba(rgba);
   const expectedUniformAlpha = mapDensityToAlpha(0.9);
   assert.ok(expectedUniformAlpha > 0);
-  assert.equal(alphaAt(0, 0), expectedUniformAlpha);
-  assert.equal(alphaAt(res - 1, 0), expectedUniformAlpha);
-  assert.equal(alphaAt(0, res - 1), expectedUniformAlpha);
-  assert.equal(alphaAt(res - 1, res - 1), expectedUniformAlpha);
-  assert.equal(alphaAt(0, 10), expectedUniformAlpha);
-  assert.equal(alphaAt(10, 0), expectedUniformAlpha);
-  assert.equal(alphaAt(15, 15), expectedUniformAlpha);
+  for (const [tx, ty] of [
+    [0, 0], [1, 0], [0, 1], [1, 1],
+    [res - 1, 0], [res - 2, 0], [0, res - 1], [res - 1, res - 1],
+    [0, 10], [1, 10], [10, 0], [10, 1], [15, 15],
+  ]) {
+    assert.equal(alphaAt(tx, ty), expectedUniformAlpha, `Edge/corner renormalization mismatch at (${tx}, ${ty})`);
+  }
 
-  // 3) Corner spike (0, 0) renormalizes over valid weights (sum = 9) without wrapping across row
+  // 3) Corner spike (0, 0) renormalizes over valid 5x5 weights (11 * 11 = 121) without wrapping across rows
   field.clear();
-  field.memoryDensity[0] = 3.6;
+  field.memoryDensity[0] = 6.0;
   field.writeToRgba(rgba);
-  assert.equal(alphaAt(0, 0), mapDensityToAlpha((3.6 * 4) / 9));
-  assert.equal(alphaAt(1, 0), mapDensityToAlpha((3.6 * 2) / 12));
-  assert.equal(alphaAt(0, 1), mapDensityToAlpha((3.6 * 2) / 12));
-  assert.equal(alphaAt(1, 1), mapDensityToAlpha((3.6 * 1) / 16));
-  assert.equal(alphaAt(res - 1, 0), 0); // No wrap-around from (0, 0)
+  assert.equal(alphaAt(0, 0), mapDensityToAlpha((6.0 * 36) / 121));
+  assert.equal(alphaAt(1, 0), mapDensityToAlpha((6.0 * 24) / 165));
+  assert.equal(alphaAt(2, 0), mapDensityToAlpha((6.0 * 6) / 176));
+  assert.equal(alphaAt(0, 1), mapDensityToAlpha((6.0 * 24) / 165));
+  assert.equal(alphaAt(1, 1), mapDensityToAlpha((6.0 * 16) / 225));
+  assert.equal(alphaAt(res - 1, 0), 0);
+});
+
+test('42. PatternMemoryField enforces asymmetric fast attack (0.08s) and slow half-life release across region shifts, pause, and 0.00s disable', () => {
+  assert.equal(PATTERN_MEMORY_ATTACK_TAU_SEC, 0.08);
+  assert.ok(computeAttackBlend(0.1, 0.08) >= 0.7);
+
+  const sideLength = 0.30;
+  const field = new PatternMemoryField(64);
+  const idxA = 16 * 64 + 16;
+  const idxB = 48 * 64 + 48;
+
+  // 1) Newly appearing density region reaches >= 70% of target within 100 ms (6 frames @ 60 Hz)
+  field.currentDensity.fill(0);
+  field.currentDensity[idxA] = 4.0;
+  for (let f = 0; f < 6; f++) {
+    field.stepWithCurrentDensity(1 / 60, 1.5);
+  }
+  const ratioA100ms = field.memoryDensity[idxA] / 4.0;
+  assert.ok(
+    ratioA100ms >= 0.7,
+    `Expected new region to reach >=70% within 100ms, got ${(ratioA100ms * 100).toFixed(2)}%`
+  );
+
+  // Settle region A fully toward 4.0, then move cluster to region B (region A -> 0, region B -> 4.0)
+  for (let f = 0; f < 60; f++) {
+    field.stepWithCurrentDensity(1 / 60, 1.5);
+  }
+  const peakABeforeMove = field.memoryDensity[idxA];
+  assert.ok(peakABeforeMove > 3.95);
+
+  field.currentDensity[idxA] = 0;
+  field.currentDensity[idxB] = 4.0;
+  for (let f = 0; f < 6; f++) {
+    field.stepWithCurrentDensity(1 / 60, 1.5);
+  }
+  const ratioB100ms = field.memoryDensity[idxB] / 4.0;
+  const retainedA100ms = field.memoryDensity[idxA] / peakABeforeMove;
+  assert.ok(
+    ratioB100ms >= 0.7,
+    `Expected moved cluster region B to reach >=70% within 100ms, got ${(ratioB100ms * 100).toFixed(2)}%`
+  );
+  assert.ok(
+    retainedA100ms > 0.9,
+    `Expected old region A to fade gradually (>90% retained after 100ms @ 1.5s half-life), got ${(retainedA100ms * 100).toFixed(2)}%`
+  );
+
+  // 2) Also verify via step(particles, ...) that particle cluster moving from A -> B obeys fast attack + slow release
+  const pField = new PatternMemoryField(128);
+  const clusterA: Particle[] = [];
+  const clusterB: Particle[] = [];
+  for (let i = 0; i < 40; i++) {
+    clusterA.push({ x: 0.08, y: 0.08, vx: 0, vy: 0, active: true, color: 'green' });
+    clusterB.push({ x: 0.22, y: 0.22, vx: 0, vy: 0, active: true, color: 'blue' });
+  }
+  // Pre-establish steady pattern at A
+  for (let f = 0; f < 60; f++) {
+    pField.step(clusterA, sideLength, 1 / 60, 1.5, false);
+  }
+  const cellAx = Math.floor((0.08 / sideLength) * 127);
+  const cellAy = Math.floor((0.08 / sideLength) * 127);
+  const cellBx = Math.floor((0.22 / sideLength) * 127);
+  const cellBy = Math.floor((0.22 / sideLength) * 127);
+  const patchMax = (buf: Float32Array, cx: number, cy: number) =>
+    Math.max(
+      buf[cy * 128 + cx],
+      buf[cy * 128 + cx + 1],
+      buf[(cy + 1) * 128 + cx],
+      buf[(cy + 1) * 128 + cx + 1]
+    );
+  const steadyA = patchMax(pField.memoryDensity, cellAx, cellAy);
+  assert.ok(steadyA > 5.0);
+
+  // Move cluster to B for 100 ms (6 frames @ 60 Hz): B builds fast while A stays slowly fading
+  pField.rasterizeParticles(clusterB, sideLength);
+  const targetBPeak = patchMax(pField.currentDensity, cellBx, cellBy);
+  for (let f = 0; f < 6; f++) {
+    pField.step(clusterB, sideLength, 1 / 60, 1.5, false);
+  }
+  assert.ok(patchMax(pField.memoryDensity, cellBx, cellBy) >= 0.7 * targetBPeak);
+  assert.ok(patchMax(pField.memoryDensity, cellAx, cellAy) > 0.9 * steadyA);
+
+  // Continue empty input for 1.5s half-life -> A drops to 50% of its post-shift value
+  const aAtShift = patchMax(pField.memoryDensity, cellAx, cellAy);
+  for (let f = 0; f < 90; f++) {
+    pField.step([], sideLength, 1 / 60, 1.5, false);
+  }
+  const decayRatio = patchMax(pField.memoryDensity, cellAx, cellAy) / aAtShift;
+  assert.ok(Math.abs(decayRatio - 0.5) < 0.015, `Expected ~50% after 1.5s half-life, got ${(decayRatio * 100).toFixed(2)}%`);
+
+  // Pause freezes memory, 0.00s disables & clears
+  const beforePause = pField.getMaxMemoryDensity();
+  pField.step(clusterA, sideLength, 1 / 60, 1.5, true);
+  assert.equal(pField.getMaxMemoryDensity(), beforePause);
+
+  assert.equal(pField.step(clusterA, sideLength, 1 / 60, 0.0, false), false);
+  assert.equal(pField.isActive, false);
+  assert.equal(pField.getMaxMemoryDensity(), 0);
+});
+
+test('43. Experimental Normalization Toggle recovers contrast on extremely faint patterns via measured mean density without mutating buffers', () => {
+  assert.equal(NORMALIZED_FLOOR_MEAN_RATIO, 0.65);
+  assert.equal(NORMALIZED_SATURATION_MEAN_RATIO, 6.0);
+  assert.ok(NORMALIZED_MIN_MEAN_DENSITY > 0);
+
+  const res = 64;
+  const field = new PatternMemoryField(res);
+  const rgbaFixed = new Uint8ClampedArray(res * res * 4);
+  const rgbaNorm = new Uint8ClampedArray(res * res * 4);
+
+  // Build an extremely faint nodal cross (peaks ~0.075, background ~0.002) completely below fixed floor 0.12
+  for (let y = 0; y < res; y++) {
+    for (let x = 0; x < res; x++) {
+      const onCross = Math.abs(x - 32) <= 1 || Math.abs(y - 32) <= 1;
+      field.memoryDensity[y * res + x] = onCross ? 0.075 : 0.002;
+    }
+  }
+  const snapshotBefore = new Float32Array(field.memoryDensity);
+
+  // 1) Fixed mapping (toggle OFF) renders zero visible pixels for this faint pattern
+  field.writeToRgba(rgbaFixed, false);
+  let fixedNonZero = 0;
+  for (let i = 0; i < res * res; i++) {
+    if (rgbaFixed[i * 4 + 3] > 0) fixedNonZero++;
+  }
+  assert.equal(fixedNonZero, 0, 'Fixed mapping must render 0 pixels when faint density < 0.12');
+
+  // 2) Normalized mapping (toggle ON) auto-scales from measured mean density and recovers nodal contrast
+  field.writeToRgba(rgbaNorm, true);
+  const measuredMean = field.getLastMeanDensity();
+  assert.ok(measuredMean > 0.005 && measuredMean < 0.02);
+
+  const centerAlpha = rgbaNorm[(32 * res + 32) * 4 + 3];
+  const cornerAlpha = rgbaNorm[(5 * res + 5) * 4 + 3];
+  assert.ok(centerAlpha >= 60, `Expected strong recovered center contrast, got alpha=${centerAlpha}`);
+  assert.equal(cornerAlpha, 0, 'Sparse low-density background (< 0.65 * mean) must stay transparent');
+
+  // memoryDensity buffer must remain bit-for-bit unchanged
+  for (let i = 0; i < field.memoryDensity.length; i++) {
+    assert.equal(field.memoryDensity[i], snapshotBefore[i]);
+  }
+
+  // 3) Empty / sub-epsilon residue stays strictly transparent when normalized
+  field.clear();
+  field.memoryDensity.fill(1e-8);
+  field.writeToRgba(rgbaNorm, true);
+  for (let i = 0; i < res * res; i++) {
+    assert.equal(rgbaNorm[i * 4 + 3], 0);
+  }
+  assert.equal(mapNormalizedDensityToAlpha(0.05, 0), 0);
 });
 
