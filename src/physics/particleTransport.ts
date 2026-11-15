@@ -30,6 +30,11 @@ export const DEFAULT_DIMENSIONAL_CONFIG: DimensionalTransportConfig = {
   subThresholdCreepFloor: 0.0,
 };
 
+export const REACTION_THRESHOLD_MIN_G = 0.0;
+export const REACTION_THRESHOLD_MAX_G = 8.0;
+export const REACTION_THRESHOLD_DEFAULT_G = 1.0;
+export const REACTION_THRESHOLD_STEP_G = 0.05;
+
 /**
  * Seeded pseudo-random number generator (Mulberry32)
  */
@@ -145,6 +150,11 @@ export class ParticleTransportSystem {
   setParticleCount(count: number): void {
     this.config.particleCount = count;
     this.initParticles();
+  }
+
+  setGammaC(gammaC: number): void {
+    if (!Number.isFinite(gammaC)) return;
+    this.config.gammaC = Math.max(REACTION_THRESHOLD_MIN_G, Math.min(20.0, gammaC));
   }
 
   private buildBalancedShuffledColors(count: number): ParticleColor[] {

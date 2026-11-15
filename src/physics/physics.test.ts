@@ -33,7 +33,14 @@ import {
   modeShape,
 } from './plate.ts';
 import { calculateAnalyticalHarmonicResponse, ModalBank } from './modalSolver.ts';
-import { ParticleTransportSystem, reflectCoordinate } from './particleTransport.ts';
+import {
+  ParticleTransportSystem,
+  REACTION_THRESHOLD_DEFAULT_G,
+  REACTION_THRESHOLD_MAX_G,
+  REACTION_THRESHOLD_MIN_G,
+  REACTION_THRESHOLD_STEP_G,
+  reflectCoordinate,
+} from './particleTransport.ts';
 import { SimulationClockAccumulator } from './simulationClock.ts';
 import { AudioEngine } from '../audio/audioEngine.ts';
 import {
@@ -3294,5 +3301,54 @@ test('39. PatternMemoryField preserves buffer identities, stays bounded/finite a
   assert.equal(mapDensityToAlpha(0), 0);
   assert.ok(mapDensityToAlpha(1.5) > mapDensityToAlpha(0.6));
   assert.equal(mapDensityToAlpha(100), MEMORY_MAX_ALPHA);
+});
+
+test('40. Reaction Threshold (gammaC) controls particle activation to vibration without resetting particle state', () => {
+  assert.equal(REACTION_THRESHOLD_MIN_G, 0);
+  assert.equal(REACTION_THRESHOLD_MAX_G, 8);
+  assert.equal(REACTION_THRESHOLD_DEFAULT_G, 1);
+  assert.equal(REACTION_THRESHOLD_STEP_G, 0.05);
+
+  const sideLength = 0.30;
+  const sys = new ParticleTransportSystem({ particleCount: 500, dRef: 2.0e-5, seed: 42 }, sideLength);
+  const initialArrayRef = sys.particles;
+  const g = sys.config.g;
+
+  // Moderate frequency excitation yielding 0.6g RMS everywhere in quadrant (below default 1.0g threshold)
+  const halfN = 9;
+  const moderateQuad = new Float64Array(halfN * halfN).fill(0.6 * g);
+  const beforePos = sys.particles.map((p) => ({ x: p.x, y: p.y }));
+
+  // 1) At default gammaC = 1.0g, 0.6g field must produce zero particle motion
+  sys.stepFromRmsGrid(0.016, moderateQuad, halfN, false);
+  for (let i = 0; i < sys.particles.length; i++) {
+    assert.equal(sys.particles[i].x, beforePos[i].x);
+    assert.equal(sys.particles[i].y, beforePos[i].y);
+  }
+
+  // 2) Lower threshold live to 0.25g -> keeps array reference intact and particles now react & move
+  sys.setGammaC(0.25);
+  assert.equal(sys.particles, initialArrayRef, 'setGammaC must never re-initialize particle array');
+  assert.equal(sys.config.gammaC, 0.25);
+  sys.stepFromRmsGrid(0.016, moderateQuad, halfN, false);
+
+  let movedCount = 0;
+  for (let i = 0; i < sys.particles.length; i++) {
+    if (sys.particles[i].x !== beforePos[i].x || sys.particles[i].y !== beforePos[i].y) {
+      movedCount++;
+    }
+  }
+  assert.ok(movedCount > 450, `Lowering threshold to 0.25g must activate particles at 0.6g, moved=${movedCount}`);
+
+  // 3) Raise threshold live above 0.6g (to 2.00g) -> particles halt again immediately
+  sys.setGammaC(2.0);
+  const frozenPos = sys.particles.map((p) => ({ x: p.x, y: p.y }));
+  sys.stepFromRmsGrid(0.016, moderateQuad, halfN, false);
+  for (let i = 0; i < sys.particles.length; i++) {
+    assert.equal(sys.particles[i].x, frozenPos[i].x);
+    assert.equal(sys.particles[i].y, frozenPos[i].y);
+    assert.equal(sys.particles[i].vx, 0);
+    assert.equal(sys.particles[i].vy, 0);
+  }
 });
 

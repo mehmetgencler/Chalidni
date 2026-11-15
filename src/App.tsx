@@ -18,7 +18,13 @@ import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Waves } from 'lucide-react';
 import { AudioEngine } from './audio/audioEngine.ts';
 import { ModalBank } from './physics/modalSolver.ts';
-import { ParticleTransportSystem } from './physics/particleTransport.ts';
+import {
+  ParticleTransportSystem,
+  REACTION_THRESHOLD_DEFAULT_G,
+  REACTION_THRESHOLD_MAX_G,
+  REACTION_THRESHOLD_MIN_G,
+  REACTION_THRESHOLD_STEP_G,
+} from './physics/particleTransport.ts';
 import { SimulationClockAccumulator } from './physics/simulationClock.ts';
 import { DEFAULT_ALUMINUM, DEFAULT_GEOMETRY } from './physics/plate.ts';
 import { PlateCanvas } from './components/PlateCanvas.tsx';
@@ -53,7 +59,7 @@ export function App() {
       {
         particleCount: 3000,
         dRef: 2.0e-6,
-        gammaC: 1.0,
+        gammaC: REACTION_THRESHOLD_DEFAULT_G,
         power: 2.0,
         g: 9.80665,
         dt: 0.016,
@@ -73,6 +79,10 @@ export function App() {
   const [patternMemoryResetToken, setPatternMemoryResetToken] = useState<number>(0);
   const isPatternMemoryPausedRef = useRef<boolean>(false);
   const memorySliderId = useId();
+
+  // Physical particle activation threshold (Gamma_c in units of g)
+  const [reactionThresholdG, setReactionThresholdG] = useState<number>(REACTION_THRESHOLD_DEFAULT_G);
+  const thresholdSliderId = useId();
 
   // Single authoritative sample-frame clock accumulator
   const simClock = useMemo(() => new SimulationClockAccumulator(), []);
@@ -130,6 +140,7 @@ export function App() {
         canvasEl.dataset.realWorklet = String(audioStats.hasRealAudioWorkletNode);
         canvasEl.dataset.sharedWorklet = String(audioStats.isToneConnected && audioStats.isFileDownmixConnected);
         canvasEl.dataset.audibleFile = String(audioStats.isFileAudibleToDestination);
+        canvasEl.dataset.gammaC = particleSystem.config.gammaC.toFixed(2);
       }
     });
 
@@ -222,39 +233,80 @@ export function App() {
             onFrequencyChange={handleFrequencyChange}
             onToneStateChange={handleToneStateChange}
           />
-          {/* Pattern Memory Fine-Control Slider (visual-only) */}
-          <div className="w-full max-w-xl mx-auto px-4 py-2.5 rounded-xl bg-slate-900/80 border border-slate-800 backdrop-blur-sm text-slate-200 flex flex-col gap-1">
-            <div className="flex items-center justify-between gap-3">
-              <label
-                htmlFor={memorySliderId}
-                className="text-xs font-medium text-slate-200 tracking-tight"
-              >
-                Desen Hafızası
-              </label>
-              <span
-                data-testid="pattern-memory-value"
-                className="text-xs font-mono font-semibold text-sky-400 tabular-nums"
-              >
-                {patternMemorySec.toFixed(2)} s
-              </span>
+          {/* Visual Pattern Memory & Particle Reaction Threshold Controls */}
+          <div className="w-full max-w-xl mx-auto px-4 py-2.5 rounded-xl bg-slate-900/80 border border-slate-800 backdrop-blur-sm text-slate-200 grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="flex flex-col gap-1">
+              <div className="flex items-center justify-between gap-3">
+                <label
+                  htmlFor={memorySliderId}
+                  className="text-xs font-medium text-slate-200 tracking-tight"
+                >
+                  Desen Hafızası
+                </label>
+                <span
+                  data-testid="pattern-memory-value"
+                  className="text-xs font-mono font-semibold text-sky-400 tabular-nums"
+                >
+                  {patternMemorySec.toFixed(2)} s
+                </span>
+              </div>
+              <input
+                id={memorySliderId}
+                type="range"
+                min={PATTERN_MEMORY_MIN_SEC}
+                max={PATTERN_MEMORY_MAX_SEC}
+                step={PATTERN_MEMORY_STEP_SEC}
+                value={patternMemorySec}
+                onChange={(e) => {
+                  const next = parseFloat(e.target.value);
+                  setPatternMemorySec(Number.isFinite(next) ? next : PATTERN_MEMORY_DEFAULT_SEC);
+                }}
+                data-testid="pattern-memory-slider"
+                className="w-full h-2 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-sky-400 focus:outline-none"
+              />
+              <p className="text-[11px] text-slate-400 leading-snug">
+                Eski desenlerin ne kadar süreyle görünür kalacağını ayarlar.
+              </p>
             </div>
-            <input
-              id={memorySliderId}
-              type="range"
-              min={PATTERN_MEMORY_MIN_SEC}
-              max={PATTERN_MEMORY_MAX_SEC}
-              step={PATTERN_MEMORY_STEP_SEC}
-              value={patternMemorySec}
-              onChange={(e) => {
-                const next = parseFloat(e.target.value);
-                setPatternMemorySec(Number.isFinite(next) ? next : PATTERN_MEMORY_DEFAULT_SEC);
-              }}
-              data-testid="pattern-memory-slider"
-              className="w-full h-2 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-sky-400 focus:outline-none"
-            />
-            <p className="text-[11px] text-slate-400 leading-snug">
-              Eski desenlerin ne kadar süreyle görünür kalacağını ayarlar.
-            </p>
+
+            <div className="flex flex-col gap-1">
+              <div className="flex items-center justify-between gap-3">
+                <label
+                  htmlFor={thresholdSliderId}
+                  className="text-xs font-medium text-slate-200 tracking-tight"
+                >
+                  Reaction Threshold
+                </label>
+                <span
+                  data-testid="reaction-threshold-value"
+                  className="text-xs font-mono font-semibold text-amber-400 tabular-nums"
+                >
+                  {reactionThresholdG.toFixed(2)} g
+                </span>
+              </div>
+              <input
+                id={thresholdSliderId}
+                type="range"
+                min={REACTION_THRESHOLD_MIN_G}
+                max={REACTION_THRESHOLD_MAX_G}
+                step={REACTION_THRESHOLD_STEP_G}
+                value={reactionThresholdG}
+                onChange={(e) => {
+                  const next = parseFloat(e.target.value);
+                  const safeG = Number.isFinite(next) ? next : REACTION_THRESHOLD_DEFAULT_G;
+                  setReactionThresholdG(safeG);
+                  particleSystem.setGammaC(safeG);
+                  if (canvasRef.current) {
+                    canvasRef.current.dataset.gammaC = particleSystem.config.gammaC.toFixed(2);
+                  }
+                }}
+                data-testid="reaction-threshold-slider"
+                className="w-full h-2 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-amber-400 focus:outline-none"
+              />
+              <p className="text-[11px] text-slate-400 leading-snug">
+                Minimum acceleration (g) required for particles to respond to frequencies.
+              </p>
+            </div>
           </div>
           <SilentVideoExport
             audioEngine={audioEngine}

@@ -151,10 +151,12 @@ test.describe('Stage 9 Real Browser AudioWorklet & Granular Simulation E2E', () 
     await expect(page.getByRole('button', { name: 'Sine Test Tone (20 Hz – 20 kHz)' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Audio File Playback' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Start Tone' })).toBeVisible();
-    await expect(page.locator('input[type="range"]')).toHaveCount(2);
+    await expect(page.locator('input[type="range"]')).toHaveCount(3);
     await expect(page.locator('button')).toHaveCount(3); // 2 tabs + Start Tone
     await expect(page.getByLabel('Desen Hafızası')).toBeVisible();
     await expect(page.getByTestId('pattern-memory-value')).toHaveText('1.50 s');
+    await expect(page.getByLabel('Reaction Threshold')).toBeVisible();
+    await expect(page.getByTestId('reaction-threshold-value')).toHaveText('1.00 g');
     await expect(
       page.getByText('Eski desenlerin ne kadar süreyle görünür kalacağını ayarlar.')
     ).toBeVisible();
@@ -350,6 +352,61 @@ test.describe('Stage 9 Real Browser AudioWorklet & Granular Simulation E2E', () 
     expect(dsRestored.patternMemoryActive).toBe('true');
     expect(Number(dsRestored.simFrames)).toBeGreaterThan(Number(dsZero.simFrames));
 
+    expect(consoleErrors).toEqual([]);
+  });
+
+  test('4. Reaction Threshold slider tunes frequency activation sensitivity live without interrupting simulation or audio', async ({
+    page,
+  }) => {
+    const consoleErrors: string[] = [];
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('pageerror', (err) => consoleErrors.push(String(err)));
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto('/');
+
+    const thresholdSlider = page.getByTestId('reaction-threshold-slider');
+    const thresholdReadout = page.getByTestId('reaction-threshold-value');
+    await expect(thresholdSlider).toHaveAttribute('min', '0');
+    await expect(thresholdSlider).toHaveAttribute('max', '8');
+    await expect(thresholdSlider).toHaveAttribute('step', '0.05');
+    await expect(thresholdReadout).toHaveText('1.00 g');
+
+    await page.getByRole('button', { name: 'Start Tone' }).click();
+    await page.waitForTimeout(700);
+
+    const dsDefault = await readCanvasDataset(page);
+    expect(dsDefault.gammaC).toBe('1.00');
+
+    // Lower threshold to 0.25 g mid-playback
+    await thresholdSlider.fill('0.25');
+    await thresholdSlider.dispatchEvent('change');
+    await page.waitForTimeout(200);
+    await expect(thresholdReadout).toHaveText('0.25 g');
+
+    const dsLow = await readCanvasDataset(page);
+    expect(dsLow.gammaC).toBe('0.25');
+    expect(Number(dsLow.simFrames)).toBeGreaterThan(Number(dsDefault.simFrames));
+    expect(Number(dsLow.particleSteps)).toBeGreaterThan(Number(dsDefault.particleSteps));
+    await expect(page.getByRole('button', { name: 'Stop Tone' })).toBeVisible();
+
+    // Raise threshold to 4.50 g mid-playback
+    await thresholdSlider.fill('4.5');
+    await thresholdSlider.dispatchEvent('change');
+    await page.waitForTimeout(200);
+    await expect(thresholdReadout).toHaveText('4.50 g');
+
+    const dsHigh = await readCanvasDataset(page);
+    expect(dsHigh.gammaC).toBe('4.50');
+    expect(Number(dsHigh.simFrames)).toBeGreaterThan(Number(dsLow.simFrames));
+    await expect(page.getByRole('button', { name: 'Stop Tone' })).toBeVisible();
+
+    const mobileOverflow = await page.evaluate(
+      () => document.documentElement.scrollWidth > window.innerWidth
+    );
+    expect(mobileOverflow).toBe(false);
     expect(consoleErrors).toEqual([]);
   });
 });
