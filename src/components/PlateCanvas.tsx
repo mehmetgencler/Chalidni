@@ -26,6 +26,7 @@ import {
   ModalLockPulseTracker,
   PatternMemoryField,
 } from './patternMemory.ts';
+import { ParticleChainSystem } from './particleChains.ts';
 
 export type HeatmapType = 'none' | 'diffusivity' | 'displacement' | 'nodal';
 
@@ -214,6 +215,7 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
   // Reusable visual pattern-memory buffers & offscreen halo/core ImageData targets (allocated once)
   const memoryFieldRef = useRef<PatternMemoryField | null>(null);
   const pulseTrackerRef = useRef<ModalLockPulseTracker | null>(null);
+  const chainSystemRef = useRef<ParticleChainSystem | null>(null);
   const appliedPulseRef = useRef<number>(0);
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const overlayValueRef = useRef<HTMLSpanElement | null>(null);
@@ -443,6 +445,7 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
         appliedResetTokenRef.current = resetTokenRef.current;
         memoryFieldRef.current?.clear();
         pulseTrackerRef.current?.reset();
+        chainSystemRef.current?.reset();
         appliedPulseRef.current = 0;
         lastOverlayFreqRef.current = -1;
         syncOverlayIndicator(0, null);
@@ -451,6 +454,7 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
       // 2.5 Visual-only two-scale density cloud (broad halo + dense core) rendered beneath live particles
       const halfLifeSec = halfLifeRef.current;
       const normalizeMemory = normalizeMemoryRef.current;
+      let currentPulseAmount = 0;
       canvas.dataset.patternMemorySec = halfLifeSec.toFixed(2);
       canvas.dataset.patternMemoryNormalized = String(normalizeMemory);
       if (halfLifeSec > 0) {
@@ -481,6 +485,7 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
         const normalizeChanged = appliedNormalizeRef.current !== normalizeMemory;
         appliedNormalizeRef.current = normalizeMemory;
         const pulseAmount = pulseTracker.update(modalInfoRef.current, dtSec, isPaused);
+        currentPulseAmount = pulseAmount;
         const pulseChanged = Math.abs(appliedPulseRef.current - pulseAmount) > 1e-4;
         appliedPulseRef.current = pulseAmount;
 
@@ -611,6 +616,22 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
         canvas.dataset.modalLockCount = '0';
         canvas.dataset.patternPulseAmount = '0.000';
       }
+
+      // 2.75 Visual-only sequential same-color hop ribbons connecting actively migrating particles
+      let chainSystem = chainSystemRef.current;
+      if (!chainSystem) {
+        chainSystem = new ParticleChainSystem();
+        chainSystemRef.current = chainSystem;
+      }
+      const activeChainCount = chainSystem.step(
+        activeParticles,
+        sideLength,
+        dtSec,
+        pausedRef.current,
+        currentPulseAmount
+      );
+      chainSystem.drawToRgbaFrame(frame, targetPx, dpr);
+      canvas.dataset.particleChainCount = String(activeChainCount);
 
       // 3. Composite granular powder particles directly onto frame buffer via pre-baked sprite pixel lists
       const scalePx = targetPx / sideLength;

@@ -4003,6 +4003,150 @@ test('47. Resonant frequency overlay visibility synchronizes with cloud transiti
   assert.deepEqual(formatResonantFrequency(12460), { value: '12.5', unit: 'kHz', text: '12.5 kHz' });
 });
 
+test('48. Sequential same-color particle chain generator spans moving neighbors only, preserves colors, freezes when paused, and renders cleanly', async () => {
+  const {
+    ParticleChainSystem,
+    evaluateChainSweepSpan,
+    CHAIN_MIN_HOPS,
+    CHAIN_MAX_HOPS,
+    CHAIN_DURATION_SEC,
+  } = await import('../components/particleChains.ts');
+
+  // 1) Sweep span monotonic head progression and trailing catch-up envelope
+  assert.deepEqual(evaluateChainSweepSpan(-0.01, 0.38, 4), { tailHop: 0, headHop: 0, envelopeAlpha: 0 });
+  assert.deepEqual(evaluateChainSweepSpan(0.38, 0.38, 4), { tailHop: 0, headHop: 0, envelopeAlpha: 0 });
+
+  const early = evaluateChainSweepSpan(0.04, 0.38, 4);
+  const mid = evaluateChainSweepSpan(0.16, 0.38, 4);
+  const late = evaluateChainSweepSpan(0.32, 0.38, 4);
+  assert.ok(early.headHop > early.tailHop && early.tailHop === 0);
+  assert.ok(mid.headHop > early.headHop && mid.tailHop > 0 && mid.envelopeAlpha > 0.9);
+  assert.ok(late.tailHop > mid.tailHop && late.envelopeAlpha < mid.envelopeAlpha && late.envelopeAlpha > 0);
+
+  // 2) Stationary particles emit zero chains
+  const L = 0.30;
+  const stationary: { x: number; y: number; vx: number; vy: number; active: boolean; color: 'green' | 'blue' | 'red' }[] = [];
+  for (let i = 0; i < 60; i++) {
+    stationary.push({
+      x: (0.2 + (i % 10) * 0.04) * L,
+      y: (0.2 + Math.floor(i / 10) * 0.04) * L,
+      vx: 0,
+      vy: 0,
+      active: true,
+      color: i % 3 === 0 ? 'green' : i % 3 === 1 ? 'blue' : 'red',
+    });
+  }
+  const sys = new ParticleChainSystem();
+  const dt = 1 / 60;
+  for (let f = 0; f < 10; f++) {
+    assert.equal(sys.step(stationary, L, dt, false, 0), 0);
+  }
+  assert.equal(sys.activeCount, 0);
+
+  // 3) Mixed-color migrating streams spawn strictly same-color 3..5 hop sequential chains
+  const moving = stationary.map((p) => ({ ...p }));
+  const prePositions = moving.map((p) => ({ x: p.x, y: p.y }));
+  for (let stepIdx = 0; stepIdx < 12; stepIdx++) {
+    for (let i = 0; i < moving.length; i++) {
+      // Shift every particle noticeably (0.002 m/frame -> ~0.4 plate-widths/sec > threshold)
+      moving[i].x += 0.002;
+      moving[i].y += 0.0012;
+    }
+    sys.step(moving, L, dt, false, 0.5);
+  }
+
+  assert.ok(sys.activeCount > 0, `Expected active same-color chains during migration, got ${sys.activeCount}`);
+  const activeChains = sys.getChains().filter((c) => c.active);
+  for (const chain of activeChains) {
+    assert.ok(
+      chain.hopCount >= CHAIN_MIN_HOPS && chain.hopCount <= CHAIN_MAX_HOPS,
+      `Chain hopCount ${chain.hopCount} outside [${CHAIN_MIN_HOPS}, ${CHAIN_MAX_HOPS}]`
+    );
+    const expectedColor = moving[chain.particleIndices[0]].color;
+    const expectedIdx = expectedColor === 'blue' ? 1 : expectedColor === 'red' ? 2 : 0;
+    assert.equal(chain.colorIdx, expectedIdx);
+    for (let v = 0; v <= chain.hopCount; v++) {
+      const pIdx = chain.particleIndices[v];
+      assert.equal(
+        moving[pIdx].color,
+        expectedColor,
+        `Chain mixed colors: expected ${expectedColor}, got ${moving[pIdx].color}`
+      );
+    }
+  }
+
+  // 4) drawToRgbaFrame paints visible pixels without mutating particle coordinates
+  const targetPx = 160;
+  const frame = new Uint8ClampedArray(targetPx * targetPx * 4);
+  for (let i = 0; i < targetPx * targetPx; i++) {
+    frame[i * 4 + 3] = 255;
+  }
+  sys.drawToRgbaFrame(frame, targetPx, 1);
+  let litPixels = 0;
+  for (let i = 0; i < targetPx * targetPx; i++) {
+    if (frame[i * 4] > 0 || frame[i * 4 + 1] > 0 || frame[i * 4 + 2] > 0) {
+      litPixels++;
+    }
+  }
+  assert.ok(litPixels > 10, `Expected non-zero rendered ribbon pixels, got ${litPixels}`);
+
+  // Confirm ParticleChainSystem never mutates particle coordinates directly
+  for (let i = 0; i < moving.length; i++) {
+    assert.ok(Math.abs(moving[i].x - (prePositions[i].x + 12 * 0.002)) < 1e-12);
+  }
+
+  // 5) Pause freezes active chain count and ages identically
+  const pausedCount = sys.activeCount;
+  const pausedAges = sys.getChains().map((c) => (c.active ? c.ageSec : -1));
+  for (let f = 0; f < 10; f++) {
+    assert.equal(sys.step(moving, L, dt, true, 0), pausedCount);
+  }
+  sys.getChains().forEach((c, idx) => {
+    assert.equal(c.active ? c.ageSec : -1, pausedAges[idx]);
+  });
+
+  // 6) Once particles come to rest, chains expire cleanly back to 0
+  const expireSteps = Math.ceil((CHAIN_DURATION_SEC * 2) / dt) + 10;
+  for (let f = 0; f < expireSteps; f++) {
+    sys.step(moving, L, dt, false, 0);
+  }
+  assert.equal(sys.activeCount, 0, 'All chains must fade out cleanly once motion ceases');
+
+  // 7) Teleporting/stretching a vertex beyond safe live hop span immediately retires that chain (no cross-plate rays)
+  const { CHAIN_MAX_LIVE_HOP_NORM } = await import('../components/particleChains.ts');
+  for (let s = 0; s < 6; s++) {
+    for (let i = 0; i < moving.length; i++) moving[i].x += 0.002;
+    sys.step(moving, L, dt, false, 0);
+  }
+  assert.ok(sys.activeCount > 0);
+  const firstActive = sys.getChains().find((c) => c.active)!;
+  const originalVertices = Array.from(firstActive.particleIndices.slice(0, firstActive.hopCount + 1));
+  const teleportedIdx = originalVertices[1];
+  moving[teleportedIdx].x = moving[teleportedIdx].x > 0.5 * L ? 0.01 * L : 0.99 * L;
+  sys.step(moving, L, dt, false, 0);
+  for (const ch of sys.getChains()) {
+    if (!ch.active) continue;
+    for (let v = 0; v < ch.hopCount; v++) {
+      const segLen = Math.hypot(ch.xs[v + 1] - ch.xs[v], ch.ys[v + 1] - ch.ys[v]);
+      assert.ok(
+        segLen <= CHAIN_MAX_LIVE_HOP_NORM + 1e-6,
+        `Active segment ${segLen} exceeded CHAIN_MAX_LIVE_HOP_NORM=${CHAIN_MAX_LIVE_HOP_NORM}`
+      );
+      assert.notEqual(ch.particleIndices[v], teleportedIdx, 'Teleported particle must not appear in newly active chain');
+    }
+    assert.notEqual(
+      ch.particleIndices[ch.hopCount],
+      teleportedIdx,
+      'Teleported particle must not appear at end of newly active chain'
+    );
+  }
+
+  // 8) reset() clears active chains immediately
+  sys.reset();
+  assert.equal(sys.activeCount, 0);
+});
+
+
 
 
 
