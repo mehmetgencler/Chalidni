@@ -12,6 +12,7 @@
  */
 
 import { Particle } from '../physics/types.ts';
+import type { DominantModalInfo } from '../physics/modalSolver.ts';
 
 export const PATTERN_MEMORY_MIN_SEC = 0.0;
 export const PATTERN_MEMORY_MAX_SEC = 4.0;
@@ -41,6 +42,19 @@ export const CORE_DENSITY_SATURATION = 2.6;
 export const CORE_MAX_ALPHA = 175;
 export const CORE_CURVE_GAMMA = 0.9;
 
+// Brief, low-intensity modal-frequency-lock pulse parameters
+export const MODAL_LOCK_MIN_RMS = 5.0; // m/s^2 (~0.5 g resonant dominance floor)
+export const MODAL_LOCK_MIN_DOMINANCE = 0.40; // >=40% of total modal variance in peak frequency cluster
+export const MODAL_LOCK_CONFIRM_SEC = 0.09; // Dwell time to confirm a resonant frequency lock
+export const MODAL_LOCK_RELEASE_SEC = 0.65; // Idle/unfocused dwell before releasing prior lock
+export const MODAL_LOCK_FREQ_TOL_REL = 0.015;
+export const MODAL_LOCK_FREQ_TOL_ABS_HZ = 1.5;
+export const MODAL_LOCK_PULSE_DURATION_SEC = 0.55;
+export const MODAL_LOCK_PULSE_PEAK_SEC = 0.09;
+export const MODAL_LOCK_PULSE_HALO_ALPHA_BOOST = 0.24;
+export const MODAL_LOCK_PULSE_CORE_ALPHA_BOOST = 0.20;
+export const MODAL_LOCK_PULSE_TINT_BOOST = 0.45;
+
 // Experimental mean-density auto-scaling parameters (used only when Normalization Toggle is enabled)
 export const NORMALIZED_FLOOR_MEAN_RATIO = 0.65;
 export const NORMALIZED_SATURATION_MEAN_RATIO = 6.0;
@@ -59,10 +73,16 @@ const MEMORY_TINT_B = 246;
 const HALO_TINT_R = 196;
 const HALO_TINT_G = 218;
 const HALO_TINT_B = 244;
+const HALO_PULSE_TINT_R = 226;
+const HALO_PULSE_TINT_G = 238;
+const HALO_PULSE_TINT_B = 254;
 
 const CORE_TINT_R = 228;
 const CORE_TINT_G = 240;
 const CORE_TINT_B = 252;
+const CORE_PULSE_TINT_R = 250;
+const CORE_PULSE_TINT_G = 253;
+const CORE_PULSE_TINT_B = 255;
 
 /**
  * Computes exact half-life release decay factor for a frame interval deltaTimeSec.
@@ -192,6 +212,169 @@ export function mapNormalizedCoreDensityToAlpha(density: number, meanDensity: nu
   );
 }
 
+/**
+ * Evaluates a smooth C1 bell-shaped envelope [0, 1] for the brief modal-lock pulse:
+ * quick soft rise to peak around MODAL_LOCK_PULSE_PEAK_SEC, followed by cosine-squared falloff.
+ */
+export function evaluateModalLockPulseCurve(
+  elapsedSec: number,
+  durationSec: number = MODAL_LOCK_PULSE_DURATION_SEC,
+  peakSec: number = MODAL_LOCK_PULSE_PEAK_SEC
+): number {
+  if (!Number.isFinite(elapsedSec) || elapsedSec < 0 || elapsedSec >= durationSec || durationSec <= 0) {
+    return 0;
+  }
+  const clampedPeak = Math.max(1e-4, Math.min(durationSec * 0.5, peakSec));
+  if (elapsedSec < clampedPeak) {
+    const u = elapsedSec / clampedPeak;
+    return u * u * (3 - 2 * u);
+  }
+  const decaySpan = durationSec - clampedPeak;
+  if (decaySpan <= 0) return 0;
+  const u = (elapsedSec - clampedPeak) / decaySpan;
+  const c = Math.cos(u * Math.PI * 0.5);
+  return c * c;
+}
+
+/**
+ * Computes synchronized overlay indicator opacity & micro-slide offset from the density-cloud pulse envelope [0, 1].
+ */
+export function computeOverlayPulseVisibility(pulseAmount: number): {
+  opacity: number;
+  translateYpx: number;
+} {
+  if (!Number.isFinite(pulseAmount) || pulseAmount <= 0) {
+    return { opacity: 0, translateYpx: -3 };
+  }
+  const clamped = pulseAmount >= 1 ? 1 : pulseAmount;
+  const envelope = Math.pow(clamped, 0.45);
+  return {
+    opacity: Math.min(0.96, envelope * 0.96),
+    translateYpx: envelope >= 1 ? 0 : (1 - envelope) * -3,
+  };
+}
+
+/**
+ * Formats detected resonant frequency into uniform tabular value & unit strings.
+ */
+export function formatResonantFrequency(freqHz: number): {
+  value: string;
+  unit: 'Hz' | 'kHz';
+  text: string;
+} {
+  if (!Number.isFinite(freqHz) || freqHz <= 0) {
+    return { value: '0.0', unit: 'Hz', text: '0.0 Hz' };
+  }
+  if (freqHz < 1000) {
+    const value = freqHz.toFixed(1);
+    return { value, unit: 'Hz', text: `${value} Hz` };
+  }
+  if (freqHz < 10000) {
+    const value = (freqHz / 1000).toFixed(2);
+    return { value, unit: 'kHz', text: `${value} kHz` };
+  }
+  const value = (freqHz / 1000).toFixed(1);
+  return { value, unit: 'kHz', text: `${value} kHz` };
+}
+
+function sameModalFrequencyCluster(aHz: number, bHz: number): boolean {
+  const tol = Math.max(MODAL_LOCK_FREQ_TOL_ABS_HZ, Math.max(aHz, bHz) * MODAL_LOCK_FREQ_TOL_REL);
+  return Math.abs(aHz - bHz) <= tol;
+}
+
+/**
+ * Tracks live dominant modal frequency transitions and emits a short-lived
+ * brightness-pulse envelope whenever excitation locks onto a new modal frequency.
+ */
+export class ModalLockPulseTracker {
+  private lockedFreqHz: number | null = null;
+  private candidateFreqHz: number | null = null;
+  private candidateHoldSec = 0;
+  private unlockedDurationSec = 0;
+  private pulseElapsedSec = -1;
+  private totalLocks = 0;
+
+  get lockedFrequencyHz(): number | null {
+    return this.lockedFreqHz;
+  }
+
+  get lockCount(): number {
+    return this.totalLocks;
+  }
+
+  getPulseAmount(): number {
+    if (this.pulseElapsedSec < 0) return 0;
+    return evaluateModalLockPulseCurve(this.pulseElapsedSec);
+  }
+
+  reset(): void {
+    this.lockedFreqHz = null;
+    this.candidateFreqHz = null;
+    this.candidateHoldSec = 0;
+    this.unlockedDurationSec = 0;
+    this.pulseElapsedSec = -1;
+    this.totalLocks = 0;
+  }
+
+  update(
+    modalInfo: DominantModalInfo | null | undefined,
+    deltaTimeSec: number,
+    isPaused: boolean = false
+  ): number {
+    if (isPaused) {
+      return this.getPulseAmount();
+    }
+
+    const dt = Number.isFinite(deltaTimeSec) && deltaTimeSec > 0 ? Math.min(0.1, deltaTimeSec) : 0;
+
+    if (this.pulseElapsedSec >= 0) {
+      this.pulseElapsedSec += dt;
+      if (this.pulseElapsedSec >= MODAL_LOCK_PULSE_DURATION_SEC) {
+        this.pulseElapsedSec = -1;
+      }
+    }
+
+    const isQualifying =
+      Boolean(modalInfo) &&
+      !modalInfo!.isSilent &&
+      modalInfo!.hasEnergy &&
+      Number.isFinite(modalInfo!.frequency) &&
+      modalInfo!.frequency > 0 &&
+      modalInfo!.peakRms >= MODAL_LOCK_MIN_RMS &&
+      modalInfo!.dominanceRatio >= MODAL_LOCK_MIN_DOMINANCE;
+
+    if (isQualifying) {
+      const freq = modalInfo!.frequency;
+      this.unlockedDurationSec = 0;
+
+      if (this.candidateFreqHz !== null && sameModalFrequencyCluster(this.candidateFreqHz, freq)) {
+        this.candidateHoldSec += dt;
+      } else {
+        this.candidateFreqHz = freq;
+        this.candidateHoldSec = dt;
+      }
+
+      const alreadyLocked =
+        this.lockedFreqHz !== null && sameModalFrequencyCluster(this.lockedFreqHz, this.candidateFreqHz);
+
+      if (!alreadyLocked && this.candidateHoldSec >= MODAL_LOCK_CONFIRM_SEC) {
+        this.lockedFreqHz = this.candidateFreqHz;
+        this.pulseElapsedSec = 0;
+        this.totalLocks += 1;
+      }
+    } else {
+      this.candidateFreqHz = null;
+      this.candidateHoldSec = 0;
+      this.unlockedDurationSec += dt;
+      if (this.lockedFreqHz !== null && this.unlockedDurationSec >= MODAL_LOCK_RELEASE_SEC) {
+        this.lockedFreqHz = null;
+      }
+    }
+
+    return this.getPulseAmount();
+  }
+}
+
 export class PatternMemoryField {
   readonly gridRes: number;
   readonly currentDensity: Float32Array;
@@ -201,6 +384,7 @@ export class PatternMemoryField {
   private readonly haloWorkBuffer: Float32Array;
   private hasAccumulated = false;
   private lastMeanDensity = 0;
+  private maxMemoryDensity = 0;
 
   constructor(gridRes: number = DEFAULT_MEMORY_GRID_RES) {
     this.gridRes = Math.max(16, Math.floor(gridRes));
@@ -224,6 +408,7 @@ export class PatternMemoryField {
     this.haloWorkBuffer.fill(0);
     this.hasAccumulated = false;
     this.lastMeanDensity = 0;
+    this.maxMemoryDensity = 0;
   }
 
   /**
@@ -321,6 +506,7 @@ export class PatternMemoryField {
     const len = mem.length;
 
     let anyNonZero = false;
+    let maxVal = 0;
     for (let i = 0; i < len; i++) {
       const c = cur[i];
       const prev = mem[i];
@@ -335,10 +521,14 @@ export class PatternMemoryField {
             ? MEMORY_MAX_CELL_DENSITY
             : nextRaw;
       mem[i] = next;
-      if (next > 0) anyNonZero = true;
+      if (next > 0) {
+        anyNonZero = true;
+        if (next > maxVal) maxVal = next;
+      }
     }
 
     this.hasAccumulated = anyNonZero;
+    this.maxMemoryDensity = maxVal;
     return anyNonZero;
   }
 
@@ -564,16 +754,31 @@ export class PatternMemoryField {
    * Renders TWO spatial scales from the exact same unchanged memoryDensity buffer:
    * - Layer A (haloRgba): broad outer aura obtained via repeated 5x5 separable Gaussian passes.
    * - Layer B (coreRgba): localized dense core using a single 5x5 separable Gaussian pass.
+   * Optional pulseAmount in [0, 1] applies a brief, low-intensity mineral brightness & opacity
+   * increase strictly to existing cloud regions while keeping empty areas transparent.
    * Performs zero heap allocations and never mutates memoryDensity.
    */
   writeDualLayersToRgba(
     haloRgba: Uint8ClampedArray,
     coreRgba: Uint8ClampedArray,
-    normalizeContrast: boolean = false
+    normalizeContrast: boolean = false,
+    pulseAmount: number = 0
   ): void {
     const mem = this.memoryDensity;
     const len = mem.length;
     if (haloRgba.length < len * 4 || coreRgba.length < len * 4) return;
+
+    const pulse = Number.isFinite(pulseAmount) ? Math.max(0, Math.min(1, pulseAmount)) : 0;
+    const hasPulse = pulse > 0;
+    const tintMix = pulse * MODAL_LOCK_PULSE_TINT_BOOST;
+    const coreR = hasPulse ? Math.round(CORE_TINT_R + tintMix * (CORE_PULSE_TINT_R - CORE_TINT_R)) : CORE_TINT_R;
+    const coreG = hasPulse ? Math.round(CORE_TINT_G + tintMix * (CORE_PULSE_TINT_G - CORE_TINT_G)) : CORE_TINT_G;
+    const coreB = hasPulse ? Math.round(CORE_TINT_B + tintMix * (CORE_PULSE_TINT_B - CORE_TINT_B)) : CORE_TINT_B;
+    const haloR = hasPulse ? Math.round(HALO_TINT_R + tintMix * (HALO_PULSE_TINT_R - HALO_TINT_R)) : HALO_TINT_R;
+    const haloG = hasPulse ? Math.round(HALO_TINT_G + tintMix * (HALO_PULSE_TINT_G - HALO_TINT_G)) : HALO_TINT_G;
+    const haloB = hasPulse ? Math.round(HALO_TINT_B + tintMix * (HALO_PULSE_TINT_B - HALO_TINT_B)) : HALO_TINT_B;
+    const coreAlphaScale = 1 + pulse * MODAL_LOCK_PULSE_CORE_ALPHA_BOOST;
+    const haloAlphaScale = 1 + pulse * MODAL_LOCK_PULSE_HALO_ALPHA_BOOST;
 
     const coreBuf = this.coreWorkBuffer;
     const haloBuf = this.haloWorkBuffer;
@@ -584,20 +789,25 @@ export class PatternMemoryField {
 
     // Rasterize Layer B (Dense Core) immediately before reusing coreBuf for halo widening
     for (let i = 0; i < len; i++) {
-      const alpha = normalizeContrast
+      const baseAlpha = normalizeContrast
         ? mapNormalizedCoreDensityToAlpha(coreBuf[i], meanDensity)
         : mapCoreDensityToAlpha(coreBuf[i]);
       const p = i * 4;
-      if (alpha <= 0) {
+      if (baseAlpha <= 0) {
         coreRgba[p] = 0;
         coreRgba[p + 1] = 0;
         coreRgba[p + 2] = 0;
         coreRgba[p + 3] = 0;
       } else {
-        coreRgba[p] = CORE_TINT_R;
-        coreRgba[p + 1] = CORE_TINT_G;
-        coreRgba[p + 2] = CORE_TINT_B;
-        coreRgba[p + 3] = alpha;
+        let outAlpha = baseAlpha;
+        if (hasPulse) {
+          outAlpha = Math.round(baseAlpha * coreAlphaScale);
+          if (outAlpha > 255) outAlpha = 255;
+        }
+        coreRgba[p] = coreR;
+        coreRgba[p + 1] = coreG;
+        coreRgba[p + 2] = coreB;
+        coreRgba[p + 3] = outAlpha;
       }
     }
 
@@ -618,20 +828,25 @@ export class PatternMemoryField {
 
     // Rasterize Layer A (Broad Soft Halo)
     for (let i = 0; i < len; i++) {
-      const alpha = normalizeContrast
+      const baseAlpha = normalizeContrast
         ? mapNormalizedHaloDensityToAlpha(finalHalo[i], haloMean)
         : mapHaloDensityToAlpha(finalHalo[i]);
       const p = i * 4;
-      if (alpha <= 0) {
+      if (baseAlpha <= 0) {
         haloRgba[p] = 0;
         haloRgba[p + 1] = 0;
         haloRgba[p + 2] = 0;
         haloRgba[p + 3] = 0;
       } else {
-        haloRgba[p] = HALO_TINT_R;
-        haloRgba[p + 1] = HALO_TINT_G;
-        haloRgba[p + 2] = HALO_TINT_B;
-        haloRgba[p + 3] = alpha;
+        let outAlpha = baseAlpha;
+        if (hasPulse) {
+          outAlpha = Math.round(baseAlpha * haloAlphaScale);
+          if (outAlpha > 255) outAlpha = 255;
+        }
+        haloRgba[p] = haloR;
+        haloRgba[p + 1] = haloG;
+        haloRgba[p + 2] = haloB;
+        haloRgba[p + 3] = outAlpha;
       }
     }
   }
@@ -648,6 +863,10 @@ export class PatternMemoryField {
 
   getLastMeanDensity(): number {
     return this.lastMeanDensity;
+  }
+
+  getLastMaxDensity(): number {
+    return this.maxMemoryDensity;
   }
 
   getMaxMemoryDensity(): number {

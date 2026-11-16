@@ -17,7 +17,7 @@
 import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Waves } from 'lucide-react';
 import { AudioEngine } from './audio/audioEngine.ts';
-import { ModalBank } from './physics/modalSolver.ts';
+import { DominantModalInfo, ModalBank } from './physics/modalSolver.ts';
 import {
   ParticleTransportSystem,
   REACTION_THRESHOLD_DEFAULT_G,
@@ -79,6 +79,13 @@ export function App() {
   const [normalizePatternMemory, setNormalizePatternMemory] = useState<boolean>(false);
   const [patternMemoryResetToken, setPatternMemoryResetToken] = useState<number>(0);
   const isPatternMemoryPausedRef = useRef<boolean>(false);
+  const dominantModalInfoRef = useRef<DominantModalInfo>({
+    frequency: 0,
+    peakRms: 0,
+    dominanceRatio: 0,
+    isSilent: true,
+    hasEnergy: false,
+  });
   const memorySliderId = useId();
   const normalizeToggleId = useId();
 
@@ -104,6 +111,7 @@ export function App() {
     const unsubscribe = audioEngine.onSnapshot((snapshot) => {
       // Apply modal displacements, velocities, accelerations, and covariance for both tone and file
       modalBank.applySnapshot(snapshot);
+      modalBank.updateDominantModalInfo(dominantModalInfoRef.current, snapshot.isSilent);
 
       // Advance particle transport strictly once per elapsed sample-frame interval
       simClock.advanceFromSnapshot(snapshot, DT_PARTICLE, MAX_SUBSTEPS_PER_SNAPSHOT, (dt) => {
@@ -189,6 +197,11 @@ export function App() {
     particleSystem.initParticles();
     liveParticlesRef.current = particleSystem.particles;
     isPatternMemoryPausedRef.current = false;
+    dominantModalInfoRef.current.frequency = 0;
+    dominantModalInfoRef.current.peakRms = 0;
+    dominantModalInfoRef.current.dominanceRatio = 0;
+    dominantModalInfoRef.current.isSilent = true;
+    dominantModalInfoRef.current.hasEnergy = false;
     setPatternMemoryResetToken((token) => token + 1);
   };
 
@@ -226,6 +239,7 @@ export function App() {
             patternMemoryResetToken={patternMemoryResetToken}
             isPatternMemoryPausedRef={isPatternMemoryPausedRef}
             normalizePatternMemory={normalizePatternMemory}
+            dominantModalInfoRef={dominantModalInfoRef}
           />
         </section>
 

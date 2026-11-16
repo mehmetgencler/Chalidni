@@ -32,7 +32,7 @@ import {
   getActiveCenterCoupledModes,
   modeShape,
 } from './plate.ts';
-import { calculateAnalyticalHarmonicResponse, ModalBank } from './modalSolver.ts';
+import { calculateAnalyticalHarmonicResponse, DominantModalInfo, ModalBank } from './modalSolver.ts';
 import {
   ParticleTransportSystem,
   REACTION_THRESHOLD_DEFAULT_G,
@@ -66,7 +66,10 @@ import { computeParticleRenderParams } from '../components/plateVisuals.ts';
 import {
   computeAttackBlend,
   computeHalfLifeDecay,
+  computeOverlayPulseVisibility,
   CORE_MAX_ALPHA,
+  evaluateModalLockPulseCurve,
+  formatResonantFrequency,
   HALO_MAX_ALPHA,
   mapCoreDensityToAlpha,
   mapDensityToAlpha,
@@ -76,6 +79,13 @@ import {
   MEMORY_DENSITY_SATURATION,
   MEMORY_MAX_ALPHA,
   MEMORY_MAX_CELL_DENSITY,
+  MODAL_LOCK_CONFIRM_SEC,
+  MODAL_LOCK_MIN_DOMINANCE,
+  MODAL_LOCK_MIN_RMS,
+  MODAL_LOCK_PULSE_DURATION_SEC,
+  MODAL_LOCK_PULSE_PEAK_SEC,
+  MODAL_LOCK_RELEASE_SEC,
+  ModalLockPulseTracker,
   NORMALIZED_FLOOR_MEAN_RATIO,
   NORMALIZED_MIN_MEAN_DENSITY,
   NORMALIZED_SATURATION_MEAN_RATIO,
@@ -3821,6 +3831,179 @@ test('45. Two-scale PatternMemoryField.writeDualLayersToRgba() produces broad ou
   assert.equal(mapHaloDensityToAlpha(0), 0);
   assert.equal(mapCoreDensityToAlpha(0), 0);
 });
+
+test('46. Modal-lock detection triggers a brief, low-intensity brightness pulse on new resonant frequency transitions only', () => {
+  // 1) Smooth C1 bell curve verification
+  assert.equal(evaluateModalLockPulseCurve(-0.01), 0);
+  assert.equal(evaluateModalLockPulseCurve(0), 0);
+  const midAttack = evaluateModalLockPulseCurve(MODAL_LOCK_PULSE_PEAK_SEC * 0.5);
+  const atPeak = evaluateModalLockPulseCurve(MODAL_LOCK_PULSE_PEAK_SEC);
+  const midDecay = evaluateModalLockPulseCurve(
+    (MODAL_LOCK_PULSE_PEAK_SEC + MODAL_LOCK_PULSE_DURATION_SEC) * 0.5
+  );
+  assert.ok(midAttack > 0.45 && midAttack < 0.55);
+  assert.ok(Math.abs(atPeak - 1.0) < 1e-9);
+  assert.ok(midDecay > 0.45 && midDecay < 0.55);
+  assert.equal(evaluateModalLockPulseCurve(MODAL_LOCK_PULSE_DURATION_SEC), 0);
+
+  // 2) ModalBank.updateDominantModalInfo merges degenerate eigenmodes cleanly
+  const mb = new ModalBank(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY, 0.01);
+  const info: DominantModalInfo = {
+    frequency: 0,
+    peakRms: 0,
+    dominanceRatio: 0,
+    isSilent: true,
+    hasEnergy: false,
+  };
+  const { processor } = createProductionWorklet(48000);
+  processor.handleMessage({ type: 'CONFIGURE_MODES', modes: mb.getWorkletModeConfig() });
+
+  feedWorkletSignal(processor, 0.25, (t) => 0.4 * Math.sin(2 * Math.PI * 269.815 * t), 48000);
+  mb.applySnapshot(processor.buildSnapshot());
+  mb.updateDominantModalInfo(info, false);
+  assert.equal(info.hasEnergy, true);
+  assert.ok(Math.abs(info.frequency - 269.815) < 0.5, `Expected ~269.8 Hz, got ${info.frequency}`);
+  assert.ok(info.peakRms >= MODAL_LOCK_MIN_RMS);
+  assert.ok(info.dominanceRatio >= 0.85, `Expected combined degenerate dominance >= 0.85, got ${info.dominanceRatio}`);
+
+  // 3) ModalLockPulseTracker confirms sustained lock, ignores brief glints, holds steady, then re-pulses on new mode
+  const tracker = new ModalLockPulseTracker();
+  const dt = 1 / 60;
+
+  // Brief 2-frame glitch (< MODAL_LOCK_CONFIRM_SEC) must NOT lock
+  for (let i = 0; i < 2; i++) {
+    const p = tracker.update(
+      { frequency: 269.82, peakRms: 80, dominanceRatio: 0.9, isSilent: false, hasEnergy: true },
+      dt,
+      false
+    );
+    assert.equal(p, 0);
+  }
+  assert.equal(tracker.lockCount, 0);
+
+  // Drop back to unfocused/low dominance resets candidate accumulation
+  tracker.update(
+    { frequency: 269.82, peakRms: 80, dominanceRatio: MODAL_LOCK_MIN_DOMINANCE * 0.5, isSilent: false, hasEnergy: true },
+    dt,
+    false
+  );
+
+  // Sustained frames at 269.82 Hz lock once total hold >= MODAL_LOCK_CONFIRM_SEC
+  const confirmSteps = Math.ceil(MODAL_LOCK_CONFIRM_SEC / dt) + 1;
+  let pulseAtLock = 0;
+  for (let i = 0; i < confirmSteps; i++) {
+    pulseAtLock = tracker.update(info, dt, false);
+  }
+  assert.equal(tracker.lockCount, 1);
+  assert.ok(Math.abs((tracker.lockedFrequencyHz ?? 0) - 269.815) < 0.5);
+  assert.ok(pulseAtLock >= 0 && tracker.getPulseAmount() >= 0);
+
+  // Advance to pulse peak and back past pulse duration -> settles cleanly to 0 without re-triggering
+  let maxObservedPulse = 0;
+  for (let i = 0; i < 45; i++) {
+    const p = tracker.update(info, dt, false);
+    if (p > maxObservedPulse) maxObservedPulse = p;
+  }
+  assert.ok(maxObservedPulse > 0.9, `Expected pulse peak near 1.0, got ${maxObservedPulse}`);
+  assert.equal(tracker.lockCount, 1, 'Holding steady at 269.82 Hz must not re-trigger locks');
+  assert.equal(tracker.getPulseAmount(), 0, 'Pulse must decay back to 0 cleanly');
+
+  // Switch excitation to a new resonance (485.67 Hz) -> locks new frequency and emits second pulse
+  const info2: DominantModalInfo = {
+    frequency: 485.67,
+    peakRms: 120,
+    dominanceRatio: 0.92,
+    isSilent: false,
+    hasEnergy: true,
+  };
+  for (let i = 0; i < confirmSteps; i++) {
+    tracker.update(info2, dt, false);
+  }
+  assert.equal(tracker.lockCount, 2);
+  assert.ok(Math.abs((tracker.lockedFrequencyHz ?? 0) - 485.67) < 0.5);
+
+  // Pause freezes active pulse without decaying it
+  tracker.update(info2, 0.09, false);
+  const pausedPulse = tracker.getPulseAmount();
+  assert.ok(pausedPulse > 0.8);
+  for (let i = 0; i < 20; i++) {
+    assert.equal(tracker.update(info2, dt, true), pausedPulse);
+  }
+
+  // Silence beyond MODAL_LOCK_RELEASE_SEC clears locked frequency so returning later triggers cleanly
+  const releaseSteps = Math.ceil((MODAL_LOCK_RELEASE_SEC + 0.1) / dt);
+  for (let i = 0; i < releaseSteps; i++) {
+    tracker.update({ frequency: 0, peakRms: 0, dominanceRatio: 0, isSilent: true, hasEnergy: false }, dt, false);
+  }
+  assert.equal(tracker.lockedFrequencyHz, null);
+  assert.equal(tracker.getPulseAmount(), 0);
+
+  // 4) Low-intensity pulse gently brightens existing density cloud without leaking haze onto empty cells
+  const res = 64;
+  const field = new PatternMemoryField(res);
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      field.memoryDensity[(32 + dy) * res + (32 + dx)] = 1.6;
+    }
+  }
+  const snapshotBefore = new Float32Array(field.memoryDensity);
+  const baseHalo = new Uint8ClampedArray(res * res * 4);
+  const baseCore = new Uint8ClampedArray(res * res * 4);
+  const pulseHalo = new Uint8ClampedArray(res * res * 4);
+  const pulseCore = new Uint8ClampedArray(res * res * 4);
+
+  field.writeDualLayersToRgba(baseHalo, baseCore, false, 0);
+  field.writeDualLayersToRgba(pulseHalo, pulseCore, false, 1);
+
+  const cIdx = (32 * res + 32) * 4;
+  const emptyIdx = (4 * res + 4) * 4;
+  // Core & halo increase alpha subtly without blowing out (< 255) and lift pale mineral RGB slightly
+  assert.ok(
+    pulseCore[cIdx + 3] > baseCore[cIdx + 3] && pulseCore[cIdx + 3] < 230,
+    `Expected low-intensity core pulse boost, base=${baseCore[cIdx + 3]} pulse=${pulseCore[cIdx + 3]}`
+  );
+  assert.ok(
+    pulseHalo[cIdx + 3] > baseHalo[cIdx + 3] && pulseHalo[cIdx + 3] < 160,
+    `Expected low-intensity halo pulse boost, base=${baseHalo[cIdx + 3]} pulse=${pulseHalo[cIdx + 3]}`
+  );
+  assert.ok(pulseCore[cIdx] >= baseCore[cIdx] && pulseHalo[cIdx] > baseHalo[cIdx]);
+  // Empty background remains strictly transparent during pulse
+  assert.equal(pulseCore[emptyIdx + 3], 0);
+  assert.equal(pulseHalo[emptyIdx + 3], 0);
+  // memoryDensity buffer never mutated
+  for (let i = 0; i < field.memoryDensity.length; i++) {
+    assert.equal(field.memoryDensity[i], snapshotBefore[i]);
+  }
+});
+
+test('47. Resonant frequency overlay visibility synchronizes with cloud transition pulse and formats Hz/kHz uniformly', () => {
+  // 1) Synchronized overlay visibility bounds
+  const hidden = computeOverlayPulseVisibility(0);
+  assert.equal(hidden.opacity, 0);
+  assert.equal(hidden.translateYpx, -3);
+
+  const rising = computeOverlayPulseVisibility(0.5);
+  assert.ok(rising.opacity > 0.65 && rising.opacity < 0.85);
+  assert.ok(rising.translateYpx < 0 && rising.translateYpx > -3);
+
+  const peak = computeOverlayPulseVisibility(1);
+  assert.ok(Math.abs(peak.opacity - 0.96) < 1e-6);
+  assert.equal(peak.translateYpx, 0);
+
+  // Handles invalid / negative inputs safely
+  assert.equal(computeOverlayPulseVisibility(-0.5).opacity, 0);
+  assert.equal(computeOverlayPulseVisibility(Number.NaN).opacity, 0);
+
+  // 2) Uniform Hz / kHz tabular formatting
+  assert.deepEqual(formatResonantFrequency(0), { value: '0.0', unit: 'Hz', text: '0.0 Hz' });
+  assert.deepEqual(formatResonantFrequency(53.963), { value: '54.0', unit: 'Hz', text: '54.0 Hz' });
+  assert.deepEqual(formatResonantFrequency(269.815), { value: '269.8', unit: 'Hz', text: '269.8 Hz' });
+  assert.deepEqual(formatResonantFrequency(485.67), { value: '485.7', unit: 'Hz', text: '485.7 Hz' });
+  assert.deepEqual(formatResonantFrequency(1349.08), { value: '1.35', unit: 'kHz', text: '1.35 kHz' });
+  assert.deepEqual(formatResonantFrequency(12460), { value: '12.5', unit: 'kHz', text: '12.5 kHz' });
+});
+
+
 
 
 

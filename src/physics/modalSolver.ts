@@ -25,6 +25,14 @@ export interface AnalyticalHarmonicResponse {
   resonanceFrequency: number; // Hz
 }
 
+export interface DominantModalInfo {
+  frequency: number;      // Hz of strongest resonant frequency cluster
+  peakRms: number;        // Combined RMS acceleration (m/s^2) of degenerate modes at frequency
+  dominanceRatio: number; // Share [0, 1] of total modal variance held by this cluster
+  isSilent: boolean;
+  hasEnergy: boolean;
+}
+
 /**
  * Analytical steady-state response for harmonic excitation Q(t) = Q0 * cos(Omega * t):
  * |q| = Q0 / [M * sqrt((omega^2 - Omega^2)^2 + (2 * zeta * omega * Omega)^2)]
@@ -505,6 +513,64 @@ export class ModalBank {
       }
     }
     return Math.sqrt(Math.max(0, maxVar));
+  }
+
+  /**
+   * Populates target with the strongest modal frequency cluster from active diagonal variance,
+   * summing degenerate eigenmodes sharing virtually the same frequency (+/- 0.5 Hz).
+   * Zero heap allocations.
+   */
+  updateDominantModalInfo(target: DominantModalInfo, isSilent: boolean = false): void {
+    const dCount = this.activeDiagCount;
+    target.isSilent = isSilent;
+
+    if (dCount === 0) {
+      target.frequency = 0;
+      target.peakRms = 0;
+      target.dominanceRatio = 0;
+      target.hasEnergy = false;
+      return;
+    }
+
+    const indices = this.activeDiagIndices;
+    const values = this.activeDiagValues;
+    let totalVar = 0;
+    let maxVar = -1;
+    let maxIdx = 0;
+
+    for (let k = 0; k < dCount; k++) {
+      const v = values[k];
+      if (v <= 0) continue;
+      totalVar += v;
+      if (v > maxVar) {
+        maxVar = v;
+        maxIdx = indices[k];
+      }
+    }
+
+    if (totalVar <= 0 || maxVar <= 0) {
+      target.frequency = 0;
+      target.peakRms = 0;
+      target.dominanceRatio = 0;
+      target.hasEnergy = false;
+      return;
+    }
+
+    const peakFreq = this.modes[maxIdx].frequency;
+    let groupVar = 0;
+    for (let k = 0; k < dCount; k++) {
+      const v = values[k];
+      if (v <= 0) continue;
+      const freq = this.modes[indices[k]].frequency;
+      if (Math.abs(freq - peakFreq) <= 0.5) {
+        groupVar += v;
+      }
+    }
+
+    target.frequency = peakFreq;
+    target.peakRms = Math.sqrt(Math.max(0, groupVar));
+    target.dominanceRatio = totalVar > 0 ? Math.min(1, groupVar / totalVar) : 0;
+    target.hasEnergy = true;
   }
 
   /**

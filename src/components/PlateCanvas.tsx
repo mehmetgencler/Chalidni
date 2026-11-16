@@ -11,9 +11,21 @@
  */
 
 import React, { useEffect, useRef } from 'react';
+import { DominantModalInfo } from '../physics/modalSolver.ts';
 import { Particle, ParticleColor } from '../physics/types.ts';
-import { computeParticleRenderParams, SPRITE_BASE_PX } from './plateVisuals.ts';
-import { DEFAULT_MEMORY_GRID_RES, PatternMemoryField } from './patternMemory.ts';
+import {
+  DEFAULT_PARTICLE_RADIUS,
+  MAX_BRIGHTNESS,
+  MIN_BRIGHTNESS,
+  SPRITE_BASE_PX,
+} from './plateVisuals.ts';
+import {
+  computeOverlayPulseVisibility,
+  DEFAULT_MEMORY_GRID_RES,
+  formatResonantFrequency,
+  ModalLockPulseTracker,
+  PatternMemoryField,
+} from './patternMemory.ts';
 
 export type HeatmapType = 'none' | 'diffusivity' | 'displacement' | 'nodal';
 
@@ -26,6 +38,7 @@ interface PlateCanvasProps {
   patternMemoryResetToken?: number;
   isPatternMemoryPausedRef?: React.RefObject<boolean>;
   normalizePatternMemory?: boolean;
+  dominantModalInfoRef?: React.RefObject<DominantModalInfo | null>;
 }
 
 const GRAIN_COLOR_TIERS: Record<ParticleColor, { body: string; spec: string }[]> = {
@@ -55,11 +68,118 @@ const GRAIN_COLOR_TIERS: Record<ParticleColor, { body: string; spec: string }[]>
   ],
 };
 
-const FALLBACK_COLORS: Record<ParticleColor, string> = {
-  green: 'rgba(74, 222, 128, 0.95)',
-  blue: 'rgba(96, 178, 252, 0.95)',
-  red: 'rgba(248, 113, 113, 0.95)',
-};
+// Discrete sprite sizes (px at dpr=1) baked cleanly with anti-aliased contact shadows & specular highlights
+const SPRITE_SIZE_BUCKETS = [9, 11, 13, 15] as const;
+const SIZE_BUCKET_COUNT = SPRITE_SIZE_BUCKETS.length;
+
+interface BakedPixelSprite {
+  len: number;
+  dx: Int8Array;
+  dy: Int8Array;
+  pr: Float32Array;
+  pg: Float32Array;
+  pb: Float32Array;
+  invA: Float32Array;
+}
+
+function buildBakedPixelSpriteBank(dpr: number): Record<ParticleColor, BakedPixelSprite[][]> {
+  const scratchCanvas = document.createElement('canvas');
+  const maxPx = Math.ceil(SPRITE_SIZE_BUCKETS[SIZE_BUCKET_COUNT - 1] * dpr) + 2;
+  scratchCanvas.width = maxPx;
+  scratchCanvas.height = maxPx;
+  const sCtx = scratchCanvas.getContext('2d', { willReadFrequently: true });
+
+  const banks: Record<ParticleColor, BakedPixelSprite[][]> = {
+    green: [],
+    blue: [],
+    red: [],
+  };
+
+  const colors: ParticleColor[] = ['green', 'blue', 'red'];
+  for (let c = 0; c < colors.length; c++) {
+    const colorKey = colors[c];
+    const tiers = GRAIN_COLOR_TIERS[colorKey];
+
+    for (let b = 0; b < SIZE_BUCKET_COUNT; b++) {
+      const pxSize = Math.max(5, Math.round(SPRITE_SIZE_BUCKETS[b] * dpr));
+      const scaleRatio = pxSize / SPRITE_BASE_PX;
+      const cx = pxSize * 0.5;
+      const halfInt = pxSize >> 1;
+      const sizeBank: BakedPixelSprite[] = [];
+
+      for (let i = 0; i < tiers.length; i++) {
+        const tier = tiers[i];
+        if (!sCtx) {
+          sizeBank.push({
+            len: 0,
+            dx: new Int8Array(0),
+            dy: new Int8Array(0),
+            pr: new Float32Array(0),
+            pg: new Float32Array(0),
+            pb: new Float32Array(0),
+            invA: new Float32Array(0),
+          });
+          continue;
+        }
+
+        sCtx.clearRect(0, 0, pxSize, pxSize);
+
+        // Subtle pre-baked contact drop shadow
+        sCtx.fillStyle = 'rgba(0, 0, 0, 0.42)';
+        sCtx.beginPath();
+        sCtx.arc(cx + 0.55 * scaleRatio, cx + 0.75 * scaleRatio, 2.0 * scaleRatio, 0, Math.PI * 2);
+        sCtx.fill();
+
+        // Main grain body
+        sCtx.fillStyle = tier.body;
+        sCtx.beginPath();
+        sCtx.arc(cx, cx, 1.85 * scaleRatio, 0, Math.PI * 2);
+        sCtx.fill();
+
+        // Subtle specular micro-highlight
+        sCtx.fillStyle = tier.spec;
+        sCtx.beginPath();
+        sCtx.arc(cx - 0.5 * scaleRatio, cx - 0.5 * scaleRatio, 0.7 * scaleRatio, 0, Math.PI * 2);
+        sCtx.fill();
+
+        const sd = sCtx.getImageData(0, 0, pxSize, pxSize).data;
+        let nonZeroCount = 0;
+        for (let p = 3; p < sd.length; p += 4) {
+          if (sd[p] > 1) nonZeroCount++;
+        }
+
+        const dx = new Int8Array(nonZeroCount);
+        const dy = new Int8Array(nonZeroCount);
+        const pr = new Float32Array(nonZeroCount);
+        const pg = new Float32Array(nonZeroCount);
+        const pb = new Float32Array(nonZeroCount);
+        const invA = new Float32Array(nonZeroCount);
+
+        let k = 0;
+        for (let py = 0; py < pxSize; py++) {
+          for (let px = 0; px < pxSize; px++) {
+            const idx = (py * pxSize + px) * 4;
+            const a = sd[idx + 3];
+            if (a <= 1) continue;
+            const aNorm = a / 255;
+            dx[k] = px - halfInt;
+            dy[k] = py - halfInt;
+            pr[k] = sd[idx] * aNorm;
+            pg[k] = sd[idx + 1] * aNorm;
+            pb[k] = sd[idx + 2] * aNorm;
+            invA[k] = 1 - aNorm;
+            k++;
+          }
+        }
+
+        sizeBank.push({ len: nonZeroCount, dx, dy, pr, pg, pb, invA });
+      }
+      banks[colorKey].push(sizeBank);
+    }
+  }
+
+  return banks;
+}
 
 export const PlateCanvas: React.FC<PlateCanvasProps> = ({
   particles,
@@ -70,6 +190,7 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
   patternMemoryResetToken = 0,
   isPatternMemoryPausedRef,
   normalizePatternMemory = false,
+  dominantModalInfoRef,
 }) => {
   const internalCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const canvasRef = canvasRefExternal ?? internalCanvasRef;
@@ -87,72 +208,90 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
   const appliedResetTokenRef = useRef<number>(patternMemoryResetToken);
   const fallbackPausedRef = useRef<boolean>(false);
   const pausedRef = isPatternMemoryPausedRef ?? fallbackPausedRef;
+  const fallbackModalInfoRef = useRef<DominantModalInfo | null>(null);
+  const modalInfoRef = dominantModalInfoRef ?? fallbackModalInfoRef;
 
   // Reusable visual pattern-memory buffers & offscreen halo/core ImageData targets (allocated once)
   const memoryFieldRef = useRef<PatternMemoryField | null>(null);
+  const pulseTrackerRef = useRef<ModalLockPulseTracker | null>(null);
+  const appliedPulseRef = useRef<number>(0);
+  const overlayRef = useRef<HTMLDivElement | null>(null);
+  const overlayValueRef = useRef<HTMLSpanElement | null>(null);
+  const overlayUnitRef = useRef<HTMLSpanElement | null>(null);
+  const lastOverlayFreqRef = useRef<number>(-1);
+  const lastOverlayVisibleRef = useRef<boolean>(false);
   const memorySurfaceRef = useRef<{
-    halo: {
-      canvas: HTMLCanvasElement;
-      ctx: CanvasRenderingContext2D;
-      imageData: ImageData;
-    };
-    core: {
-      canvas: HTMLCanvasElement;
-      ctx: CanvasRenderingContext2D;
-      imageData: ImageData;
-    };
+    gridRes: number;
+    haloRgba: Uint8ClampedArray;
+    coreRgba: Uint8ClampedArray;
+    cloudPremul: Float32Array;
   } | null>(null);
 
-  // Pre-rendered grain sprite tiers grouped by color ('green' | 'blue' | 'red')
-  const spritesRef = useRef<Record<ParticleColor, HTMLCanvasElement[]> | null>(null);
-  // Cached brushed aluminum plate background (only re-rendered when size or dpr changes)
-  const plateSurfaceRef = useRef<{ canvas: HTMLCanvasElement; size: number; dpr: number } | null>(null);
+  // Pre-rendered anti-aliased sprite pixel lists (keyed by dpr, rebuilt only when dpr changes)
+  const pixelSpritesRef = useRef<{
+    dpr: number;
+    maxHalf: number;
+    banks: Record<ParticleColor, BakedPixelSprite[][]>;
+  } | null>(null);
 
-  useEffect(() => {
-    const s = SPRITE_BASE_PX;
-    const banks: Record<ParticleColor, HTMLCanvasElement[]> = {
-      green: [],
-      blue: [],
-      red: [],
-    };
-
-    (Object.keys(GRAIN_COLOR_TIERS) as ParticleColor[]).forEach((colorKey) => {
-      const tiers = GRAIN_COLOR_TIERS[colorKey];
-      for (let i = 0; i < tiers.length; i++) {
-        const tier = tiers[i];
-        const sprite = document.createElement('canvas');
-        sprite.width = s;
-        sprite.height = s;
-        const sCtx = sprite.getContext('2d');
-        if (sCtx) {
-          // Subtle pre-baked contact drop shadow
-          sCtx.fillStyle = 'rgba(0, 0, 0, 0.42)';
-          sCtx.beginPath();
-          sCtx.arc(s / 2 + 0.55, s / 2 + 0.75, 2.0, 0, Math.PI * 2);
-          sCtx.fill();
-
-          // Main grain body
-          sCtx.fillStyle = tier.body;
-          sCtx.beginPath();
-          sCtx.arc(s / 2, s / 2, 1.85, 0, Math.PI * 2);
-          sCtx.fill();
-
-          // Subtle specular micro-highlight
-          sCtx.fillStyle = tier.spec;
-          sCtx.beginPath();
-          sCtx.arc(s / 2 - 0.5, s / 2 - 0.5, 0.7, 0, Math.PI * 2);
-          sCtx.fill();
-        }
-        banks[colorKey].push(sprite);
-      }
-    });
-    spritesRef.current = banks;
-  }, []);
+  // Cached brushed aluminum plate pixels & single reusable output frame buffer (rebuilt on size/dpr change)
+  const plateSurfaceRef = useRef<{
+    size: number;
+    dpr: number;
+    targetPx: number;
+    platePixels: Uint8ClampedArray;
+    frameImageData: ImageData;
+    xMap: Uint16Array;
+    xFrac: Float32Array;
+    yMap: Uint16Array;
+    yFrac: Float32Array;
+  } | null>(null);
 
   // Pure rendering loop (never advances physics or particle transport)
   useEffect(() => {
     let animId: number;
     let lastRenderMs: number | null = null;
+    const prefersReducedMotion =
+      typeof window !== 'undefined' &&
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    const syncOverlayIndicator = (pulseAmount: number, lockedFreqHz: number | null) => {
+      const overlayEl = overlayRef.current;
+      if (!overlayEl) return;
+
+      const isVisible = pulseAmount > 0 && lockedFreqHz !== null && lockedFreqHz > 0;
+      if (isVisible) {
+        const { opacity, translateYpx } = computeOverlayPulseVisibility(pulseAmount);
+        overlayEl.style.visibility = 'visible';
+        overlayEl.style.opacity = opacity.toFixed(3);
+        overlayEl.style.transform = prefersReducedMotion
+          ? 'translate3d(0, 0, 0)'
+          : `translate3d(0, ${translateYpx.toFixed(2)}px, 0)`;
+
+        if (lastOverlayFreqRef.current !== lockedFreqHz) {
+          lastOverlayFreqRef.current = lockedFreqHz;
+          const formatted = formatResonantFrequency(lockedFreqHz);
+          if (overlayValueRef.current) overlayValueRef.current.textContent = formatted.value;
+          if (overlayUnitRef.current) overlayUnitRef.current.textContent = formatted.unit;
+          overlayEl.dataset.frequencyHz = lockedFreqHz.toFixed(2);
+        }
+        if (!lastOverlayVisibleRef.current) {
+          lastOverlayVisibleRef.current = true;
+          overlayEl.dataset.visible = 'true';
+        }
+        overlayEl.dataset.pulseOpacity = opacity.toFixed(3);
+      } else if (lastOverlayVisibleRef.current || overlayEl.dataset.visible !== 'false') {
+        lastOverlayVisibleRef.current = false;
+        overlayEl.style.opacity = '0';
+        overlayEl.style.visibility = 'hidden';
+        overlayEl.style.transform = prefersReducedMotion
+          ? 'translate3d(0, 0, 0)'
+          : 'translate3d(0, -3px, 0)';
+        overlayEl.dataset.visible = 'false';
+        overlayEl.dataset.pulseOpacity = '0.000';
+      }
+    };
 
     const render = (nowMs: number) => {
       const dtSec =
@@ -165,7 +304,7 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
         return;
       }
 
-      const ctx = canvas.getContext('2d');
+      const ctx = canvas.getContext('2d', { alpha: false });
       if (!ctx) {
         animId = requestAnimationFrame(render);
         return;
@@ -187,13 +326,13 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
         canvas.height = targetPx;
       }
 
-      // Build or reuse cached brushed metal plate surface
+      // Build or reuse cached brushed metal plate pixel buffer + coordinate lookup tables
       let cached = plateSurfaceRef.current;
-      if (!cached || cached.size !== size || cached.dpr !== dpr) {
+      if (!cached || cached.size !== size || cached.dpr !== dpr || cached.targetPx !== targetPx) {
         const off = document.createElement('canvas');
         off.width = targetPx;
         off.height = targetPx;
-        const oCtx = off.getContext('2d');
+        const oCtx = off.getContext('2d', { alpha: false });
         if (oCtx) {
           oCtx.scale(dpr, dpr);
 
@@ -247,20 +386,66 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
           oCtx.arc(size / 2 - 0.5, size / 2 - 0.5, 0.8, 0, Math.PI * 2);
           oCtx.fill();
         }
-        cached = { canvas: off, size, dpr };
+
+        const plateImageData = oCtx
+          ? oCtx.getImageData(0, 0, targetPx, targetPx)
+          : ctx.createImageData(targetPx, targetPx);
+        const frameImageData = ctx.createImageData(targetPx, targetPx);
+
+        const maxGridIdx = DEFAULT_MEMORY_GRID_RES - 1;
+        const maxAxis = Math.max(1, targetPx - 1);
+        const xMap = new Uint16Array(targetPx);
+        const xFrac = new Float32Array(targetPx);
+        const yMap = new Uint16Array(targetPx);
+        const yFrac = new Float32Array(targetPx);
+        for (let i = 0; i < targetPx; i++) {
+          const g = (i / maxAxis) * maxGridIdx;
+          const ig = g >= maxGridIdx ? maxGridIdx - 1 : g | 0;
+          xMap[i] = ig;
+          xFrac[i] = g - ig;
+          yMap[i] = ig;
+          yFrac[i] = g - ig;
+        }
+
+        cached = {
+          size,
+          dpr,
+          targetPx,
+          platePixels: new Uint8ClampedArray(plateImageData.data),
+          frameImageData,
+          xMap,
+          xFrac,
+          yMap,
+          yFrac,
+        };
         plateSurfaceRef.current = cached;
       }
 
-      ctx.save();
-      ctx.scale(dpr, dpr);
-      ctx.drawImage(cached.canvas, 0, 0, size, size);
+      // Build or reuse pre-baked anti-aliased sprite pixel lists
+      let spriteCache = pixelSpritesRef.current;
+      if (!spriteCache || spriteCache.dpr !== dpr) {
+        const maxPx = Math.max(5, Math.round(SPRITE_SIZE_BUCKETS[SIZE_BUCKET_COUNT - 1] * dpr));
+        spriteCache = {
+          dpr,
+          maxHalf: (maxPx >> 1) + 1,
+          banks: buildBakedPixelSpriteBank(dpr),
+        };
+        pixelSpritesRef.current = spriteCache;
+      }
+
+      const frame = cached.frameImageData.data;
+      frame.set(cached.platePixels);
 
       const activeParticles = particlesRef.current;
 
-      // Clear accumulated visual pattern memory on explicit simulation reset
+      // Clear accumulated visual pattern memory & modal lock pulse on explicit simulation reset
       if (appliedResetTokenRef.current !== resetTokenRef.current) {
         appliedResetTokenRef.current = resetTokenRef.current;
         memoryFieldRef.current?.clear();
+        pulseTrackerRef.current?.reset();
+        appliedPulseRef.current = 0;
+        lastOverlayFreqRef.current = -1;
+        syncOverlayIndicator(0, null);
       }
 
       // 2.5 Visual-only two-scale density cloud (broad halo + dense core) rendered beneath live particles
@@ -275,96 +460,218 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
           field = new PatternMemoryField(DEFAULT_MEMORY_GRID_RES);
           memoryFieldRef.current = field;
         }
+        let pulseTracker = pulseTrackerRef.current;
+        if (!pulseTracker) {
+          pulseTracker = new ModalLockPulseTracker();
+          pulseTrackerRef.current = pulseTracker;
+        }
         let memSurface = memorySurfaceRef.current;
-        if (!memSurface) {
-          const makeOffscreen = (res: number) => {
-            const c = document.createElement('canvas');
-            c.width = res;
-            c.height = res;
-            const cCtx = c.getContext('2d');
-            if (!cCtx) return null;
-            return {
-              canvas: c,
-              ctx: cCtx,
-              imageData: cCtx.createImageData(res, res),
-            };
+        if (!memSurface || memSurface.gridRes !== field.gridRes) {
+          const cellCount = field.gridRes * field.gridRes;
+          memSurface = {
+            gridRes: field.gridRes,
+            haloRgba: new Uint8ClampedArray(cellCount * 4),
+            coreRgba: new Uint8ClampedArray(cellCount * 4),
+            cloudPremul: new Float32Array(cellCount * 4),
           };
-          const halo = makeOffscreen(field.gridRes);
-          const core = makeOffscreen(field.gridRes);
-          if (halo && core) {
-            memSurface = { halo, core };
-            memorySurfaceRef.current = memSurface;
-          }
+          memorySurfaceRef.current = memSurface;
         }
 
         const isPaused = pausedRef.current;
         const normalizeChanged = appliedNormalizeRef.current !== normalizeMemory;
         appliedNormalizeRef.current = normalizeMemory;
+        const pulseAmount = pulseTracker.update(modalInfoRef.current, dtSec, isPaused);
+        const pulseChanged = Math.abs(appliedPulseRef.current - pulseAmount) > 1e-4;
+        appliedPulseRef.current = pulseAmount;
+
         const hasMemory = field.step(activeParticles, sideLength, dtSec, halfLifeSec, isPaused);
-        if (hasMemory && memSurface) {
-          if (!isPaused || normalizeChanged) {
-            field.writeDualLayersToRgba(
-              memSurface.halo.imageData.data,
-              memSurface.core.imageData.data,
-              normalizeMemory
-            );
-            memSurface.halo.ctx.putImageData(memSurface.halo.imageData, 0, 0);
-            memSurface.core.ctx.putImageData(memSurface.core.imageData, 0, 0);
+        if (hasMemory) {
+          const cloudPremul = memSurface.cloudPremul;
+          const res = memSurface.gridRes;
+
+          if (!isPaused || normalizeChanged || pulseChanged) {
+            const haloRgba = memSurface.haloRgba;
+            const coreRgba = memSurface.coreRgba;
+            field.writeDualLayersToRgba(haloRgba, coreRgba, normalizeMemory, pulseAmount);
+
+            // Pre-combine Halo + Core in 128x128 using exact sequential 'screen' identity over opaque plate
+            const inv255Sq = 1 / (255 * 255);
+            const cellCount = res * res;
+            for (let i = 0; i < cellCount; i++) {
+              const p = i * 4;
+              const ha = haloRgba[p + 3];
+              const ca = coreRgba[p + 3];
+              if ((ha | ca) === 0) {
+                cloudPremul[p] = 0;
+                cloudPremul[p + 1] = 0;
+                cloudPremul[p + 2] = 0;
+                cloudPremul[p + 3] = 0;
+              } else {
+                const hScale = ha * inv255Sq;
+                const cScale = ca * inv255Sq;
+                const hr = haloRgba[p] * hScale;
+                const hg = haloRgba[p + 1] * hScale;
+                const hb = haloRgba[p + 2] * hScale;
+                const cr = coreRgba[p] * cScale;
+                const cg = coreRgba[p + 1] * cScale;
+                const cb = coreRgba[p + 2] * cScale;
+                cloudPremul[p] = hr + cr - hr * cr;
+                cloudPremul[p + 1] = hg + cg - hg * cg;
+                cloudPremul[p + 2] = hb + cb - hb * cb;
+                cloudPremul[p + 3] = 1;
+              }
+            }
           }
-          ctx.save();
-          ctx.globalCompositeOperation = 'screen';
-          ctx.imageSmoothingEnabled = true;
-          ctx.drawImage(memSurface.halo.canvas, 0, 0, size, size);
-          ctx.drawImage(memSurface.core.canvas, 0, 0, size, size);
-          ctx.restore();
+
+          // Bilinear upsample + screen blend onto opaque frame buffer (zero-regions skipped in O(1))
+          const stride = res * 4;
+          const xMap = cached.xMap;
+          const xFrac = cached.xFrac;
+          const yMap = cached.yMap;
+          const yFrac = cached.yFrac;
+
+          for (let y = 0; y < targetPx; y++) {
+            const iy = yMap[y];
+            const fy = yFrac[y];
+            const oneMinusFy = 1 - fy;
+            const row0 = iy * stride;
+            const row1 = row0 + stride;
+            const dstRow = y * targetPx * 4;
+
+            for (let x = 0; x < targetPx; x++) {
+              const p00 = row0 + xMap[x] * 4;
+              const p10 = p00 + 4;
+              const p01 = row1 + xMap[x] * 4;
+              const p11 = p01 + 4;
+              if (
+                cloudPremul[p00 + 3] === 0 &&
+                cloudPremul[p10 + 3] === 0 &&
+                cloudPremul[p01 + 3] === 0 &&
+                cloudPremul[p11 + 3] === 0
+              ) {
+                continue;
+              }
+
+              const fx = xFrac[x];
+              const oneMinusFx = 1 - fx;
+              const w00 = oneMinusFx * oneMinusFy;
+              const w10 = fx * oneMinusFy;
+              const w01 = oneMinusFx * fy;
+              const w11 = fx * fy;
+
+              const mr =
+                cloudPremul[p00] * w00 +
+                cloudPremul[p10] * w10 +
+                cloudPremul[p01] * w01 +
+                cloudPremul[p11] * w11;
+              const mg =
+                cloudPremul[p00 + 1] * w00 +
+                cloudPremul[p10 + 1] * w10 +
+                cloudPremul[p01 + 1] * w01 +
+                cloudPremul[p11 + 1] * w11;
+              const mb =
+                cloudPremul[p00 + 2] * w00 +
+                cloudPremul[p10 + 2] * w10 +
+                cloudPremul[p01 + 2] * w01 +
+                cloudPremul[p11 + 2] * w11;
+
+              const d = dstRow + x * 4;
+              const dr = frame[d];
+              const dg = frame[d + 1];
+              const db = frame[d + 2];
+              frame[d] = dr + mr * (255 - dr);
+              frame[d + 1] = dg + mg * (255 - dg);
+              frame[d + 2] = db + mb * (255 - db);
+            }
+          }
         }
         const memMs = performance.now() - memT0;
         canvas.dataset.patternMemoryActive = String(hasMemory);
-        canvas.dataset.patternMemoryPeak = field.getMaxMemoryDensity().toFixed(3);
+        canvas.dataset.patternMemoryPeak = field.getLastMaxDensity().toFixed(3);
         canvas.dataset.patternMemoryMean = field.getLastMeanDensity().toFixed(4);
         canvas.dataset.patternMemoryRenderMs = memMs.toFixed(3);
+        canvas.dataset.modalLockFreqHz = (pulseTracker.lockedFrequencyHz ?? 0).toFixed(2);
+        canvas.dataset.modalLockCount = String(pulseTracker.lockCount);
+        canvas.dataset.patternPulseAmount = pulseAmount.toFixed(3);
+        syncOverlayIndicator(pulseAmount, pulseTracker.lockedFrequencyHz);
       } else {
         appliedNormalizeRef.current = normalizeMemory;
+        appliedPulseRef.current = 0;
         if (memoryFieldRef.current?.isActive) {
           memoryFieldRef.current.clear();
         }
+        pulseTrackerRef.current?.reset();
+        lastOverlayFreqRef.current = -1;
+        syncOverlayIndicator(0, null);
         canvas.dataset.patternMemoryActive = 'false';
         canvas.dataset.patternMemoryPeak = '0.000';
         canvas.dataset.patternMemoryMean = '0.0000';
         canvas.dataset.patternMemoryRenderMs = '0.000';
+        canvas.dataset.modalLockFreqHz = '0.00';
+        canvas.dataset.modalLockCount = '0';
+        canvas.dataset.patternPulseAmount = '0.000';
       }
 
-      // 3. Render granular powder particles using per-particle color, radius & brightness
-      const scale = size / sideLength;
-      const spriteBanks = spritesRef.current;
+      // 3. Composite granular powder particles directly onto frame buffer via pre-baked sprite pixel lists
+      const scalePx = targetPx / sideLength;
+      const banks = spriteCache.banks;
+      const tierCount = banks.green[0].length;
+      const bSpanInv = 1 / (MAX_BRIGHTNESS - MIN_BRIGHTNESS);
+      const rBaseScale = SPRITE_BASE_PX / DEFAULT_PARTICLE_RADIUS;
+      const maxMargin = spriteCache.maxHalf;
+      const safeLimit = targetPx - maxMargin;
 
-      if (spriteBanks && spriteBanks.green.length > 0) {
-        const tierCount = spriteBanks.green.length;
-        for (let i = 0; i < activeParticles.length; i++) {
-          const p = activeParticles[i];
-          if (!p.active) continue;
+      for (let i = 0; i < activeParticles.length; i++) {
+        const p = activeParticles[i];
+        if (!p.active) continue;
 
-          const px = p.x * scale;
-          const py = p.y * scale;
-          const { spriteTier, drawSize } = computeParticleRenderParams(p, tierCount);
-          const half = drawSize * 0.5;
-          const colorKey: ParticleColor = p.color ?? 'green';
-          const bank = spriteBanks[colorKey];
+        const cx = (p.x * scalePx) | 0;
+        const cy = (p.y * scalePx) | 0;
+        const b = p.brightness ?? 1.0;
+        const normB = Math.max(0, Math.min(0.9999, (b - MIN_BRIGHTNESS) * bSpanInv));
+        const spriteTier = (normB * tierCount) | 0;
 
-          ctx.drawImage(bank[spriteTier], px - half, py - half, drawSize, drawSize);
-        }
-      } else {
-        for (let i = 0; i < activeParticles.length; i++) {
-          const p = activeParticles[i];
-          if (!p.active) continue;
-          ctx.fillStyle = FALLBACK_COLORS[p.color ?? 'green'];
-          ctx.beginPath();
-          ctx.arc(p.x * scale, p.y * scale, p.radius ?? 1.2, 0, Math.PI * 2);
-          ctx.fill();
+        const r = p.radius ?? DEFAULT_PARTICLE_RADIUS;
+        const clampedR = r < 0.6 ? 0.6 : r > 2.0 ? 2.0 : r;
+        const targetSpritePx = clampedR * rBaseScale;
+        let bucket = ((targetSpritePx - 8) * 0.5) | 0;
+        if (bucket < 0) bucket = 0;
+        else if (bucket >= SIZE_BUCKET_COUNT) bucket = SIZE_BUCKET_COUNT - 1;
+
+        const colorBank =
+          p.color === 'blue' ? banks.blue : p.color === 'red' ? banks.red : banks.green;
+        const sprite = colorBank[bucket][spriteTier];
+        const sLen = sprite.len;
+        const sDx = sprite.dx;
+        const sDy = sprite.dy;
+        const sPr = sprite.pr;
+        const sPg = sprite.pg;
+        const sPb = sprite.pb;
+        const sInvA = sprite.invA;
+
+        if (cx >= maxMargin && cx < safeLimit && cy >= maxMargin && cy < safeLimit) {
+          for (let k = 0; k < sLen; k++) {
+            const d = ((cy + sDy[k]) * targetPx + (cx + sDx[k])) * 4;
+            const invA = sInvA[k];
+            frame[d] = sPr[k] + frame[d] * invA;
+            frame[d + 1] = sPg[k] + frame[d + 1] * invA;
+            frame[d + 2] = sPb[k] + frame[d + 2] * invA;
+          }
+        } else {
+          for (let k = 0; k < sLen; k++) {
+            const px = cx + sDx[k];
+            const py = cy + sDy[k];
+            if (px < 0 || px >= targetPx || py < 0 || py >= targetPx) continue;
+            const d = (py * targetPx + px) * 4;
+            const invA = sInvA[k];
+            frame[d] = sPr[k] + frame[d] * invA;
+            frame[d + 1] = sPg[k] + frame[d + 1] * invA;
+            frame[d + 2] = sPb[k] + frame[d + 2] * invA;
+          }
         }
       }
 
-      ctx.restore();
+      ctx.putImageData(cached.frameImageData, 0, 0);
       animId = requestAnimationFrame(render);
     };
 
@@ -380,6 +687,35 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
           data-testid="chladni-plate-canvas"
           className="w-full h-full block cursor-default"
         />
+        <div
+          ref={overlayRef}
+          data-testid="resonant-frequency-overlay"
+          data-visible="false"
+          data-frequency-hz="0.00"
+          data-pulse-opacity="0.000"
+          aria-hidden="true"
+          className="pointer-events-none select-none absolute top-3 left-3 px-2.5 py-1.5 rounded-md bg-slate-950/90 border border-slate-700/60 flex items-baseline gap-2 opacity-0 invisible"
+        >
+          <span className="text-[11px] font-medium text-slate-300/90 tracking-tight leading-none">
+            Resonant lock
+          </span>
+          <span className="inline-flex items-baseline gap-1 leading-none">
+            <span
+              ref={overlayValueRef}
+              data-testid="resonant-frequency-overlay-value"
+              className="text-sm font-mono font-semibold tabular-nums text-sky-200 leading-none"
+            >
+              0.0
+            </span>
+            <span
+              ref={overlayUnitRef}
+              data-testid="resonant-frequency-overlay-unit"
+              className="text-[11px] font-mono text-slate-400 leading-none"
+            >
+              Hz
+            </span>
+          </span>
+        </div>
       </div>
     </div>
   );
