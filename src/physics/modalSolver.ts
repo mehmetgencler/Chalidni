@@ -25,12 +25,20 @@ export interface AnalyticalHarmonicResponse {
   resonanceFrequency: number; // Hz
 }
 
+export interface DominantModeEntry {
+  m: number;
+  n: number;
+  weight: number;
+}
+
 export interface DominantModalInfo {
   frequency: number;      // Hz of strongest resonant frequency cluster
   peakRms: number;        // Combined RMS acceleration (m/s^2) of degenerate modes at frequency
   dominanceRatio: number; // Share [0, 1] of total modal variance held by this cluster
   isSilent: boolean;
   hasEnergy: boolean;
+  dominantModes?: DominantModeEntry[];
+  dominantModeCount?: number;
 }
 
 /**
@@ -529,6 +537,7 @@ export class ModalBank {
       target.peakRms = 0;
       target.dominanceRatio = 0;
       target.hasEnergy = false;
+      target.dominantModeCount = 0;
       return;
     }
 
@@ -553,17 +562,35 @@ export class ModalBank {
       target.peakRms = 0;
       target.dominanceRatio = 0;
       target.hasEnergy = false;
+      target.dominantModeCount = 0;
       return;
     }
 
     const peakFreq = this.modes[maxIdx].frequency;
     let groupVar = 0;
+    let clusterCount = 0;
+    if (!target.dominantModes) {
+      target.dominantModes = [];
+    }
+    const clusterList = target.dominantModes;
+
     for (let k = 0; k < dCount; k++) {
       const v = values[k];
       if (v <= 0) continue;
-      const freq = this.modes[indices[k]].frequency;
-      if (Math.abs(freq - peakFreq) <= 0.5) {
+      const mode = this.modes[indices[k]];
+      if (Math.abs(mode.frequency - peakFreq) <= 0.5) {
         groupVar += v;
+        const c =
+          Math.sin((mode.m * Math.PI) * 0.5) * Math.sin((mode.n * Math.PI) * 0.5);
+        const weight = Math.abs(c) > 1e-6 ? (c >= 0 ? 1 : -1) : 1;
+        if (clusterCount < clusterList.length) {
+          clusterList[clusterCount].m = mode.m;
+          clusterList[clusterCount].n = mode.n;
+          clusterList[clusterCount].weight = weight;
+        } else {
+          clusterList.push({ m: mode.m, n: mode.n, weight });
+        }
+        clusterCount++;
       }
     }
 
@@ -571,6 +598,7 @@ export class ModalBank {
     target.peakRms = Math.sqrt(Math.max(0, groupVar));
     target.dominanceRatio = totalVar > 0 ? Math.min(1, groupVar / totalVar) : 0;
     target.hasEnergy = true;
+    target.dominantModeCount = clusterCount;
   }
 
   /**

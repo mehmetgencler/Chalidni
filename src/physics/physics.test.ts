@@ -4146,6 +4146,166 @@ test('48. Sequential same-color particle chain generator spans moving neighbors 
   assert.equal(sys.activeCount, 0);
 });
 
+test('49. Theoretical nodal wireframe accurately extracts zero contours for single & degenerate dominant modes and persists across silence until reset', async () => {
+  const {
+    NODAL_WIREFRAME_ALPHA,
+    NODAL_WIREFRAME_COLOR_RGB,
+    NodalWireframeOverlayCache,
+    computeTheoreticalNodalSegments,
+    evaluateModalSuperpositionField,
+  } = await import('../components/nodalWireframe.ts');
+
+  const mb = new ModalBank(DEFAULT_ALUMINUM, DEFAULT_GEOMETRY, 0.01);
+  const info: DominantModalInfo = {
+    frequency: 0,
+    peakRms: 0,
+    dominanceRatio: 0,
+    isSilent: true,
+    hasEnergy: false,
+  };
+
+  // 1) Degenerate 269.815 Hz cluster ((1,3)+(3,1)) extracts zero-contour circle
+  {
+    const { processor } = createProductionWorklet(48000);
+    processor.handleMessage({ type: 'CONFIGURE_MODES', modes: mb.getWorkletModeConfig() });
+    feedWorkletSignal(processor, 0.25, (t) => 0.45 * Math.sin(2 * Math.PI * 269.815 * t), 48000);
+    mb.applySnapshot(processor.buildSnapshot());
+    mb.updateDominantModalInfo(info, false);
+
+    assert.equal(info.dominantModeCount, 2);
+    const segs = computeTheoreticalNodalSegments(info.dominantModes!, info.dominantModeCount!, 128);
+    assert.ok(segs.length >= 400, `Expected dense closed nodal curve segments for 269.8 Hz, got ${segs.length / 4}`);
+
+    // Every extracted segment midpoint must lie on the analytical zero contour |Phi| < 0.03
+    let maxResidual = 0;
+    for (let s = 0; s + 3 < segs.length; s += 4) {
+      const mx = 0.5 * (segs[s] + segs[s + 2]);
+      const my = 0.5 * (segs[s + 1] + segs[s + 3]);
+      const val = Math.abs(evaluateModalSuperpositionField(info.dominantModes!, info.dominantModeCount!, mx, my));
+      if (val > maxResidual) maxResidual = val;
+    }
+    assert.ok(maxResidual < 0.03, `269.8 Hz nodal midpoint residual ${maxResidual} exceeded 0.03`);
+  }
+
+  // 2) Orthogonal non-degenerate 485.67 Hz (3,3) mode resolves clean nodal intersections at 1/3 and 2/3
+  {
+    const { processor } = createProductionWorklet(48000);
+    processor.handleMessage({ type: 'CONFIGURE_MODES', modes: mb.getWorkletModeConfig() });
+    feedWorkletSignal(processor, 0.25, (t) => 0.45 * Math.sin(2 * Math.PI * 485.67 * t), 48000);
+    mb.applySnapshot(processor.buildSnapshot());
+    mb.updateDominantModalInfo(info, false);
+
+    assert.equal(info.dominantModeCount, 1);
+    assert.equal(info.dominantModes![0].m, 3);
+    assert.equal(info.dominantModes![0].n, 3);
+
+    const segs = computeTheoreticalNodalSegments(info.dominantModes!, info.dominantModeCount!, 128);
+    let maxResidual = 0;
+    let nearCrossCount = 0;
+    for (let s = 0; s + 3 < segs.length; s += 4) {
+      const mx = 0.5 * (segs[s] + segs[s + 2]);
+      const my = 0.5 * (segs[s + 1] + segs[s + 3]);
+      const val = Math.abs(evaluateModalSuperpositionField(info.dominantModes!, info.dominantModeCount!, mx, my));
+      if (val > maxResidual) maxResidual = val;
+      if (Math.hypot(mx - 1 / 3, my - 1 / 3) < 0.025) nearCrossCount++;
+    }
+    assert.ok(maxResidual < 0.02, `(3,3) nodal midpoint residual ${maxResidual} exceeded 0.02`);
+    assert.ok(nearCrossCount >= 2, 'Saddle disambiguation must preserve orthogonal crossing segments at (1/3, 1/3)');
+  }
+
+  // 3) Persistent wireframe cache latches active mode, stays lit on silence/pause, composites subtle light-blue, and clears on reset
+  const cache = new NodalWireframeOverlayCache();
+  const targetPx = 128;
+  assert.equal(cache.update({ ...info, isSilent: true, hasEnergy: false }, targetPx, 1).active, false);
+
+  const stActive = cache.update(info, targetPx, 1);
+  assert.equal(stActive.active, true);
+  assert.equal(stActive.modeLabel, '(3,3)');
+  assert.ok(stActive.segmentCount > 100);
+
+  // Remains persistently displayed during subsequent silence / decay so user can compare patterns
+  const stSilent = cache.update(
+    { frequency: 0, peakRms: 0, dominanceRatio: 0, isSilent: true, hasEnergy: false },
+    targetPx,
+    1
+  );
+  assert.equal(stSilent.active, true);
+  assert.equal(stSilent.modeLabel, '(3,3)');
+
+  const frame = new Uint8ClampedArray(targetPx * targetPx * 4);
+  for (let i = 0; i < targetPx * targetPx; i++) frame[i * 4 + 3] = 255;
+  cache.compositeOntoFrame(frame, targetPx);
+
+  // Verify light-blue wireframe pixel near x = 1/3 nodal line and zero contamination at (1/6, 1/6) antinode
+  const onNodePx = Math.round((1 / 3) * (targetPx - 1));
+  const nodeY = Math.round(0.2 * (targetPx - 1));
+  const onIdx = (nodeY * targetPx + onNodePx) * 4;
+  assert.ok(
+    frame[onIdx + 2] > frame[onIdx] && frame[onIdx + 2] > 20,
+    `Expected light-blue wireframe RGB near node, got [${frame[onIdx]}, ${frame[onIdx + 1]}, ${frame[onIdx + 2]}]`
+  );
+  assert.ok(
+    frame[onIdx + 2] <= Math.ceil(NODAL_WIREFRAME_COLOR_RGB[2] * NODAL_WIREFRAME_ALPHA) + 2,
+    'Wireframe opacity must stay subtle'
+  );
+
+  const offNodePx = Math.round((1 / 6) * (targetPx - 1));
+  const offIdx = (offNodePx * targetPx + offNodePx) * 4;
+  assert.equal(frame[offIdx + 2], 0, 'Antinode interior away from nodal lines must stay completely dark');
+
+  cache.reset();
+  assert.equal(cache.getStatus().active, false);
+});
+
+test('50. Fading particle momentum velocity vectors point opposite momentum behind each grain and skip stationary particles', async () => {
+  const {
+    VELOCITY_VECTOR_MAX_LEN_PX,
+    computeParticleVelocityVector,
+    drawParticleVelocityVectorsToFrame,
+  } = await import('../components/particleVelocityVectors.ts');
+
+  // 1) Pure geometric specification check
+  const stationary = computeParticleVelocityVector(0.002, -0.003, 1);
+  assert.equal(stationary.active, false);
+
+  const spec = computeParticleVelocityVector(0.3, 0.0, 1);
+  assert.equal(spec.active, true);
+  assert.ok(spec.tailDirX < -0.999 && Math.abs(spec.tailDirY) < 1e-9, 'Tail must point strictly behind +x velocity (-x)');
+  assert.ok(spec.lenPx > 5 && spec.lenPx <= VELOCITY_VECTOR_MAX_LEN_PX);
+
+  const clampedSpec = computeParticleVelocityVector(4.0, 3.0, 2);
+  assert.ok(Math.abs(clampedSpec.lenPx - VELOCITY_VECTOR_MAX_LEN_PX * 2) < 1e-6);
+
+  // 2) Frame rasterization renders fading trail behind moving particle and nothing ahead or on resting grains
+  const targetPx = 100;
+  const L = 0.30;
+  const particles = [
+    { x: 0.15, y: 0.15, vx: 0.4, vy: 0.0, active: true, color: 'blue' as const, brightness: 1.0 },
+    { x: 0.06, y: 0.24, vx: 0.0, vy: 0.0, active: true, color: 'red' as const, brightness: 1.0 },
+  ];
+
+  const frame = new Uint8ClampedArray(targetPx * targetPx * 4);
+  for (let i = 0; i < targetPx * targetPx; i++) frame[i * 4 + 3] = 255;
+
+  const drawn = drawParticleVelocityVectorsToFrame(frame, targetPx, 1, particles, L);
+  assert.equal(drawn, 1, 'Only the migrating particle must emit a velocity vector');
+
+  const cy = Math.round((0.15 / L) * targetPx);
+  const cx = Math.round((0.15 / L) * targetPx);
+  const behindNear = frame[(cy * targetPx + (cx - 1)) * 4 + 2];
+  const behindMid = frame[(cy * targetPx + (cx - 5)) * 4 + 2];
+  const aheadEmpty = frame[(cy * targetPx + (cx + 2)) * 4 + 2];
+
+  assert.ok(behindNear > behindMid && behindMid > 0, `Expected fading blue trail behind grain: near=${behindNear}, mid=${behindMid}`);
+  assert.equal(aheadEmpty, 0, 'Zero trail pixels may appear ahead of particle velocity');
+
+  // Stationary grain must emit zero pixels
+  const restCy = Math.round((0.24 / L) * targetPx);
+  const restCx = Math.round((0.06 / L) * targetPx);
+  assert.equal(frame[(restCy * targetPx + restCx) * 4], 0);
+});
+
+
 
 
 

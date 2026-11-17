@@ -27,6 +27,8 @@ import {
   PatternMemoryField,
 } from './patternMemory.ts';
 import { ParticleChainSystem } from './particleChains.ts';
+import { NodalWireframeOverlayCache } from './nodalWireframe.ts';
+import { drawParticleVelocityVectorsToFrame } from './particleVelocityVectors.ts';
 
 export type HeatmapType = 'none' | 'diffusivity' | 'displacement' | 'nodal';
 
@@ -216,6 +218,7 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
   const memoryFieldRef = useRef<PatternMemoryField | null>(null);
   const pulseTrackerRef = useRef<ModalLockPulseTracker | null>(null);
   const chainSystemRef = useRef<ParticleChainSystem | null>(null);
+  const nodalWireframeRef = useRef<NodalWireframeOverlayCache | null>(null);
   const appliedPulseRef = useRef<number>(0);
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const overlayValueRef = useRef<HTMLSpanElement | null>(null);
@@ -446,6 +449,7 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
         memoryFieldRef.current?.clear();
         pulseTrackerRef.current?.reset();
         chainSystemRef.current?.reset();
+        nodalWireframeRef.current?.reset();
         appliedPulseRef.current = 0;
         lastOverlayFreqRef.current = -1;
         syncOverlayIndicator(0, null);
@@ -617,6 +621,19 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
         canvas.dataset.patternPulseAmount = '0.000';
       }
 
+      // 2.6 Subtle, persistent light-blue theoretical nodal wireframe overlay for dominant modal frequency
+      let nodalWireframe = nodalWireframeRef.current;
+      if (!nodalWireframe) {
+        nodalWireframe = new NodalWireframeOverlayCache();
+        nodalWireframeRef.current = nodalWireframe;
+      }
+      const nodalStatus = nodalWireframe.update(modalInfoRef.current, targetPx, dpr);
+      nodalWireframe.compositeOntoFrame(frame, targetPx);
+      canvas.dataset.nodalWireframeActive = String(nodalStatus.active);
+      canvas.dataset.nodalWireframeFreqHz = nodalStatus.frequencyHz.toFixed(2);
+      canvas.dataset.nodalWireframeModes = nodalStatus.modeLabel;
+      canvas.dataset.nodalWireframeSegments = String(nodalStatus.segmentCount);
+
       // 2.75 Visual-only sequential same-color hop ribbons connecting actively migrating particles
       let chainSystem = chainSystemRef.current;
       if (!chainSystem) {
@@ -632,6 +649,16 @@ export const PlateCanvas: React.FC<PlateCanvasProps> = ({
       );
       chainSystem.drawToRgbaFrame(frame, targetPx, dpr);
       canvas.dataset.particleChainCount = String(activeChainCount);
+
+      // 2.85 Short, fading momentum velocity vectors drawn behind each moving particle
+      const velocityVectorCount = drawParticleVelocityVectorsToFrame(
+        frame,
+        targetPx,
+        dpr,
+        activeParticles,
+        sideLength
+      );
+      canvas.dataset.velocityVectorCount = String(velocityVectorCount);
 
       // 3. Composite granular powder particles directly onto frame buffer via pre-baked sprite pixel lists
       const scalePx = targetPx / sideLength;
